@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          pkg=target/${{ matrix.target }}/release
+          tar czf dist/yui-${{ matrix.target }}.tar.gz -C "$pkg" yui
+      - name: package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist
+          $pkg = "target/${{ matrix.target }}/release"
+          Compress-Archive -Path "$pkg/yui.exe" `
+            -DestinationPath dist/yui-${{ matrix.target }}.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: yui-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    name: github release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  publish:
+    name: publish to crates.io
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      # --locked keeps the committed Cargo.lock so the publish verification
+      # step cannot fail the dirty-git-state check by rewriting the lock.
+      - run: cargo publish --locked --token ${{ secrets.CARGO_REGISTRY_TOKEN }}

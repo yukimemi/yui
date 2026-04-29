@@ -1,0 +1,53 @@
+[tasks.default]
+alias = "check"
+
+[tasks.check]
+description = "Run fmt + clippy + test + lock-check (same as CI)"
+dependencies = ["fmt-check", "clippy", "test", "lock-check"]
+
+[tasks.fmt-check]
+description = "Check formatting"
+command = "cargo"
+args = ["fmt", "--all", "--", "--check"]
+
+[tasks.fmt]
+description = "Apply formatting"
+command = "cargo"
+args = ["fmt", "--all"]
+
+[tasks.clippy]
+description = "Run clippy with warnings as errors"
+command = "cargo"
+args = ["clippy", "--all-targets", "--", "-D", "warnings"]
+
+[tasks.test]
+description = "Run all tests"
+command = "cargo"
+args = ["test"]
+
+[tasks.lock-check]
+description = "Verify Cargo.lock is in sync with Cargo.toml"
+command = "cargo"
+args = ["check", "--locked", "--all-targets"]
+
+[tasks.install-local]
+description = "Install the current checkout as ~/.cargo/bin/yui"
+command = "cargo"
+args = ["install", "--path", ".", "--force"]
+
+[tasks.publish-dry]
+description = "Dry-run crates.io publish"
+command = "cargo"
+args = ["publish", "--dry-run", "--allow-dirty"]
+
+[tasks.hook-install]
+description = "Install git pre-push hook that runs 'cargo make check'"
+script_runner = "@duckscript"
+script = '''
+hook_dir = set ".git/hooks"
+hook_file = set "${hook_dir}/pre-push"
+mkdir ${hook_dir}
+hook_content = set "#!/bin/sh\n# Installed by: cargo make hook-install\ncargo make check"
+writefile ${hook_file} ${hook_content}
+echo "Installed pre-push hook -> ${hook_file}"
+'''
