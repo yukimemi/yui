@@ -35,7 +35,7 @@ camino = { version = "1.2.2", features = ["serde1"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 globset = "0.4.18"
 ignore = "0.4.25"
-indicatif = "0.17"
+indicatif = "0.18.4"
 jiff = { version = "0.2.24", features = ["serde"] }
 owo-colors = "4.3.0"
 same-file = "1.0.6"
