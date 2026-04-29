@@ -1839,6 +1839,7 @@ dependencies = [
  "junction",
  "owo-colors",
  "predicates",
+ "same-file",
  "serde",
  "similar",
  "tempfile",
