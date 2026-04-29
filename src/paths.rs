@@ -65,8 +65,16 @@ pub fn load_yuiignore(source: &Utf8Path) -> crate::Result<ignore::gitignore::Git
         .map_err(|e| crate::Error::Config(format!("building .yuiignore: {e}")))
 }
 
-/// Test a path against the loaded `.yuiignore` matcher. `path` may be
-/// absolute or relative to `source` — relative is computed automatically.
+/// Test a path against the loaded `.yuiignore` matcher.
+///
+/// `path` is treated relative to `source` (gitignore convention). Paths
+/// that don't live under `source` can't possibly match a source-rooted
+/// rule, so they short-circuit to `false`. Without this guard, an
+/// absolute path passed through `unwrap_or(path)` would land on the
+/// matcher as an absolute, which `Gitignore` would test using its
+/// rightmost component — leading to spurious matches for paths outside
+/// the repo. (Caught in PR #19 review.)
+///
 /// Uses `matched_path_or_any_parents` so an ignored ancestor directory
 /// causes the descendant file to be ignored too.
 pub fn is_ignored(
@@ -75,7 +83,9 @@ pub fn is_ignored(
     path: &Utf8Path,
     is_dir: bool,
 ) -> bool {
-    let rel = path.strip_prefix(source).unwrap_or(path);
+    let Ok(rel) = path.strip_prefix(source) else {
+        return false;
+    };
     matches!(
         gi.matched_path_or_any_parents(rel.as_std_path(), is_dir),
         ignore::Match::Ignore(_)

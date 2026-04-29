@@ -51,9 +51,12 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     let source = resolve_source(source)?;
     let yui = YuiVars::detect(&source);
     let config = config::load(&source, &yui)?;
+    // Load `.yuiignore` once and thread through render + walk so the
+    // matcher isn't re-built per-flow.
+    let yuiignore = paths::load_yuiignore(&source)?;
 
     // 1. Render templates first so the link walk picks up rendered files.
-    let render_report = render::render_all(&source, &config, &yui, dry_run)?;
+    let render_report = render::render_all(&source, &config, &yui, &yuiignore, dry_run)?;
     log_render_report(&render_report);
     if render_report.has_drift() {
         anyhow::bail!(
@@ -73,7 +76,6 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     )?;
 
     let backup_root = source.join(&config.backup.dir);
-    let yuiignore = paths::load_yuiignore(&source)?;
     let ctx = ApplyCtx {
         config: &config,
         source: &source,
@@ -417,8 +419,9 @@ pub fn render(source: Option<Utf8PathBuf>, check: bool, dry_run: bool) -> Result
     let source = resolve_source(source)?;
     let yui = YuiVars::detect(&source);
     let config = config::load(&source, &yui)?;
+    let yuiignore = paths::load_yuiignore(&source)?;
     // --check is a stricter dry-run: never writes, exits non-zero on drift.
-    let report = render::render_all(&source, &config, &yui, dry_run || check)?;
+    let report = render::render_all(&source, &config, &yui, &yuiignore, dry_run || check)?;
     log_render_report(&report);
     if check && report.has_drift() {
         anyhow::bail!("render drift detected ({} file(s))", report.diverged.len());
@@ -479,10 +482,14 @@ pub fn status(
     let color = !no_color && supports_color_stdout();
 
     let mut report: Vec<StatusItem> = Vec::new();
+    // Load `.yuiignore` once and reuse for both render-drift detection
+    // and the link-drift walk below.
+    let yuiignore = paths::load_yuiignore(&source)?;
 
     // 1. Template drift — render in dry-run mode and surface anything
     //    whose rendered counterpart on disk no longer matches.
-    let render_report = render::render_all(&source, &config, &yui, /* dry_run */ true)?;
+    let render_report =
+        render::render_all(&source, &config, &yui, &yuiignore, /* dry_run */ true)?;
     for rendered in &render_report.diverged {
         // `diverged` holds the rendered path; the template lives at
         // `<rendered>.tera`. Show the .tera as src so it's clear which
@@ -496,7 +503,6 @@ pub fn status(
     }
 
     // 2. Link drift — classify each src→dst pair under every mount.
-    let yuiignore = paths::load_yuiignore(&source)?;
     for m in &mounts {
         let src_root = source.join(&m.src);
         if !src_root.is_dir() {
@@ -801,9 +807,18 @@ pub fn absorb(source: Option<Utf8PathBuf>, target: Utf8PathBuf, dry_run: bool) -
 
     let mut engine = template::Engine::new();
     let tera_ctx = template::template_context(&yui, &config.vars);
+    // Single load — the matcher is shared with both find_source_for_target
+    // and the eventual ApplyCtx below.
+    let yuiignore = paths::load_yuiignore(&source)?;
 
-    let src_path = match find_source_for_target(&source, &config, &target, &mut engine, &tera_ctx)?
-    {
+    let src_path = match find_source_for_target(
+        &source,
+        &config,
+        &target,
+        &mut engine,
+        &tera_ctx,
+        &yuiignore,
+    )? {
         Some(s) => s,
         None => anyhow::bail!(
             "no mount entry / .yuilink override claims target {target}; \
@@ -819,7 +834,6 @@ pub fn absorb(source: Option<Utf8PathBuf>, target: Utf8PathBuf, dry_run: bool) -
     }
 
     let backup_root = source.join(&config.backup.dir);
-    let yuiignore = paths::load_yuiignore(&source)?;
     let ctx = ApplyCtx {
         config: &config,
         source: &source,
@@ -844,9 +858,8 @@ fn find_source_for_target(
     target: &Utf8Path,
     engine: &mut template::Engine,
     tera_ctx: &TeraContext,
+    yuiignore: &ignore::gitignore::Gitignore,
 ) -> Result<Option<Utf8PathBuf>> {
-    let yuiignore = paths::load_yuiignore(source)?;
-
     // 1. Mount entries — render dst, see if target is inside it.
     for entry in &config.mount.entry {
         if let Some(when) = &entry.when {
@@ -861,7 +874,7 @@ fn find_source_for_target(
             // Honor `.yuiignore` even on manual absorb — if you've
             // ignored a path, you've explicitly opted out of yui's
             // managing it.
-            if paths::is_ignored(&yuiignore, source, &candidate, candidate.is_dir()) {
+            if paths::is_ignored(yuiignore, source, &candidate, candidate.is_dir()) {
                 continue;
             }
             return Ok(Some(candidate));
@@ -892,7 +905,7 @@ fn find_source_for_target(
             Ok(p) => p,
             Err(_) => continue,
         };
-        if paths::is_ignored(&yuiignore, source, &dir_utf8, true) {
+        if paths::is_ignored(yuiignore, source, &dir_utf8, true) {
             continue;
         }
         let spec = match marker::read_spec(&dir_utf8, marker_filename)? {
