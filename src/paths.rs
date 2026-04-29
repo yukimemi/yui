@@ -40,6 +40,58 @@ pub fn home_dir() -> Option<Utf8PathBuf> {
         .map(Utf8PathBuf::from)
 }
 
+/// Load `$source/.yuiignore` as a gitignore-style matcher.
+///
+/// Returns an empty matcher when the file is absent (so `is_ignored`
+/// becomes a no-op). Patterns use full gitignore syntax: glob (`*`,
+/// `**`), negation (`!`), trailing-slash dir-only matching, comments
+/// (`#`).
+///
+/// Currently only the repo-root `.yuiignore` is honored — nested
+/// `.yuiignore` files inside subdirectories are not yet walked. (The
+/// 95% case is "exclude `**/lock.json` once at the top".) If you need
+/// per-subtree rules, file an issue with the use case.
+pub fn load_yuiignore(source: &Utf8Path) -> crate::Result<ignore::gitignore::Gitignore> {
+    let path = source.join(".yuiignore");
+    if !path.is_file() {
+        return Ok(ignore::gitignore::Gitignore::empty());
+    }
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(source);
+    if let Some(e) = builder.add(path.as_std_path()) {
+        return Err(crate::Error::Config(format!("parsing {path}: {e}")));
+    }
+    builder
+        .build()
+        .map_err(|e| crate::Error::Config(format!("building .yuiignore: {e}")))
+}
+
+/// Test a path against the loaded `.yuiignore` matcher.
+///
+/// `path` is treated relative to `source` (gitignore convention). Paths
+/// that don't live under `source` can't possibly match a source-rooted
+/// rule, so they short-circuit to `false`. Without this guard, an
+/// absolute path passed through `unwrap_or(path)` would land on the
+/// matcher as an absolute, which `Gitignore` would test using its
+/// rightmost component — leading to spurious matches for paths outside
+/// the repo. (Caught in PR #19 review.)
+///
+/// Uses `matched_path_or_any_parents` so an ignored ancestor directory
+/// causes the descendant file to be ignored too.
+pub fn is_ignored(
+    gi: &ignore::gitignore::Gitignore,
+    source: &Utf8Path,
+    path: &Utf8Path,
+    is_dir: bool,
+) -> bool {
+    let Ok(rel) = path.strip_prefix(source) else {
+        return false;
+    };
+    matches!(
+        gi.matched_path_or_any_parents(rel.as_std_path(), is_dir),
+        ignore::Match::Ignore(_)
+    )
+}
+
 /// Build a source-tree walker that skips yui's internal `.yui/` directory.
 ///
 /// `.yui/backup/` can grow huge over time, and `.yui/rendered/` (future)
