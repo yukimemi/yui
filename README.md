@@ -60,6 +60,15 @@ target missing?                                  → Restore
 copies target's content into source before relinking — your local
 edit is preserved, even when an editor saved over the link.
 
+For directories the same target-wins merge applies: target's files
+land in source (overwriting on conflict), source-only scaffolding
+(like `.yuilink` markers) survives, and the dir is then re-exposed
+via a platform-appropriate link back to source — junction on
+Windows, symlink on Unix/macOS, or whatever the configured `dir_mode`
+resolves to. Non-regular entries inside the target — junctions,
+symlinks, device files — are skipped with a warning since following
+them safely is ill-defined.
+
 ## Install
 
 ```sh

@@ -1470,46 +1470,223 @@ fn link_dir_with_backup(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>) -> R
             link::link_dir(src, dst, ctx.dir_mode)?;
             Ok(())
         }
-        _ => {
-            // Directory drift: we don't deep-merge the contents (apps can
-            // legitimately add files inside a junction'd dir, and yui has
-            // no way to know which side is authoritative). Fall back to
-            // backup + replace, the same behaviour as before the
-            // absorb classifier landed.
-            backup_existing(dst, ctx.backup_root, /* is_dir */ true)?;
-            // `link::unlink` is intentionally conservative: it refuses to
-            // recursively delete a non-empty regular directory. That's
-            // the right default for ad-hoc cleanup, but here we have
-            // *just* backed the directory up, so a recursive remove is
-            // safe — the user's pre-yui content is preserved under
-            // `.yui/backup/...`. Without this fall-through the absorb
-            // chokes on `Directory not empty` (Windows error 145) for
-            // anything migrated from a per-file dotfiles manager.
-            //
-            // Narrow the fallback to the case it's actually for: the
-            // target still exists and is a real (non-link) directory.
-            // Anything else — permission denied, I/O error, the path
-            // suddenly being a file or junction — propagates instead
-            // of being silently coerced into `remove_dir_all`.
-            if let Err(unlink_err) = link::unlink(dst) {
-                let meta = std::fs::symlink_metadata(dst).with_context(|| {
-                    format!("stat {dst} after link::unlink failed: {unlink_err}")
-                })?;
-                let ft = meta.file_type();
-                if ft.is_dir() && !ft.is_symlink() {
-                    std::fs::remove_dir_all(dst).with_context(|| {
-                        format!(
-                            "remove_dir_all({dst}) after link::unlink failed: \
-                             {unlink_err}"
-                        )
-                    })?;
-                } else {
-                    return Err(unlink_err).with_context(|| format!("unlink({dst}) before relink"));
-                }
-            }
+        RelinkOnly => {
+            // For dirs the classifier doesn't currently produce
+            // `RelinkOnly` (only InSync / NeedsConfirm), but handle it
+            // for symmetry with the file path: contents already match,
+            // so just swap the target for a junction to source.
             info!("relink dir: {src} → {dst}");
+            remove_dir_link_or_real(dst)?;
             link::link_dir(src, dst, ctx.dir_mode)?;
             Ok(())
+        }
+        AutoAbsorb | NeedsConfirm => {
+            // Reaching `link_dir_with_backup` means we're acting on a
+            // `.yuilink` marker (or a `[[mount.entry]]` whose `src` is a
+            // directory) — the user has explicitly opted into
+            // "this whole subtree is target-as-truth". A dir-level
+            // NeedsConfirm here is therefore *not* the same kind of
+            // anomaly that file-level NeedsConfirm represents (a single
+            // file the user edited and source got newer); it's just
+            // "source and target dirs are different inodes" — the
+            // marker already authorised us to merge.
+            //
+            // Per-file content conflicts *inside* the merge are still
+            // a real concern (target has X, source has X with
+            // different content). Those are surfaced from inside the
+            // merge itself — see `merge_dir_target_into_source`'s
+            // file-level dispatch — so the outer-dir decision falls
+            // straight through to absorb.
+            //
+            // The `auto` / `require_clean_git` knobs still gate, so
+            // turning them off restores the prompt before any
+            // whole-dir absorb.
+            if !ctx.config.absorb.auto {
+                return handle_anomaly_dir(
+                    src,
+                    dst,
+                    ctx,
+                    "absorb.auto = false; treating divergence as anomaly",
+                );
+            }
+            if ctx.config.absorb.require_clean_git && !source_repo_is_clean(ctx.source) {
+                return handle_anomaly_dir(
+                    src,
+                    dst,
+                    ctx,
+                    "source repo is dirty; deferring auto-absorb",
+                );
+            }
+            absorb_target_dir_into_source(src, dst, ctx)
+        }
+    }
+}
+
+/// `link::unlink` with a documented fallback for the chezmoi-migration
+/// shape: target is a real (non-link) directory packed with files. The
+/// caller is responsible for ensuring the target's prior content is
+/// preserved (in `.yui/backup/...` or because we just merged it into
+/// source) before reaching here.
+///
+/// Anything other than the "non-empty regular dir" case — permission
+/// denied, target gone, target now a junction or symlink — propagates
+/// rather than being silently coerced into `remove_dir_all`.
+fn remove_dir_link_or_real(dst: &Utf8Path) -> Result<()> {
+    if let Err(unlink_err) = link::unlink(dst) {
+        let meta = std::fs::symlink_metadata(dst)
+            .with_context(|| format!("stat {dst} after link::unlink failed: {unlink_err}"))?;
+        let ft = meta.file_type();
+        if ft.is_dir() && !ft.is_symlink() {
+            std::fs::remove_dir_all(dst).with_context(|| {
+                format!(
+                    "remove_dir_all({dst}) after link::unlink failed: \
+                     {unlink_err}"
+                )
+            })?;
+        } else {
+            return Err(unlink_err).with_context(|| format!("unlink({dst}) before relink"));
+        }
+    }
+    Ok(())
+}
+
+/// Recursively merge target's files into source: target wins on file
+/// conflicts, source-only files are preserved, sub-dirs are created
+/// in source as needed. Non-regular entries (symlinks / junctions /
+/// device files) are skipped with a warning — copying their content
+/// is ill-defined and following them risks looping into target via
+/// some chain back to source.
+///
+/// Mirrors the file-level "AutoAbsorb backs up source, copies target's
+/// content into source before relinking" semantic for whole dirs.
+fn merge_dir_target_into_source(target: &Utf8Path, source: &Utf8Path) -> Result<()> {
+    for entry in std::fs::read_dir(target)? {
+        let entry = entry?;
+        let name_os = entry.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        let target_path = target.join(name);
+        let source_path = source.join(name);
+        let ft = entry.file_type()?;
+
+        if ft.is_dir() && !ft.is_symlink() {
+            // Target is a real dir. If source has a non-dir entry at
+            // the same name (regular file, symlink, junction), it
+            // would block `create_dir_all` and the recursive merge.
+            // Honor target-wins by clearing the conflicting source
+            // entry first.
+            if let Ok(src_meta) = std::fs::symlink_metadata(&source_path) {
+                let sft = src_meta.file_type();
+                if !sft.is_dir() || sft.is_symlink() {
+                    link::unlink(&source_path).with_context(|| {
+                        format!("remove conflicting source entry before dir merge: {source_path}")
+                    })?;
+                }
+            }
+            if !source_path.exists() {
+                std::fs::create_dir_all(&source_path).with_context(|| {
+                    format!("create_dir_all({source_path}) during target→source merge")
+                })?;
+            }
+            merge_dir_target_into_source(&target_path, &source_path)?;
+        } else if ft.is_file() {
+            // Target is a regular file. Symmetrical handling: if
+            // source has a directory or symlink at the same name,
+            // tear it down first so the file copy can land.
+            if let Ok(src_meta) = std::fs::symlink_metadata(&source_path) {
+                let sft = src_meta.file_type();
+                if sft.is_dir() && !sft.is_symlink() {
+                    remove_dir_link_or_real(&source_path).with_context(|| {
+                        format!("remove conflicting source dir before file merge: {source_path}")
+                    })?;
+                } else if sft.is_symlink() {
+                    link::unlink(&source_path).with_context(|| {
+                        format!(
+                            "remove conflicting source symlink before file merge: {source_path}"
+                        )
+                    })?;
+                }
+            }
+            if let Some(parent) = source_path.parent() {
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            std::fs::copy(&target_path, &source_path)
+                .with_context(|| format!("copy({target_path} → {source_path}) during merge"))?;
+        } else {
+            warn!(
+                "merge: skipping non-regular entry {target_path} \
+                 (symlink / junction / special — content not copied)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Back up source-side, merge target's content into source (target
+/// wins on conflict), then replace target with a junction to source.
+/// "Target wins" — yui's core philosophy, generalised from the file
+/// path to whole directories so a chezmoi-style migrated `~/.config/`
+/// keeps every file the user actually had instead of stranding most
+/// of them in `.yui/backup/...`.
+fn absorb_target_dir_into_source(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>) -> Result<()> {
+    info!("absorb dir: {dst} → {src}");
+    backup_existing(src, ctx.backup_root, /* is_dir */ true)?;
+    merge_dir_target_into_source(dst, src)?;
+    // Source now carries every regular file from target. Tear down the
+    // original target dir and re-expose source via a junction.
+    remove_dir_link_or_real(dst)?;
+    link::link_dir(src, dst, ctx.dir_mode)?;
+    Ok(())
+}
+
+/// Dir-level counterpart to `handle_anomaly`. Same `[absorb] on_anomaly`
+/// dispatch — `skip` warns and walks away, `force` absorbs anyway,
+/// `ask` prompts on a TTY (downgraded to skip off-TTY).
+fn handle_anomaly_dir(
+    src: &Utf8Path,
+    dst: &Utf8Path,
+    ctx: &ApplyCtx<'_>,
+    reason: &str,
+) -> Result<()> {
+    use crate::config::AnomalyAction::*;
+    match ctx.config.absorb.on_anomaly {
+        Skip => {
+            warn!("anomaly skip dir: {dst} ({reason})");
+            Ok(())
+        }
+        Force => {
+            warn!(
+                "anomaly force dir: {dst} ({reason}) \
+                 — absorbing target into source"
+            );
+            absorb_target_dir_into_source(src, dst, ctx)
+        }
+        Ask => {
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                eprintln!();
+                eprintln!("anomaly: {dst}");
+                eprintln!("  {reason}");
+                eprintln!("  source: {src}");
+                eprint!("  absorb target dir into source? (y/N) ");
+                use std::io::{BufRead as _, Write as _};
+                std::io::stderr().flush().ok();
+                let mut buf = String::new();
+                std::io::stdin().lock().read_line(&mut buf)?;
+                let answer = buf.trim();
+                if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+                    absorb_target_dir_into_source(src, dst, ctx)
+                } else {
+                    warn!("anomaly skipped by user: {dst}");
+                    Ok(())
+                }
+            } else {
+                warn!("anomaly skip (non-TTY ask mode): {dst} ({reason})");
+                Ok(())
+            }
         }
     }
 }
@@ -2192,8 +2369,13 @@ dst = "{}"
     /// inside is an individual hardlink) used to fail the absorb with
     /// `Directory not empty` because `link::unlink` refuses to recurse.
     /// After backup we now `remove_dir_all` as a fallback.
+    ///
+    /// v0.7+: also exercises the target-wins merge — target's
+    /// `config.toml` overwrites source's, target's `state.json` lands
+    /// in source (target was the source of truth), and source-only
+    /// scaffolding (`.yuilink`) survives the absorb.
     #[test]
-    fn apply_replaces_non_empty_target_dir_after_backup() {
+    fn apply_absorbs_non_empty_target_dir_target_wins() {
         let tmp = TempDir::new().unwrap();
         let source = utf8(tmp.path().join("dotfiles"));
         let target = utf8(tmp.path().join("target"));
@@ -2203,6 +2385,8 @@ dst = "{}"
         // — same shape as a typical home/.config/.yuilink.
         std::fs::write(source.join("home/.config/.yuilink"), "").unwrap();
         std::fs::write(source.join("home/.config/app/config.toml"), "src side").unwrap();
+        // Source-only scaffolding that the absorb must preserve.
+        std::fs::write(source.join("home/.config/app/source-only.toml"), "src").unwrap();
         // Pre-existing non-empty regular dir at the target — chezmoi /
         // any per-file dotfiles flow leaves things in this shape.
         std::fs::write(target.join(".config/app/config.toml"), "target side").unwrap();
@@ -2224,23 +2408,133 @@ dst = "{}"
         // Used to bail with `unlink: ... Directory not empty` here.
         apply(Some(source.clone()), false).unwrap();
 
-        // ~/.config now reaches source/home/.config via the link.
+        // Target wins on the conflicting file.
         assert_eq!(
             std::fs::read_to_string(target.join(".config/app/config.toml")).unwrap(),
-            "src side"
+            "target side"
         );
-        // Pre-existing target content is preserved in `.yui/backup/`.
+        // Target-only file is now reachable via the junction.
+        assert_eq!(
+            std::fs::read_to_string(target.join(".config/app/state.json")).unwrap(),
+            "{}"
+        );
+        // Source's pre-merge state was backed up before being overwritten,
+        // so the original "src side" / `.yuilink` survive in `.yui/backup/`.
         let backup_root = source.join(".yui/backup");
-        let mut found_backup_state = false;
+        let mut backup_files: Vec<String> = Vec::new();
         for entry in walkdir(&backup_root) {
-            if entry.file_name() == Some("state.json") {
-                found_backup_state = true;
-                break;
+            if let Some(n) = entry.file_name() {
+                backup_files.push(n.to_string());
             }
         }
         assert!(
-            found_backup_state,
-            "expected target's state.json to land in the backup tree"
+            backup_files.iter().any(|f| f == "config.toml"),
+            "expected source's config.toml to land in the backup tree, got {backup_files:?}"
+        );
+        // Source-only scaffolding survives the merge.
+        assert!(
+            source.join("home/.config/app/source-only.toml").exists(),
+            "source-only file should survive a target-wins merge"
+        );
+        // Source picked up target-only state.json via the merge.
+        assert!(
+            source.join("home/.config/app/state.json").exists(),
+            "target-only state.json should be merged into source"
+        );
+    }
+
+    /// v0.7+: `home/.config/.yuilink` is the user's explicit
+    /// "this whole subtree is target-as-truth" declaration. A
+    /// dir-level NeedsConfirm at the marker root is therefore not a
+    /// real anomaly — the marker is consent. Default `[absorb]` (ask
+    /// + require_clean_git) should still absorb, no prompt.
+    #[test]
+    fn marker_dir_absorbs_with_default_ask_policy() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let target = utf8(tmp.path().join("target"));
+        std::fs::create_dir_all(source.join("home/.config")).unwrap();
+        std::fs::create_dir_all(target.join(".config/gh")).unwrap();
+        // Marker — user opts the whole .config dir into target-as-truth.
+        std::fs::write(source.join("home/.config/.yuilink"), "").unwrap();
+        // gh exists only on the target side (no entry in source).
+        std::fs::write(target.join(".config/gh/hosts.yml"), "oauth_token: x\n").unwrap();
+
+        // Default [absorb] (no override) — `on_anomaly = "ask"`,
+        // `auto = true`, `require_clean_git = true`. Pre-v0.7 this
+        // would have been routed through the ask prompt at dir level.
+        let cfg = format!(
+            r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+            toml_path(&target)
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+        // Even with default `ask`, the marker-rooted absorb proceeds.
+        // Test would hang on a stdin prompt if dir-level still treated
+        // this as an anomaly.
+        apply(Some(source.clone()), false).unwrap();
+
+        // Target-only file is now reachable through the junction and
+        // recorded in source.
+        assert!(target.join(".config/gh/hosts.yml").exists());
+        assert!(source.join("home/.config/gh/hosts.yml").exists());
+    }
+
+    /// File↔dir collisions during merge. Honor target-wins: if source
+    /// has a regular file at a path where target has a dir, the file
+    /// gets removed and the dir is created. Symmetrical for the
+    /// inverse case. Without the conflict-clearing the merge would
+    /// fail with `not a directory` / `path exists` deep in the recursion.
+    #[test]
+    fn merge_handles_file_vs_dir_collisions_target_wins() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let target = utf8(tmp.path().join("target"));
+        std::fs::create_dir_all(source.join("home/.config/foo")).unwrap();
+        std::fs::create_dir_all(target.join(".config")).unwrap();
+        std::fs::write(source.join("home/.config/.yuilink"), "").unwrap();
+
+        // Conflict A: source has `foo` as dir, target has `foo` as file.
+        std::fs::write(source.join("home/.config/foo/leaf.txt"), "src").unwrap();
+        std::fs::write(target.join(".config/foo"), "target file body").unwrap();
+        // Conflict B: source has `bar` as file, target has `bar` as dir.
+        std::fs::write(source.join("home/.config/bar"), "src file body").unwrap();
+        std::fs::create_dir_all(target.join(".config/bar")).unwrap();
+        std::fs::write(target.join(".config/bar/inside.txt"), "target nested").unwrap();
+
+        let cfg = format!(
+            r#"
+[absorb]
+on_anomaly = "force"
+
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+            toml_path(&target)
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+        apply(Some(source.clone()), false).unwrap();
+
+        // After absorb the target's view (which equals source via
+        // junction) carries target's shapes:
+        // `foo` is a regular file
+        let foo_meta = std::fs::symlink_metadata(target.join(".config/foo")).unwrap();
+        assert!(foo_meta.file_type().is_file(), "foo should be a file");
+        assert_eq!(
+            std::fs::read_to_string(target.join(".config/foo")).unwrap(),
+            "target file body"
+        );
+        // `bar` is a directory with the nested file
+        let bar_meta = std::fs::symlink_metadata(target.join(".config/bar")).unwrap();
+        assert!(bar_meta.file_type().is_dir(), "bar should be a dir");
+        assert_eq!(
+            std::fs::read_to_string(target.join(".config/bar/inside.txt")).unwrap(),
+            "target nested"
         );
     }
 
