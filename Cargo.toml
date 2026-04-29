@@ -40,7 +40,7 @@ jiff = { version = "0.2.24", features = ["serde"] }
 owo-colors = "4"
 same-file = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = "1.0.149"
 sha2 = "0.10"
 similar = "2"
 tera = "1"
