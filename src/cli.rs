@@ -3,6 +3,7 @@ use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 
 use crate::cmd;
+use crate::config::IconsMode;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -55,6 +56,19 @@ pub enum Command {
     /// Show drift status (link-broken / replaced / template-drift)
     Status,
 
+    /// List all src→dst link mappings (mount entries + .yuilink overrides)
+    List {
+        /// Include entries whose `when` evaluates false on the current host
+        #[arg(long)]
+        all: bool,
+        /// Override [ui] icons mode for this invocation
+        #[arg(long, value_name = "MODE")]
+        icons: Option<IconsMode>,
+        /// Disable color output (also respected via NO_COLOR env)
+        #[arg(long)]
+        no_color: bool,
+    },
+
     /// Manually absorb a target into source (when auto-absorb skipped)
     Absorb {
         target: Utf8PathBuf,
@@ -83,6 +97,11 @@ impl Cli {
             Command::Link { dry_run } => cmd::link(source, dry_run),
             Command::Unlink { paths } => cmd::unlink(source, paths),
             Command::Status => cmd::status(source),
+            Command::List {
+                all,
+                icons,
+                no_color,
+            } => cmd::list(source, all, icons, no_color),
             Command::Absorb { target, dry_run } => cmd::absorb(source, target, dry_run),
             Command::Doctor => cmd::doctor(source),
             Command::GcBackup { older_than } => cmd::gc_backup(source, older_than),

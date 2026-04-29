@@ -36,6 +36,27 @@ pub struct Config {
 
     #[serde(default)]
     pub backup: BackupConfig,
+
+    #[serde(default)]
+    pub ui: UiConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct UiConfig {
+    #[serde(default)]
+    pub icons: IconsMode,
+}
+
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum IconsMode {
+    /// `✓ ✗ → ─` — works on any terminal that renders basic Unicode (default).
+    #[default]
+    Unicode,
+    /// Nerd Font glyphs (`  →`) — requires a Nerd-Font-patched terminal font.
+    Nerd,
+    /// `[+] [-] -> -` — pure ASCII, for CI logs / SSH-into-legacy-tty.
+    Ascii,
 }
 
 #[derive(Debug, Deserialize, Default)]

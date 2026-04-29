@@ -4,6 +4,7 @@ pub mod cli;
 pub mod cmd;
 pub mod config;
 pub mod error;
+pub mod icons;
 pub mod link;
 pub mod marker;
 pub mod mount;

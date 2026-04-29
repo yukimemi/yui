@@ -66,6 +66,22 @@ pub fn template_context<V: Serialize>(yui: &YuiVars, vars: &V) -> Context {
     ctx
 }
 
+/// Evaluate a Tera expression as a truthy/falsy boolean. Accepts either a
+/// bare expression (`yui.os == 'linux'`) or a pre-wrapped one
+/// (`{{ yui.os == 'linux' }}`); used wherever the user writes a `when`
+/// condition (mount entry, render rule, marker link, file-header).
+pub fn eval_truthy(expr: &str, engine: &mut Engine, ctx: &Context) -> Result<bool> {
+    let trimmed = expr.trim_start();
+    let to_render = if trimmed.starts_with("{{") || trimmed.starts_with("{%") {
+        expr.to_string()
+    } else {
+        format!("{{{{ {expr} }}}}")
+    };
+    let out = engine.render(&to_render, ctx)?;
+    let s = out.trim();
+    Ok(s.eq_ignore_ascii_case("true") || s == "1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
