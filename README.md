@@ -69,6 +69,14 @@ resolves to. Non-regular entries inside the target — junctions,
 symlinks, device files — are skipped with a warning since following
 them safely is ill-defined.
 
+Per-file content collisions inside the merge run through the same
+absorb classifier the file-level path uses: identical content is a
+no-op, target-newer copies through (AutoAbsorb), and source-newer +
+diff defers to `[absorb] on_anomaly` (skip / force / ask). The
+marker is consent for the *whole-tree* merge, but a single file
+where the source side is newer is still a real anomaly worth
+surfacing.
+
 ## Install
 
 ```sh
