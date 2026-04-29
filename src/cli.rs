@@ -1,12 +1,34 @@
 use anyhow::Result;
 use camino::Utf8PathBuf;
+use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand};
 
 use crate::cmd;
 use crate::config::IconsMode;
 
+/// Explicit colour palette for `--help` output. clap honours `NO_COLOR`
+/// and falls back to monochrome when stdout isn't a TTY, so this is
+/// safe to leave on unconditionally — the styled bytes are only ever
+/// emitted when a real terminal is reading them. The palette mirrors
+/// the bind-points / icon colours used in `yui list` / `yui status` so
+/// help, list, and status all feel like the same tool.
+const HELP_STYLES: Styles = Styles::styled()
+    // "Commands:" / "Options:" / etc. section headers.
+    .header(AnsiColor::BrightCyan.on_default().effects(Effects::BOLD))
+    // The "Usage:" heading label itself (NOT the binary name — that
+    // falls under `literal` below).
+    .usage(AnsiColor::BrightCyan.on_default().effects(Effects::BOLD))
+    // Binary name in the usage line + every subcommand / option
+    // literal (`init`, `--source`, …).
+    .literal(AnsiColor::Magenta.on_default().effects(Effects::BOLD))
+    // <PLACEHOLDER> values inside option signatures.
+    .placeholder(AnsiColor::Cyan.on_default())
+    .error(AnsiColor::Red.on_default().effects(Effects::BOLD))
+    .valid(AnsiColor::Green.on_default())
+    .invalid(AnsiColor::Yellow.on_default().effects(Effects::BOLD));
+
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
+#[command(version, about, long_about = None, styles = HELP_STYLES)]
 pub struct Cli {
     /// Path to dotfiles source repository ($DOTFILES)
     #[arg(short, long, env = "YUI_SOURCE", global = true)]
