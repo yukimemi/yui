@@ -5,6 +5,7 @@ pub mod cmd;
 pub mod config;
 pub mod error;
 pub mod git;
+pub mod hook;
 pub mod icons;
 pub mod link;
 pub mod marker;

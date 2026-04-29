@@ -160,6 +160,65 @@ Currently only the repo-root `.yuiignore` is honored — nested
 `.yuiignore` files inside subdirectories are not yet walked, so put
 all your rules at the top.
 
+## Hooks — run scripts around `apply`
+
+Drop a script under `$DOTFILES/.yui/bin/` and reference it with a
+`[[hook]]` entry. The script stays a normal executable (you can run
+it directly without yui); yui just decides *when* to invoke it.
+
+```toml
+[[hook]]
+name   = "brew-bundle"
+script = ".yui/bin/brew-bundle.sh"
+# Defaults: command="bash", args=["{{ script_path }}"], when_run="onchange", phase="post"
+when   = "yui.os == 'macos'"
+```
+
+Schema:
+
+| field | required? | default | meaning |
+|---|---|---|---|
+| `name` | ✓ | — | unique identifier (state-tracking key, `yui hooks run <name>`) |
+| `script` | ✓ | — | path to script, relative to `$DOTFILES` |
+| `command` | | `"bash"` | Tera-templated interpreter |
+| `args` | | `["{{ script_path }}"]` | Tera-templated each |
+| `when_run` | | `"onchange"` | `once` \| `onchange` \| `every` |
+| `phase` | | `"post"` | `pre` \| `post` (around `apply`) |
+| `when` | | _always_ | optional Tera bool predicate |
+
+`onchange` re-runs whenever the script's SHA-256 differs from the
+last successful run. State is tracked in `$DOTFILES/.yui/state.json`
+(gitignored — it's per-machine).
+
+`command` and each `args` element are Tera-rendered with the standard
+`yui.*` / `vars.*` / `env(...)` plus these extras for the script:
+`script_path`, `script_dir`, `script_name`, `script_stem`,
+`script_ext`. Example with a Deno script:
+
+```toml
+[[hook]]
+name = "denops-build"
+script = ".yui/bin/build.ts"
+command = "deno"
+args = ["run", "-A", "{{ script_path }}"]
+when_run = "onchange"
+phase = "post"
+when = "yui.os != 'windows'"
+```
+
+Manual control:
+
+```sh
+yui hooks list                    # what's configured + last-run state
+yui hooks run                     # run all hooks per their rules
+yui hooks run brew-bundle         # run just this one (still honors `when`)
+yui hooks run brew-bundle --force # bypass when_run state check
+```
+
+`apply` runs `pre` hooks before render/link and `post` hooks after
+all linking. A failing hook stops `apply` immediately — fix the
+script, then re-run.
+
 ## Anomalies and the `[absorb]` policy
 
 When source AND target both diverge from each other, `yui` can't
@@ -194,6 +253,8 @@ Need to absorb a single file regardless of policy? `yui absorb
 | `yui unlink <path>...` | tear down a specific link |
 | `yui doctor` | environment sanity check |
 | `yui gc-backup [--older-than DUR]` | clean old backups (**not yet implemented** — calling it errors out) |
+| `yui hooks list` | show configured `[[hook]]` entries + last-run state |
+| `yui hooks run [<name>] [--force]` | run hooks on demand (bypassing `when_run` with `--force`) |
 
 `--icons` accepts `unicode` (default), `nerd` (Nerd-Font glyphs),
 `ascii` (CI-log-safe). The `[ui] icons = "..."` config key sets it
@@ -204,7 +265,6 @@ globally.
 `v0.4.0` ships the absorb story end-to-end — chezmoi-replacement
 ready for simple repos. Known gaps:
 
-- no hook-script support (chezmoi's `run_*` scripts)
 - no built-in encryption (use `pass` / `1password-cli` from a Tera
   template instead)
 - chezmoi name-prefix translation (`dot_zshrc` → `.zshrc`,
