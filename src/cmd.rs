@@ -438,7 +438,11 @@ pub fn unlink(source: Option<Utf8PathBuf>, paths_arg: Vec<Utf8PathBuf>) -> Resul
 ///
 /// Walks each `[[mount.entry]]`'s source tree, honoring `.yuilink`
 /// markers (PassThrough = single dir-level link, Override = one or more
-/// custom dsts), and classifies each pair via [`crate::absorb::classify`].
+/// custom dsts), classifies each pair via [`crate::absorb::classify`],
+/// and additionally surfaces any **render drift** — rendered files
+/// whose content has diverged from what the matching `.tera` template
+/// would produce now (i.e. the user edited the rendered file in place
+/// without reflecting the change back into the template).
 ///
 /// Exits non-zero (via `anyhow::bail!`) when anything diverges, so
 /// `yui status && …` can gate workflows on a clean tree.
@@ -465,6 +469,23 @@ pub fn status(
     let color = !no_color && supports_color_stdout();
 
     let mut report: Vec<StatusItem> = Vec::new();
+
+    // 1. Template drift — render in dry-run mode and surface anything
+    //    whose rendered counterpart on disk no longer matches.
+    let render_report = render::render_all(&source, &config, &yui, /* dry_run */ true)?;
+    for rendered in &render_report.diverged {
+        // `diverged` holds the rendered path; the template lives at
+        // `<rendered>.tera`. Show the .tera as src so it's clear which
+        // file the user needs to update.
+        let tera_path = Utf8PathBuf::from(format!("{rendered}.tera"));
+        report.push(StatusItem {
+            src: relative_for_display(&source, &tera_path),
+            dst: rendered.clone(),
+            state: StatusState::RenderDrift,
+        });
+    }
+
+    // 2. Link drift — classify each src→dst pair under every mount.
     for m in &mounts {
         let src_root = source.join(&m.src);
         if !src_root.is_dir() {
@@ -487,10 +508,7 @@ pub fn status(
 
     print_status_table(&report, icons, color);
 
-    let drift = report
-        .iter()
-        .filter(|r| !matches!(r.decision, absorb::AbsorbDecision::InSync))
-        .count();
+    let drift = report.iter().filter(|r| !r.state.is_in_sync()).count();
 
     println!();
     let total = report.len();
@@ -508,9 +526,23 @@ pub fn status(
 struct StatusItem {
     /// Path under the source tree (display only).
     src: Utf8PathBuf,
-    /// Resolved target path.
+    /// Resolved target path (or rendered output path for `RenderDrift`).
     dst: Utf8PathBuf,
-    decision: absorb::AbsorbDecision,
+    state: StatusState,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StatusState {
+    Link(absorb::AbsorbDecision),
+    /// Rendered output diverges from current `.tera` template — user
+    /// edited the rendered file directly without updating the template.
+    RenderDrift,
+}
+
+impl StatusState {
+    fn is_in_sync(self) -> bool {
+        matches!(self, Self::Link(absorb::AbsorbDecision::InSync))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -534,7 +566,7 @@ fn classify_walk(
                 report.push(StatusItem {
                     src: relative_for_display(source_root, src_dir),
                     dst: dst_dir.to_path_buf(),
-                    decision,
+                    state: StatusState::Link(decision),
                 });
                 return Ok(());
             }
@@ -551,7 +583,7 @@ fn classify_walk(
                     report.push(StatusItem {
                         src: relative_for_display(source_root, src_dir),
                         dst,
-                        decision,
+                        state: StatusState::Link(decision),
                     });
                 }
                 return Ok(());
@@ -587,7 +619,7 @@ fn classify_walk(
             report.push(StatusItem {
                 src: relative_for_display(source_root, &src_path),
                 dst: dst_path,
-                decision,
+                state: StatusState::Link(decision),
             });
         }
     }
@@ -616,7 +648,7 @@ fn print_status_table(items: &[StatusItem], icons: Icons, color: bool) {
     // STATE column = icon (1ch) + space + longest label
     let state_label_w = items
         .iter()
-        .map(|i| state_label(i.decision).len())
+        .map(|i| state_label(i.state).len())
         .max()
         .unwrap_or(0)
         .max("STATE".len() - 2); // "STATE" header takes 5 chars; the icon prefix accounts for 2
@@ -635,25 +667,27 @@ fn print_status_table(items: &[StatusItem], icons: Icons, color: bool) {
     }
 }
 
-fn state_label(d: absorb::AbsorbDecision) -> &'static str {
+fn state_label(s: StatusState) -> &'static str {
     use absorb::AbsorbDecision::*;
-    match d {
-        InSync => "in-sync",
-        RelinkOnly => "relink",
-        AutoAbsorb => "drift (auto)",
-        NeedsConfirm => "drift (anomaly)",
-        Restore => "missing",
+    match s {
+        StatusState::Link(InSync) => "in-sync",
+        StatusState::Link(RelinkOnly) => "relink",
+        StatusState::Link(AutoAbsorb) => "drift (auto)",
+        StatusState::Link(NeedsConfirm) => "drift (anomaly)",
+        StatusState::Link(Restore) => "missing",
+        StatusState::RenderDrift => "render drift",
     }
 }
 
-fn state_icon(d: absorb::AbsorbDecision, icons: Icons) -> &'static str {
+fn state_icon(s: StatusState, icons: Icons) -> &'static str {
     use absorb::AbsorbDecision::*;
-    match d {
-        InSync => icons.ok,
-        RelinkOnly => icons.warn,
-        AutoAbsorb => icons.warn,
-        NeedsConfirm => icons.error,
-        Restore => icons.info,
+    match s {
+        StatusState::Link(InSync) => icons.ok,
+        StatusState::Link(RelinkOnly) => icons.warn,
+        StatusState::Link(AutoAbsorb) => icons.warn,
+        StatusState::Link(NeedsConfirm) => icons.error,
+        StatusState::Link(Restore) => icons.info,
+        StatusState::RenderDrift => icons.error,
     }
 }
 
@@ -698,8 +732,8 @@ fn print_status_row(
     color: bool,
 ) {
     use owo_colors::OwoColorize as _;
-    let icon = state_icon(item.decision, icons);
-    let label = state_label(item.decision);
+    let icon = state_icon(item.state, icons);
+    let label = state_label(item.state);
     let state_text = format!("{icon} {label}");
     let src_display = item.src.as_str().replace('\\', "/");
     let dst_display = item.dst.as_str().replace('\\', "/");
@@ -715,11 +749,14 @@ fn print_status_row(
     }
 
     use absorb::AbsorbDecision::*;
-    let state_colored = match item.decision {
-        InSync => cell_state.green().to_string(),
-        RelinkOnly | AutoAbsorb => cell_state.yellow().to_string(),
-        NeedsConfirm => cell_state.red().to_string(),
-        Restore => cell_state.cyan().to_string(),
+    let state_colored = match item.state {
+        StatusState::Link(InSync) => cell_state.green().to_string(),
+        StatusState::Link(RelinkOnly) | StatusState::Link(AutoAbsorb) => {
+            cell_state.yellow().to_string()
+        }
+        StatusState::Link(NeedsConfirm) => cell_state.red().to_string(),
+        StatusState::Link(Restore) => cell_state.cyan().to_string(),
+        StatusState::RenderDrift => cell_state.red().to_string(),
     };
     let src_colored = cell_src.cyan().to_string();
     let arrow_colored = arrow.dimmed().to_string();
@@ -1271,6 +1308,32 @@ dst = "{}"
         apply(Some(source.clone()), false).unwrap();
         // status should succeed (everything in-sync).
         status(Some(source), None, true).unwrap();
+    }
+
+    #[test]
+    fn status_reports_template_drift() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let target = utf8(tmp.path().join("target"));
+        std::fs::create_dir_all(source.join("home")).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        // Template would render to "fresh" but the rendered file on disk
+        // says "stale" — simulating a manual edit not reflected back.
+        std::fs::write(source.join("home/.gitconfig.tera"), "fresh").unwrap();
+        std::fs::write(source.join("home/.gitconfig"), "stale").unwrap();
+
+        let cfg = format!(
+            r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+            toml_path(&target)
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+        let err = status(Some(source), None, true).unwrap_err();
+        assert!(format!("{err}").contains("diverged"));
     }
 
     #[test]

@@ -71,11 +71,13 @@ pub fn classify(source: &Utf8Path, target: &Utf8Path) -> Result<AbsorbDecision> 
         return Ok(AbsorbDecision::NeedsConfirm);
     }
 
-    // File vs file: compare content + mtime to choose the action.
+    // File vs file: compare content + mtime to choose the action. Fast
+    // path: compare sizes first to avoid loading two arbitrary blobs into
+    // memory whenever the answer is obviously "different".
     if target_meta.file_type().is_file() && source_meta.file_type().is_file() {
-        let src_content = std::fs::read(source)?;
-        let dst_content = std::fs::read(target)?;
-        if src_content == dst_content {
+        let identical = source_meta.len() == target_meta.len()
+            && std::fs::read(source)? == std::fs::read(target)?;
+        if identical {
             return Ok(AbsorbDecision::RelinkOnly);
         }
         let src_mtime = source_meta.modified()?;
