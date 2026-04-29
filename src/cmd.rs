@@ -11,6 +11,7 @@ use crate::config::{self, Config, MountStrategy};
 use crate::link::{self, EffectiveDirMode, EffectiveFileMode, resolve_dir_mode, resolve_file_mode};
 use crate::marker;
 use crate::mount::{self, ResolvedMount};
+use crate::render::{self, RenderReport};
 use crate::template;
 use crate::vars::YuiVars;
 use crate::{backup, paths};
@@ -41,13 +42,24 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     let yui = YuiVars::detect(&source);
     let config = config::load(&source, &yui)?;
 
+    // 1. Render templates first so the link walk picks up rendered files.
+    let render_report = render::render_all(&source, &config, &yui, dry_run)?;
+    log_render_report(&render_report);
+    if render_report.has_drift() {
+        anyhow::bail!(
+            "render drift detected ({} file(s)); reflect target edits back into the .tera before re-running apply",
+            render_report.diverged.len()
+        );
+    }
+
+    // 2. Resolve mounts and link.
     let mut engine = template::Engine::new();
-    let ctx = template::config_context(&yui);
+    let tera_ctx = template::config_context(&yui);
     let mounts = mount::resolve(
         &config.mount.entry,
         config.mount.default_strategy,
         &mut engine,
-        &ctx,
+        &tera_ctx,
     )?;
 
     let backup_root = source.join(&config.backup.dir);
@@ -72,6 +84,24 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+fn log_render_report(r: &RenderReport) {
+    if !r.written.is_empty() {
+        info!("rendered {} new file(s)", r.written.len());
+    }
+    if !r.unchanged.is_empty() {
+        info!("rendered {} file(s) unchanged", r.unchanged.len());
+    }
+    if !r.skipped_when_false.is_empty() {
+        info!(
+            "skipped {} template(s) (when=false)",
+            r.skipped_when_false.len()
+        );
+    }
+    for d in &r.diverged {
+        warn!("rendered file diverged from template: {d}");
+    }
+}
+
 /// Bundle of immutable settings threaded through the apply walk.
 struct ApplyCtx<'a> {
     config: &'a Config,
@@ -81,8 +111,17 @@ struct ApplyCtx<'a> {
     dry_run: bool,
 }
 
-pub fn render(_source: Option<Utf8PathBuf>, _check: bool, _dry_run: bool) -> Result<()> {
-    todo!("yui render — Tera rendering of *.tera files (next iteration)")
+pub fn render(source: Option<Utf8PathBuf>, check: bool, dry_run: bool) -> Result<()> {
+    let source = resolve_source(source)?;
+    let yui = YuiVars::detect(&source);
+    let config = config::load(&source, &yui)?;
+    // --check is a stricter dry-run: never writes, exits non-zero on drift.
+    let report = render::render_all(&source, &config, &yui, dry_run || check)?;
+    log_render_report(&report);
+    if check && report.has_drift() {
+        anyhow::bail!("render drift detected ({} file(s))", report.diverged.len());
+    }
+    Ok(())
 }
 
 pub fn link(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
@@ -420,13 +459,17 @@ dst = "{}"
     }
 
     #[test]
-    fn apply_skips_tera_files() {
+    fn apply_renders_templates_then_links_rendered_outputs() {
         let tmp = TempDir::new().unwrap();
         let source = utf8(tmp.path().join("dotfiles"));
         let target = utf8(tmp.path().join("target"));
         std::fs::create_dir_all(source.join("home")).unwrap();
         std::fs::create_dir_all(&target).unwrap();
-        std::fs::write(source.join("home/.gitconfig.tera"), "stuff").unwrap();
+        std::fs::write(
+            source.join("home/.gitconfig.tera"),
+            "[user]\n  os = {{ yui.os }}\n",
+        )
+        .unwrap();
         std::fs::write(source.join("home/.bashrc"), "raw").unwrap();
 
         let cfg = format!(
@@ -439,12 +482,49 @@ dst = "{}"
         );
         std::fs::write(source.join("config.toml"), cfg).unwrap();
 
-        apply(Some(source), false).unwrap();
+        apply(Some(source.clone()), false).unwrap();
 
+        // Raw file: linked.
         assert!(target.join(".bashrc").exists());
-        // Templates are NOT linked yet (pending render flow).
-        assert!(!target.join(".gitconfig").exists());
+        // Template's rendered output: written to source then linked.
+        assert!(source.join("home/.gitconfig").exists());
+        assert!(target.join(".gitconfig").exists());
+        // The .tera file itself is never linked into target.
         assert!(!target.join(".gitconfig.tera").exists());
+        // Rendered file content carries the yui.os substitution.
+        let linked = std::fs::read_to_string(target.join(".gitconfig")).unwrap();
+        assert!(linked.contains("os = "));
+    }
+
+    #[test]
+    fn apply_aborts_on_render_drift() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let target = utf8(tmp.path().join("target"));
+        std::fs::create_dir_all(source.join("home")).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(source.join("home/foo.tera"), "fresh body").unwrap();
+        std::fs::write(source.join("home/foo"), "manually edited").unwrap();
+
+        let cfg = format!(
+            r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+            toml_path(&target)
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+        let err = apply(Some(source.clone()), false).unwrap_err();
+        assert!(format!("{err}").contains("drift"));
+        // Existing rendered file untouched.
+        assert_eq!(
+            std::fs::read_to_string(source.join("home/foo")).unwrap(),
+            "manually edited"
+        );
+        // Linking aborted — target empty.
+        assert!(!target.join("foo").exists());
     }
 
     #[test]
