@@ -92,6 +92,29 @@ pub enum Command {
         #[arg(long)]
         older_than: Option<String>,
     },
+
+    /// Manage `[[hook]]` scripts
+    Hooks {
+        #[command(subcommand)]
+        action: HookAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HookAction {
+    /// List configured hooks with their last-run state
+    List,
+    /// Run a hook (or every hook). The `when` filter is always honored;
+    /// `--force` bypasses the `when_run` state check (so a `once` hook
+    /// can be re-run, an `onchange` hook re-runs even with matching
+    /// hash).
+    Run {
+        /// Hook name (omit to run every hook per its `when_run` rule)
+        name: Option<String>,
+        /// Bypass the `when_run` state check
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 impl Cli {
@@ -112,6 +135,10 @@ impl Cli {
             Command::Absorb { target, dry_run } => cmd::absorb(source, target, dry_run),
             Command::Doctor => cmd::doctor(source),
             Command::GcBackup { older_than } => cmd::gc_backup(source, older_than),
+            Command::Hooks { action } => match action {
+                HookAction::List => cmd::hooks_list(source),
+                HookAction::Run { name, force } => cmd::hooks_run(source, name, force),
+            },
         }
     }
 }

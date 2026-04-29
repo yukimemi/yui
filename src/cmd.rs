@@ -10,7 +10,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 use tera::Context as TeraContext;
 use tracing::{info, warn};
 
-use crate::config::{self, Config, IconsMode, MountStrategy};
+use crate::config::{self, Config, HookPhase, IconsMode, MountStrategy};
+use crate::hook::{self, HookOutcome};
 use crate::icons::Icons;
 use crate::link::{self, EffectiveDirMode, EffectiveFileMode, resolve_dir_mode, resolve_file_mode};
 use crate::marker::{self, MarkerSpec};
@@ -55,6 +56,21 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     // matcher isn't re-built per-flow.
     let yuiignore = paths::load_yuiignore(&source)?;
 
+    let mut engine = template::Engine::new();
+    let tera_ctx = template::template_context(&yui, &config.vars);
+
+    // 0. Pre-apply hooks (before render / link). Bail on hook failure so
+    //    apply doesn't proceed past a broken bootstrap.
+    hook::run_phase(
+        &config,
+        &source,
+        &yui,
+        &mut engine,
+        &tera_ctx,
+        HookPhase::Pre,
+        dry_run,
+    )?;
+
     // 1. Render templates first so the link walk picks up rendered files.
     let render_report = render::render_all(&source, &config, &yui, &yuiignore, dry_run)?;
     log_render_report(&render_report);
@@ -66,8 +82,6 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     }
 
     // 2. Resolve mounts and link.
-    let mut engine = template::Engine::new();
-    let tera_ctx = template::template_context(&yui, &config.vars);
     let mounts = mount::resolve(
         &config.mount.entry,
         config.mount.default_strategy,
@@ -96,6 +110,17 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
         info!("mount: {} → {}", m.src, m.dst);
         process_mount(&source, m, &ctx, &mut engine, &tera_ctx)?;
     }
+
+    // 3. Post-apply hooks (after every link is in place).
+    hook::run_phase(
+        &config,
+        &source,
+        &yui,
+        &mut engine,
+        &tera_ctx,
+        HookPhase::Post,
+        dry_run,
+    )?;
     Ok(())
 }
 
@@ -972,6 +997,104 @@ pub fn doctor(source: Option<Utf8PathBuf>) -> Result<()> {
 
 pub fn gc_backup(_source: Option<Utf8PathBuf>, _older_than: Option<String>) -> Result<()> {
     todo!("yui gc-backup — clean up old backups")
+}
+
+/// `yui hooks list` — show every configured hook + its last-run state.
+pub fn hooks_list(source: Option<Utf8PathBuf>) -> Result<()> {
+    let source = resolve_source(source)?;
+    let yui = YuiVars::detect(&source);
+    let config = config::load(&source, &yui)?;
+    let state = hook::State::load(&source)?;
+
+    if config.hook.is_empty() {
+        println!("(no [[hook]] entries in config)");
+        return Ok(());
+    }
+
+    for h in &config.hook {
+        let phase = match h.phase {
+            HookPhase::Pre => "pre",
+            HookPhase::Post => "post",
+        };
+        let when_run = match h.when_run {
+            config::WhenRun::Once => "once",
+            config::WhenRun::Onchange => "onchange",
+            config::WhenRun::Every => "every",
+        };
+        let last = state
+            .hooks
+            .get(&h.name)
+            .and_then(|s| s.last_run_at.as_deref())
+            .unwrap_or("(never)");
+        println!(
+            "{name:<20}  phase={phase:<4}  when_run={when_run:<8}  last_run_at={last}",
+            name = h.name,
+        );
+        if let Some(when) = &h.when {
+            println!("                       when = {when}");
+        }
+        println!("                       script = {}", h.script);
+        println!(
+            "                       command = {} {}",
+            h.command,
+            h.args.join(" ")
+        );
+    }
+    Ok(())
+}
+
+/// `yui hooks run [<name>] [--force]` — run a single hook (or every
+/// hook) on demand. `--force` bypasses the `when_run` state check;
+/// the `when` filter (`yui.os == 'macos'` etc.) is always honored.
+pub fn hooks_run(source: Option<Utf8PathBuf>, name: Option<String>, force: bool) -> Result<()> {
+    let source = resolve_source(source)?;
+    let yui = YuiVars::detect(&source);
+    let config = config::load(&source, &yui)?;
+    let mut engine = template::Engine::new();
+    let tera_ctx = template::template_context(&yui, &config.vars);
+
+    let targets: Vec<&config::HookConfig> = match &name {
+        Some(want) => {
+            let m = config
+                .hook
+                .iter()
+                .find(|h| &h.name == want)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no [[hook]] named {want:?}; run `yui hooks list` to see available names"
+                    )
+                })?;
+            vec![m]
+        }
+        None => config.hook.iter().collect(),
+    };
+
+    let mut state = hook::State::load(&source)?;
+    for h in targets {
+        let outcome = hook::run_hook(
+            h,
+            &source,
+            &yui,
+            &config.vars,
+            &mut engine,
+            &tera_ctx,
+            &mut state,
+            /* dry_run */ false,
+            force,
+        )?;
+        let label = match outcome {
+            HookOutcome::Ran => "ran",
+            HookOutcome::SkippedOnce => "skipped (once: already ran)",
+            HookOutcome::SkippedUnchanged => "skipped (onchange: hash matches)",
+            HookOutcome::SkippedWhenFalse => "skipped (when=false)",
+            HookOutcome::DryRun => "would run (dry-run)",
+        };
+        info!("hook[{}]: {label}", h.name);
+        if outcome == HookOutcome::Ran {
+            state.save(&source)?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

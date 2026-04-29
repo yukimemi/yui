@@ -39,6 +39,79 @@ pub struct Config {
 
     #[serde(default)]
     pub ui: UiConfig,
+
+    #[serde(default)]
+    pub hook: Vec<HookConfig>,
+}
+
+/// One hook = one script invocation triggered around `yui apply`.
+///
+/// The script lives at `$DOTFILES/<script>` (kept yui-agnostic — runnable
+/// directly with no yui involvement); `command` + `args` decide how to
+/// invoke it. Both are Tera-rendered with the standard yui context plus
+/// `script_path` / `script_dir` / `script_name` / `script_stem` /
+/// `script_ext`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HookConfig {
+    /// Unique identifier — used as the state-tracking key and the
+    /// argument to `yui hooks run <name>`.
+    pub name: String,
+    /// Script path relative to `$DOTFILES`. Hashed for `onchange` runs;
+    /// also exposed to `command` / `args` Tera as `script_path` etc.
+    pub script: Utf8PathBuf,
+
+    /// Interpreter / command to invoke. Tera-rendered. Default `"bash"`.
+    #[serde(default = "default_hook_command")]
+    pub command: String,
+    /// Arguments to `command`. Each element Tera-rendered. Default
+    /// `["{{ script_path }}"]`.
+    #[serde(default = "default_hook_args")]
+    pub args: Vec<String>,
+
+    /// Re-run policy. Default `Onchange`.
+    #[serde(default)]
+    pub when_run: WhenRun,
+    /// Apply phase to fire on. Default `Post`.
+    #[serde(default)]
+    pub phase: HookPhase,
+
+    /// Optional Tera bool predicate; absent = always eligible.
+    #[serde(default)]
+    pub when: Option<String>,
+}
+
+fn default_hook_command() -> String {
+    "bash".to_string()
+}
+
+fn default_hook_args() -> Vec<String> {
+    vec!["{{ script_path }}".to_string()]
+}
+
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WhenRun {
+    /// Run exactly once across the lifetime of the source repo. Tracked
+    /// via `last_run_at` in `.yui/state.json`.
+    Once,
+    /// Run when the script content (SHA-256 of `script`) differs from
+    /// the last successful run. Default — best fit for "re-run when I
+    /// edit the bootstrap".
+    #[default]
+    Onchange,
+    /// Run on every apply.
+    Every,
+}
+
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HookPhase {
+    /// Before any render / link work — useful for prerequisite installs.
+    Pre,
+    /// After all linking finishes. Default — "I just `apply`'d, now
+    /// reload the launchd / brew bundle / etc.".
+    #[default]
+    Post,
 }
 
 #[derive(Debug, Deserialize, Default)]
