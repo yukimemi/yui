@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="yui (knot variant)">
+  <title>yui — mizuhiki knot variant</title>
+  <!--
+    Variant 1: stylized 水引-like cord knot — two ribbons crossing each
+    other. Most literal representation of 結 (knot/tie). Slightly busier
+    than the rings, more iconic at larger sizes.
+  -->
+  <g fill="none" stroke-width="18" stroke-linecap="round">
+    <!-- "Bottom" cord (drawn first; appears under the crossing) -->
+    <path d="M 56,176 C 56,80 200,80 200,176"
+          stroke="#d96459" />
+    <!-- "Top" cord crossing over — drawn second so it appears on top -->
+    <path d="M 56,80  C 56,176 200,176 200,80"
+          stroke="#225378" />
+    <!-- Knot center — small filled circle highlighting the link point -->
+    <circle cx="128" cy="128" r="14" fill="#c9a227" stroke="none" />
+  </g>
+</svg>
