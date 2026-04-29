@@ -75,6 +75,7 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     let backup_root = source.join(&config.backup.dir);
     let ctx = ApplyCtx {
         config: &config,
+        source: &source,
         file_mode: resolve_file_mode(config.link.file_mode),
         dir_mode: resolve_dir_mode(config.link.dir_mode),
         backup_root: &backup_root,
@@ -115,6 +116,8 @@ fn log_render_report(r: &RenderReport) {
 /// Bundle of immutable settings threaded through the apply walk.
 struct ApplyCtx<'a> {
     config: &'a Config,
+    /// Source repo root — needed for git-clean checks during absorb.
+    source: &'a Utf8Path,
     file_mode: EffectiveFileMode,
     dir_mode: EffectiveDirMode,
     backup_root: &'a Utf8Path,
@@ -196,11 +199,7 @@ fn collect_list_items(source: &Utf8Path, config: &Config, yui: &YuiVars) -> Resu
     }
 
     // 2. .yuilink overrides under source
-    let walker = ignore::WalkBuilder::new(source)
-        .hidden(false)
-        .git_ignore(false)
-        .ignore(false)
-        .build();
+    let walker = paths::source_walker(source).build();
     let marker_filename = &config.mount.marker_filename;
     for entry in walker {
         let entry = match entry {
@@ -764,8 +763,127 @@ fn print_status_row(
     println!("  {state_colored}  {src_colored}  {arrow_colored}  {dst_colored}");
 }
 
-pub fn absorb(_source: Option<Utf8PathBuf>, _target: Utf8PathBuf, _dry_run: bool) -> Result<()> {
-    todo!("yui absorb — manual absorb (needs absorb classifier)")
+/// Manually absorb a single target file back into source.
+///
+/// Used when `apply` has skipped an anomaly (`[absorb] on_anomaly = "skip"`
+/// or non-TTY ask) but the user has decided that target is right. Bypasses
+/// policy + git-clean checks: this is an explicit user request.
+///
+/// Walks `[[mount.entry]]` and `.yuilink` overrides to find which source
+/// path "owns" the given target. Errors loudly if no mount claims it.
+pub fn absorb(source: Option<Utf8PathBuf>, target: Utf8PathBuf, dry_run: bool) -> Result<()> {
+    let source = resolve_source(source)?;
+    let target = absolutize(&target)?;
+    let yui = YuiVars::detect(&source);
+    let config = config::load(&source, &yui)?;
+
+    let mut engine = template::Engine::new();
+    let tera_ctx = template::template_context(&yui, &config.vars);
+
+    let src_path = match find_source_for_target(&source, &config, &target, &mut engine, &tera_ctx)?
+    {
+        Some(s) => s,
+        None => anyhow::bail!(
+            "no mount entry / .yuilink override claims target {target}; \
+                 pass a path inside a known dst"
+        ),
+    };
+
+    info!("source for {target}: {src_path}");
+
+    if dry_run {
+        info!("[dry-run] would absorb {target} → {src_path}");
+        return Ok(());
+    }
+
+    let backup_root = source.join(&config.backup.dir);
+    let ctx = ApplyCtx {
+        config: &config,
+        source: &source,
+        file_mode: resolve_file_mode(config.link.file_mode),
+        dir_mode: resolve_dir_mode(config.link.dir_mode),
+        backup_root: &backup_root,
+        dry_run: false,
+    };
+
+    // Manual absorb is an explicit user request — bypass `auto`,
+    // `require_clean_git`, and `on_anomaly` policy entirely.
+    absorb_target_into_source(&src_path, &target, &ctx)
+}
+
+/// Walk mount entries + `.yuilink` Override markers to find the source
+/// file/dir that the given target maps back to. Returns `None` when no
+/// mount or marker claims the path.
+fn find_source_for_target(
+    source: &Utf8Path,
+    config: &Config,
+    target: &Utf8Path,
+    engine: &mut template::Engine,
+    tera_ctx: &TeraContext,
+) -> Result<Option<Utf8PathBuf>> {
+    // 1. Mount entries — render dst, see if target is inside it.
+    for entry in &config.mount.entry {
+        if let Some(when) = &entry.when {
+            if !template::eval_truthy(when, engine, tera_ctx)? {
+                continue;
+            }
+        }
+        let dst_str = engine.render(&entry.dst, tera_ctx)?;
+        let dst_root = paths::expand_tilde(dst_str.trim());
+        if let Ok(rel) = target.strip_prefix(&dst_root) {
+            return Ok(Some(source.join(&entry.src).join(rel)));
+        }
+    }
+
+    // 2. `.yuilink` Override markers — walk source, parse, render each
+    //    `[[link]] dst`, see if target is the rendered dst (or nested
+    //    inside a junction'd dir). Skips `.yui/` (backup mirrors etc.).
+    let walker = paths::source_walker(source).build();
+    let marker_filename = &config.mount.marker_filename;
+    for ent in walker {
+        let ent = match ent {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if !ent.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        if ent.path().file_name().and_then(|n| n.to_str()) != Some(marker_filename.as_str()) {
+            continue;
+        }
+        let dir = match ent.path().parent() {
+            Some(d) => d,
+            None => continue,
+        };
+        let dir_utf8 = match Utf8PathBuf::from_path_buf(dir.to_path_buf()) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let spec = match marker::read_spec(&dir_utf8, marker_filename)? {
+            Some(s) => s,
+            None => continue,
+        };
+        let MarkerSpec::Override { links } = spec else {
+            continue;
+        };
+        for link in &links {
+            if let Some(when) = &link.when {
+                if !template::eval_truthy(when, engine, tera_ctx)? {
+                    continue;
+                }
+            }
+            let dst_str = engine.render(&link.dst, tera_ctx)?;
+            let dst = paths::expand_tilde(dst_str.trim());
+            if target == dst {
+                return Ok(Some(dir_utf8));
+            }
+            if let Ok(rel) = target.strip_prefix(&dst) {
+                return Ok(Some(dir_utf8.join(rel)));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 pub fn doctor(source: Option<Utf8PathBuf>) -> Result<()> {
@@ -895,31 +1013,183 @@ fn walk_and_link(
 }
 
 fn link_file_with_backup(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>) -> Result<()> {
+    use absorb::AbsorbDecision::*;
+
+    let decision = absorb::classify(src, dst)?;
+
     if ctx.dry_run {
-        info!("[dry-run] link file: {src} → {dst}");
+        info!("[dry-run] {decision:?}: {src} → {dst}");
         return Ok(());
     }
-    if std::fs::symlink_metadata(dst).is_ok() {
-        backup_existing(dst, ctx.backup_root, /*is_dir=*/ false)?;
-        link::unlink(dst)?;
+
+    match decision {
+        InSync => {
+            // Link is intact (same inode/file-id). Nothing to do.
+            Ok(())
+        }
+        Restore => {
+            info!("link: {src} → {dst}");
+            link::link_file(src, dst, ctx.file_mode)?;
+            Ok(())
+        }
+        RelinkOnly => {
+            // Same content, different inode (e.g. hardlink broken by an
+            // editor's atomic save). Re-link without touching source.
+            info!("relink: {src} → {dst}");
+            link::unlink(dst)?;
+            link::link_file(src, dst, ctx.file_mode)?;
+            Ok(())
+        }
+        AutoAbsorb => {
+            // Target newer + content differs: target wins, source updated.
+            // Honor `[absorb] auto` (kill-switch) and `require_clean_git`.
+            if !ctx.config.absorb.auto {
+                return handle_anomaly(
+                    src,
+                    dst,
+                    ctx,
+                    "absorb.auto = false; treating divergence as anomaly",
+                );
+            }
+            if ctx.config.absorb.require_clean_git && !source_repo_is_clean(ctx.source) {
+                return handle_anomaly(
+                    src,
+                    dst,
+                    ctx,
+                    "source repo is dirty; deferring auto-absorb",
+                );
+            }
+            absorb_target_into_source(src, dst, ctx)
+        }
+        NeedsConfirm => handle_anomaly(
+            src,
+            dst,
+            ctx,
+            "anomaly: source equals/newer than target but content differs",
+        ),
     }
-    info!("link file: {src} → {dst}");
+}
+
+/// Back up the source-side file, copy the target's content into source,
+/// then re-link so the freshly-updated source is what target points at.
+/// "Target wins" — yui's core philosophy.
+fn absorb_target_into_source(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>) -> Result<()> {
+    info!("absorb: {dst} → {src}");
+    backup_existing(src, ctx.backup_root, /* is_dir */ false)?;
+    std::fs::copy(dst, src)?;
+    link::unlink(dst)?;
     link::link_file(src, dst, ctx.file_mode)?;
     Ok(())
 }
 
+/// Decide what to do for an anomaly (NeedsConfirm or AutoAbsorb that was
+/// escalated by `auto = false` / dirty git). Per `[absorb] on_anomaly`:
+///   - `skip`  → log warning, leave target alone
+///   - `force` → behave like AutoAbsorb (target wins)
+///   - `ask`   → on a TTY, show diff + prompt. Off-TTY, downgrade to skip.
+fn handle_anomaly(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>, reason: &str) -> Result<()> {
+    use crate::config::AnomalyAction::*;
+    match ctx.config.absorb.on_anomaly {
+        Skip => {
+            warn!("anomaly skip: {dst} ({reason})");
+            Ok(())
+        }
+        Force => {
+            warn!("anomaly force: {dst} ({reason}) — absorbing target into source");
+            absorb_target_into_source(src, dst, ctx)
+        }
+        Ask => {
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                if prompt_absorb_with_diff(src, dst, reason)? {
+                    absorb_target_into_source(src, dst, ctx)
+                } else {
+                    warn!("anomaly skipped by user: {dst}");
+                    Ok(())
+                }
+            } else {
+                warn!("anomaly skip (non-TTY ask mode): {dst} ({reason})");
+                Ok(())
+            }
+        }
+    }
+}
+
+fn prompt_absorb_with_diff(src: &Utf8Path, dst: &Utf8Path, reason: &str) -> Result<bool> {
+    use std::io::Write as _;
+    let src_content = std::fs::read_to_string(src).unwrap_or_default();
+    let dst_content = std::fs::read_to_string(dst).unwrap_or_default();
+    eprintln!();
+    eprintln!("anomaly: {reason}");
+    eprintln!("  src: {src}");
+    eprintln!("  dst: {dst}");
+    eprintln!();
+    eprintln!("--- diff (- source, + target) ---");
+    let diff = similar::TextDiff::from_lines(&src_content, &dst_content);
+    for change in diff.iter_all_changes() {
+        let sign = match change.tag() {
+            similar::ChangeTag::Delete => "-",
+            similar::ChangeTag::Insert => "+",
+            similar::ChangeTag::Equal => " ",
+        };
+        eprint!("{sign}{change}");
+    }
+    eprintln!();
+    eprint!("absorb target into source? [y/N]: ");
+    // Flush stderr (where the prompt was written) — flushing stdout was a
+    // bug; on a buffered stderr (rare but possible) the prompt would be
+    // hidden until after the user typed something. Caught in PR #15
+    // review (gemini-code-assist).
+    std::io::stderr().flush().ok();
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let answer = input.trim();
+    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
+}
+
+/// Resilient git-clean check: if `git` isn't available or `source` isn't
+/// a repo, log a warning and proceed as if clean. We don't want a missing
+/// `git` to block apply — the require_clean_git knob is a *safety net*,
+/// not a hard prerequisite.
+fn source_repo_is_clean(source: &Utf8Path) -> bool {
+    match crate::git::is_clean(source) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("git clean check failed at {source}: {e} — treating as clean");
+            true
+        }
+    }
+}
+
 fn link_dir_with_backup(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>) -> Result<()> {
+    use absorb::AbsorbDecision::*;
+    let decision = absorb::classify(src, dst)?;
+
     if ctx.dry_run {
-        info!("[dry-run] link dir: {src} → {dst}");
+        info!("[dry-run] dir {decision:?}: {src} → {dst}");
         return Ok(());
     }
-    if std::fs::symlink_metadata(dst).is_ok() {
-        backup_existing(dst, ctx.backup_root, /*is_dir=*/ true)?;
-        link::unlink(dst)?;
+
+    match decision {
+        InSync => Ok(()),
+        Restore => {
+            info!("link dir: {src} → {dst}");
+            link::link_dir(src, dst, ctx.dir_mode)?;
+            Ok(())
+        }
+        _ => {
+            // Directory drift: we don't deep-merge the contents (apps can
+            // legitimately add files inside a junction'd dir, and yui has
+            // no way to know which side is authoritative). Fall back to
+            // backup + replace, the same behaviour as before the
+            // absorb classifier landed.
+            backup_existing(dst, ctx.backup_root, /* is_dir */ true)?;
+            link::unlink(dst)?;
+            info!("relink dir: {src} → {dst}");
+            link::link_dir(src, dst, ctx.dir_mode)?;
+            Ok(())
+        }
     }
-    info!("link dir: {src} → {dst}");
-    link::link_dir(src, dst, ctx.dir_mode)?;
-    Ok(())
 }
 
 fn backup_existing(target: &Utf8Path, backup_root: &Utf8Path, is_dir: bool) -> Result<()> {
@@ -1415,17 +1685,13 @@ dst = "{}"
         assert!(format!("{err}").contains("already exists"));
     }
 
-    #[test]
-    fn apply_with_existing_target_backs_up() {
-        let tmp = TempDir::new().unwrap();
+    /// Build a minimal `apply`-able dotfiles tree for absorb tests.
+    /// Returns (source_dir, target_dir).
+    fn setup_minimal_dotfiles(tmp: &TempDir) -> (Utf8PathBuf, Utf8PathBuf) {
         let source = utf8(tmp.path().join("dotfiles"));
         let target = utf8(tmp.path().join("target"));
         std::fs::create_dir_all(source.join("home")).unwrap();
         std::fs::create_dir_all(&target).unwrap();
-        std::fs::write(source.join("home/.bashrc"), "new content").unwrap();
-        // Pre-existing target file with different content.
-        std::fs::write(target.join(".bashrc"), "old content").unwrap();
-
         let cfg = format!(
             r#"
 [[mount.entry]]
@@ -1435,28 +1701,211 @@ dst = "{}"
             toml_path(&target)
         );
         std::fs::write(source.join("config.toml"), cfg).unwrap();
+        (source, target)
+    }
+
+    fn write_with_mtime(path: &Utf8Path, body: &str, when: std::time::SystemTime) {
+        std::fs::write(path, body).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open writable");
+        f.set_modified(when).expect("set_modified");
+    }
+
+    #[test]
+    fn apply_target_newer_absorbs_target_into_source() {
+        // Target has the user's edit and is mtime-newer than source —
+        // classifier returns `AutoAbsorb`. yui's "target-as-truth"
+        // philosophy: target wins, source is updated and backed up.
+        let tmp = TempDir::new().unwrap();
+        let (source, target) = setup_minimal_dotfiles(&tmp);
+
+        let now = std::time::SystemTime::now();
+        let past = now - std::time::Duration::from_secs(120);
+        write_with_mtime(&source.join("home/.bashrc"), "default from repo", past);
+        // Pre-existing target with user's edit, NEWER mtime.
+        write_with_mtime(&target.join(".bashrc"), "user's edit", now);
 
         apply(Some(source.clone()), false).unwrap();
 
-        // Target now has new content (linked from source).
+        // Target's content survives — that's the whole point.
         assert_eq!(
             std::fs::read_to_string(target.join(".bashrc")).unwrap(),
-            "new content"
+            "user's edit"
         );
-
-        // A backup of the old content should exist somewhere under .yui/backup.
+        // Source has been updated to match target.
+        assert_eq!(
+            std::fs::read_to_string(source.join("home/.bashrc")).unwrap(),
+            "user's edit"
+        );
+        // Source's previous content lives under .yui/backup.
         let backup_root = source.join(".yui/backup");
-        assert!(backup_root.exists(), "backup root should exist");
         let mut found_old = false;
         for entry in walkdir(&backup_root) {
             if let Ok(s) = std::fs::read_to_string(&entry) {
-                if s == "old content" {
+                if s == "default from repo" {
                     found_old = true;
                     break;
                 }
             }
         }
-        assert!(found_old, "expected backup containing 'old content'");
+        assert!(found_old, "expected backup containing 'default from repo'");
+    }
+
+    #[test]
+    fn apply_in_sync_target_is_a_no_op() {
+        // After an initial `apply`, running `apply` again classifies as
+        // `InSync` and does nothing.
+        let tmp = TempDir::new().unwrap();
+        let (source, target) = setup_minimal_dotfiles(&tmp);
+        std::fs::write(source.join("home/.bashrc"), "echo hi\n").unwrap();
+        apply(Some(source.clone()), false).unwrap();
+        let backup_root = source.join(".yui/backup");
+        let backup_count_after_first = walkdir(&backup_root).len();
+
+        // Second apply — nothing should change.
+        apply(Some(source.clone()), false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join(".bashrc")).unwrap(),
+            "echo hi\n"
+        );
+        let backup_count_after_second = walkdir(&backup_root).len();
+        assert_eq!(
+            backup_count_after_first, backup_count_after_second,
+            "second apply on an in-sync tree should not produce backups"
+        );
+    }
+
+    #[test]
+    fn apply_skip_policy_leaves_anomaly_alone() {
+        // Source newer than target + content differs = NeedsConfirm.
+        // With on_anomaly = "skip", target stays untouched.
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let target = utf8(tmp.path().join("target"));
+        std::fs::create_dir_all(source.join("home")).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let cfg = format!(
+            r#"
+[absorb]
+on_anomaly = "skip"
+
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+            toml_path(&target)
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+        let now = std::time::SystemTime::now();
+        let past = now - std::time::Duration::from_secs(120);
+        write_with_mtime(&target.join(".bashrc"), "user's edit (older)", past);
+        write_with_mtime(&source.join("home/.bashrc"), "fresh from upstream", now);
+
+        apply(Some(source.clone()), false).unwrap();
+
+        // Target untouched (skip policy honored).
+        assert_eq!(
+            std::fs::read_to_string(target.join(".bashrc")).unwrap(),
+            "user's edit (older)"
+        );
+        // Source untouched too.
+        assert_eq!(
+            std::fs::read_to_string(source.join("home/.bashrc")).unwrap(),
+            "fresh from upstream"
+        );
+    }
+
+    #[test]
+    fn apply_force_policy_absorbs_anomaly_anyway() {
+        // Same anomaly setup, but on_anomaly = "force" → target wins.
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let target = utf8(tmp.path().join("target"));
+        std::fs::create_dir_all(source.join("home")).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let cfg = format!(
+            r#"
+[absorb]
+on_anomaly = "force"
+
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+            toml_path(&target)
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+        let now = std::time::SystemTime::now();
+        let past = now - std::time::Duration::from_secs(120);
+        write_with_mtime(&target.join(".bashrc"), "user's edit (older)", past);
+        write_with_mtime(&source.join("home/.bashrc"), "fresh from upstream", now);
+
+        apply(Some(source.clone()), false).unwrap();
+
+        // Target wins despite being mtime-older — force policy.
+        assert_eq!(
+            std::fs::read_to_string(target.join(".bashrc")).unwrap(),
+            "user's edit (older)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join("home/.bashrc")).unwrap(),
+            "user's edit (older)"
+        );
+    }
+
+    #[test]
+    fn manual_absorb_command_pulls_target_into_source() {
+        // Manual `yui absorb <target>` bypasses policy + git checks.
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let target = utf8(tmp.path().join("target"));
+        std::fs::create_dir_all(source.join("home")).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        // on_anomaly = "skip" so passive `apply` would NOT touch this.
+        let cfg = format!(
+            r#"
+[absorb]
+on_anomaly = "skip"
+
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+            toml_path(&target)
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+        std::fs::write(target.join(".bashrc"), "user picked this").unwrap();
+        std::fs::write(source.join("home/.bashrc"), "default").unwrap();
+
+        // Run absorb directly on the target.
+        absorb(
+            Some(source.clone()),
+            target.join(".bashrc"),
+            /* dry_run */ false,
+        )
+        .unwrap();
+
+        // Source picked up target's content (manual absorb is forceful).
+        assert_eq!(
+            std::fs::read_to_string(source.join("home/.bashrc")).unwrap(),
+            "user picked this"
+        );
+    }
+
+    #[test]
+    fn manual_absorb_errors_when_target_outside_known_mounts() {
+        let tmp = TempDir::new().unwrap();
+        let (source, _target) = setup_minimal_dotfiles(&tmp);
+        std::fs::write(source.join("home/.bashrc"), "x").unwrap();
+        let stranger = utf8(tmp.path().join("not-managed/foo"));
+        std::fs::create_dir_all(stranger.parent().unwrap()).unwrap();
+        std::fs::write(&stranger, "not yui's").unwrap();
+        let err = absorb(Some(source), stranger, false).unwrap_err();
+        assert!(format!("{err}").contains("no mount entry"));
     }
 
     fn walkdir(root: &Utf8Path) -> Vec<Utf8PathBuf> {
