@@ -1477,7 +1477,36 @@ fn link_dir_with_backup(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>) -> R
             // backup + replace, the same behaviour as before the
             // absorb classifier landed.
             backup_existing(dst, ctx.backup_root, /* is_dir */ true)?;
-            link::unlink(dst)?;
+            // `link::unlink` is intentionally conservative: it refuses to
+            // recursively delete a non-empty regular directory. That's
+            // the right default for ad-hoc cleanup, but here we have
+            // *just* backed the directory up, so a recursive remove is
+            // safe — the user's pre-yui content is preserved under
+            // `.yui/backup/...`. Without this fall-through the absorb
+            // chokes on `Directory not empty` (Windows error 145) for
+            // anything migrated from a per-file dotfiles manager.
+            //
+            // Narrow the fallback to the case it's actually for: the
+            // target still exists and is a real (non-link) directory.
+            // Anything else — permission denied, I/O error, the path
+            // suddenly being a file or junction — propagates instead
+            // of being silently coerced into `remove_dir_all`.
+            if let Err(unlink_err) = link::unlink(dst) {
+                let meta = std::fs::symlink_metadata(dst).with_context(|| {
+                    format!("stat {dst} after link::unlink failed: {unlink_err}")
+                })?;
+                let ft = meta.file_type();
+                if ft.is_dir() && !ft.is_symlink() {
+                    std::fs::remove_dir_all(dst).with_context(|| {
+                        format!(
+                            "remove_dir_all({dst}) after link::unlink failed: \
+                             {unlink_err}"
+                        )
+                    })?;
+                } else {
+                    return Err(unlink_err).with_context(|| format!("unlink({dst}) before relink"));
+                }
+            }
             info!("relink dir: {src} → {dst}");
             link::link_dir(src, dst, ctx.dir_mode)?;
             Ok(())
@@ -2154,6 +2183,64 @@ dst = "{}"
         assert_eq!(
             std::fs::read_to_string(source.join("home/.bashrc")).unwrap(),
             "user's edit (older)"
+        );
+    }
+
+    /// Regression for the Windows-error-145 bug: a `home/.config/.yuilink`
+    /// (PassThrough) marker pointing at a non-empty regular `~/.config`
+    /// directory (the typical chezmoi-migrated state, where every file
+    /// inside is an individual hardlink) used to fail the absorb with
+    /// `Directory not empty` because `link::unlink` refuses to recurse.
+    /// After backup we now `remove_dir_all` as a fallback.
+    #[test]
+    fn apply_replaces_non_empty_target_dir_after_backup() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let target = utf8(tmp.path().join("target"));
+        std::fs::create_dir_all(source.join("home/.config/app")).unwrap();
+        std::fs::create_dir_all(target.join(".config/app")).unwrap();
+        // Marker that says "junction this dir at the parent mount's dst"
+        // — same shape as a typical home/.config/.yuilink.
+        std::fs::write(source.join("home/.config/.yuilink"), "").unwrap();
+        std::fs::write(source.join("home/.config/app/config.toml"), "src side").unwrap();
+        // Pre-existing non-empty regular dir at the target — chezmoi /
+        // any per-file dotfiles flow leaves things in this shape.
+        std::fs::write(target.join(".config/app/config.toml"), "target side").unwrap();
+        std::fs::write(target.join(".config/app/state.json"), "{}").unwrap();
+
+        let cfg = format!(
+            r#"
+[absorb]
+on_anomaly = "force"
+
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+            toml_path(&target)
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+        // Used to bail with `unlink: ... Directory not empty` here.
+        apply(Some(source.clone()), false).unwrap();
+
+        // ~/.config now reaches source/home/.config via the link.
+        assert_eq!(
+            std::fs::read_to_string(target.join(".config/app/config.toml")).unwrap(),
+            "src side"
+        );
+        // Pre-existing target content is preserved in `.yui/backup/`.
+        let backup_root = source.join(".yui/backup");
+        let mut found_backup_state = false;
+        for entry in walkdir(&backup_root) {
+            if entry.file_name() == Some("state.json") {
+                found_backup_state = true;
+                break;
+            }
+        }
+        assert!(
+            found_backup_state,
+            "expected target's state.json to land in the backup tree"
         );
     }
 
