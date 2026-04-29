@@ -125,7 +125,14 @@ pub enum Command {
 #[derive(Subcommand, Debug)]
 pub enum HookAction {
     /// List configured hooks with their last-run state
-    List,
+    List {
+        /// Override [ui] icons mode for this invocation
+        #[arg(long, value_name = "MODE")]
+        icons: Option<IconsMode>,
+        /// Disable color output (also respected via NO_COLOR env)
+        #[arg(long)]
+        no_color: bool,
+    },
     /// Run a hook (or every hook). The `when` filter is always honored;
     /// `--force` bypasses the `when_run` state check (so a `once` hook
     /// can be re-run, an `onchange` hook re-runs even with matching
@@ -158,7 +165,7 @@ impl Cli {
             Command::Doctor => cmd::doctor(source),
             Command::GcBackup { older_than } => cmd::gc_backup(source, older_than),
             Command::Hooks { action } => match action {
-                HookAction::List => cmd::hooks_list(source),
+                HookAction::List { icons, no_color } => cmd::hooks_list(source, icons, no_color),
                 HookAction::Run { name, force } => cmd::hooks_run(source, name, force),
             },
         }
