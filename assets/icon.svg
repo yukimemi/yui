@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="yui">
+  <title>yui — target-as-truth dotfiles</title>
+  <!--
+    Two interlocking rings: source (warm coral) and target (deep indigo).
+    The visual overlap stands in for 結 (yui, "tie / bind") — the very
+    point of yui-cli is to keep source and target the same backing file.
+  -->
+  <g fill="none" stroke-width="20" stroke-linecap="round">
+    <circle cx="96"  cy="128" r="56" stroke="#d96459" />
+    <circle cx="160" cy="128" r="56" stroke="#225378" />
+  </g>
+</svg>

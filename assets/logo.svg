@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 580 120" role="img" aria-label="yui — target-as-truth dotfiles">
+  <title>yui — target-as-truth dotfiles</title>
+  <!-- icon (matches assets/icon.svg) -->
+  <g transform="translate(20, 18) scale(0.34)">
+    <g fill="none" stroke-width="20" stroke-linecap="round">
+      <circle cx="96"  cy="128" r="56" stroke="#d96459" />
+      <circle cx="160" cy="128" r="56" stroke="#225378" />
+    </g>
+  </g>
+  <!-- wordmark -->
+  <text x="118" y="68"
+        font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-weight="700" font-size="58" letter-spacing="-2"
+        fill="#1a1a1a">yui</text>
+  <!-- tagline -->
+  <text x="120" y="96"
+        font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-style="italic" font-size="16"
+        fill="#5a5a5a">結 — target-as-truth dotfiles manager</text>
+</svg>
