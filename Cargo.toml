@@ -39,11 +39,11 @@ indicatif = "0.17"
 jiff = { version = "0.2.24", features = ["serde"] }
 owo-colors = "4.3.0"
 same-file = "1.0.6"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 sha2 = "0.10"
-similar = "2"
-tera = "1"
+similar = "2.7.0"
+tera = "1.20.1"
 thiserror = "2"
 toml = "1"
 tracing = "0.1"
