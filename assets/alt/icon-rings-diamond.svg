@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="yui (rings + diamond variant)">
+  <title>yui — interlocking rings with a small gold diamond</title>
+  <!--
+    Variant 5b: same rings, but the bind-point is a small rotated square
+    (diamond) instead of a circle. Breaks the "iris" pattern that makes
+    a centered circle inside a vertical lens read as a literal eye, while
+    keeping the gold-accent-at-the-bind-point idea.
+  -->
+  <g fill="none" stroke-width="20" stroke-linecap="round">
+    <circle cx="96"  cy="128" r="56" stroke="#d96459" />
+    <circle cx="160" cy="128" r="56" stroke="#225378" />
+  </g>
+  <!-- Diamond (rotated square) at intersection center, side ≈ 12 -->
+  <rect x="120" y="120" width="16" height="16"
+        transform="rotate(45 128 128)"
+        fill="#c9a227" />
+</svg>
