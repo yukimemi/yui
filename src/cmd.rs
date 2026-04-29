@@ -1559,7 +1559,11 @@ fn remove_dir_link_or_real(dst: &Utf8Path) -> Result<()> {
 ///
 /// Mirrors the file-level "AutoAbsorb backs up source, copies target's
 /// content into source before relinking" semantic for whole dirs.
-fn merge_dir_target_into_source(target: &Utf8Path, source: &Utf8Path) -> Result<()> {
+fn merge_dir_target_into_source(
+    target: &Utf8Path,
+    source: &Utf8Path,
+    ctx: &ApplyCtx<'_>,
+) -> Result<()> {
     for entry in std::fs::read_dir(target)? {
         let entry = entry?;
         let name_os = entry.file_name();
@@ -1589,7 +1593,7 @@ fn merge_dir_target_into_source(target: &Utf8Path, source: &Utf8Path) -> Result<
                     format!("create_dir_all({source_path}) during target→source merge")
                 })?;
             }
-            merge_dir_target_into_source(&target_path, &source_path)?;
+            merge_dir_target_into_source(&target_path, &source_path, ctx)?;
         } else if ft.is_file() {
             // Target is a regular file. Symmetrical handling: if
             // source has a directory or symlink at the same name,
@@ -1613,8 +1617,25 @@ fn merge_dir_target_into_source(target: &Utf8Path, source: &Utf8Path) -> Result<
                     std::fs::create_dir_all(parent)?;
                 }
             }
-            std::fs::copy(&target_path, &source_path)
-                .with_context(|| format!("copy({target_path} → {source_path}) during merge"))?;
+            // If both sides are now regular files at the same path, run
+            // the file-level absorb classifier so this single overlap
+            // is resolved against `[absorb]` policy (auto / skip /
+            // force / ask) instead of being silently overwritten. The
+            // dir-level marker provides consent for the *whole-tree*
+            // merge, but a per-file content collision where the
+            // source side is *newer* is still a legitimate anomaly
+            // worth surfacing.
+            //
+            // Source-only files were already preserved by virtue of
+            // the merge not visiting them. Target-only files (where
+            // `source_path` doesn't exist) skip the classifier and go
+            // straight to copy below.
+            if source_path.is_file() {
+                merge_resolve_file_conflict(&target_path, &source_path, ctx)?;
+            } else {
+                std::fs::copy(&target_path, &source_path)
+                    .with_context(|| format!("copy({target_path} → {source_path}) during merge"))?;
+            }
         } else {
             warn!(
                 "merge: skipping non-regular entry {target_path} \
@@ -1623,6 +1644,90 @@ fn merge_dir_target_into_source(target: &Utf8Path, source: &Utf8Path) -> Result<
         }
     }
     Ok(())
+}
+
+/// Per-file conflict resolution inside the dir merge. Both
+/// `target_path` and `source_path` exist as regular files — run the
+/// absorb classifier on the pair and route to the matching policy:
+///
+/// - `InSync` / `RelinkOnly` → no-op (contents already match)
+/// - `AutoAbsorb` (target newer + diff) → copy target → source,
+///   target-wins per the AutoAbsorb contract.
+/// - `NeedsConfirm` (source newer + diff, the genuine anomaly) →
+///   `[absorb] on_anomaly` dispatch:
+///     - `skip` → leave source alone, target's version is dropped
+///       (after the outer junction, target ends up with source's content)
+///     - `force` → copy target → source (target wins anyway)
+///     - `ask` → TTY prompt with diff; downgrade to skip off-TTY
+fn merge_resolve_file_conflict(
+    target_path: &Utf8Path,
+    source_path: &Utf8Path,
+    ctx: &ApplyCtx<'_>,
+) -> Result<()> {
+    use absorb::AbsorbDecision::*;
+    let decision = absorb::classify(source_path, target_path)?;
+    match decision {
+        InSync | RelinkOnly => Ok(()),
+        AutoAbsorb => {
+            std::fs::copy(target_path, source_path).with_context(|| {
+                format!("copy({target_path} → {source_path}) during merge AutoAbsorb")
+            })?;
+            Ok(())
+        }
+        Restore => {
+            // `Restore` is the classifier's "target is missing" arm.
+            // We only enter this function after the merge loop saw
+            // `target_path` as a regular file in the read_dir
+            // iteration, and the caller guards on `source_path.is_file()`
+            // — both exist by construction, so this branch is
+            // unreachable.
+            unreachable!(
+                "merge_resolve_file_conflict reached with both files present, \
+                 but classify returned Restore (target {target_path} / source {source_path})"
+            )
+        }
+        NeedsConfirm => {
+            use crate::config::AnomalyAction::*;
+            match ctx.config.absorb.on_anomaly {
+                Skip => {
+                    warn!(
+                        "merge anomaly skip: {target_path} (source-newer / content drift) \
+                         — keeping source version, target version dropped"
+                    );
+                    Ok(())
+                }
+                Force => {
+                    warn!(
+                        "merge anomaly force: {target_path} \
+                         (source-newer / content drift) — overwriting source"
+                    );
+                    std::fs::copy(target_path, source_path)?;
+                    Ok(())
+                }
+                Ask => {
+                    use std::io::IsTerminal;
+                    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                        if prompt_absorb_with_diff(
+                            source_path,
+                            target_path,
+                            "merge: file content differs and source is newer",
+                        )? {
+                            std::fs::copy(target_path, source_path)?;
+                        } else {
+                            warn!("merge: kept source version by user choice: {source_path}");
+                        }
+                        Ok(())
+                    } else {
+                        warn!(
+                            "merge anomaly skip (non-TTY ask mode): {target_path} \
+                             — keeping source version"
+                        );
+                        Ok(())
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Back up source-side, merge target's content into source (target
@@ -1634,7 +1739,7 @@ fn merge_dir_target_into_source(target: &Utf8Path, source: &Utf8Path) -> Result<
 fn absorb_target_dir_into_source(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>) -> Result<()> {
     info!("absorb dir: {dst} → {src}");
     backup_existing(src, ctx.backup_root, /* is_dir */ true)?;
-    merge_dir_target_into_source(dst, src)?;
+    merge_dir_target_into_source(dst, src, ctx)?;
     // Source now carries every regular file from target. Tear down the
     // original target dir and re-expose source via a junction.
     remove_dir_link_or_real(dst)?;
@@ -2535,6 +2640,155 @@ dst = "{}"
         assert_eq!(
             std::fs::read_to_string(target.join(".config/bar/inside.txt")).unwrap(),
             "target nested"
+        );
+    }
+
+    /// Per-file conflict in dir merge — target newer + content
+    /// differs → AutoAbsorb. Target wins automatically without
+    /// touching `[absorb] on_anomaly`.
+    #[test]
+    fn merge_per_file_target_newer_auto_absorbs() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let target = utf8(tmp.path().join("target"));
+        std::fs::create_dir_all(source.join("home/.config")).unwrap();
+        std::fs::create_dir_all(target.join(".config")).unwrap();
+        std::fs::write(source.join("home/.config/.yuilink"), "").unwrap();
+
+        // Source has the older copy, target has the newer edit.
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        write_with_mtime(&source.join("home/.config/app.toml"), "old src", past);
+        std::fs::write(target.join(".config/app.toml"), "user's live edit").unwrap();
+
+        // Default `ask` policy — should NOT prompt because the
+        // classifier returns AutoAbsorb (target newer + diff), which
+        // bypasses `on_anomaly` entirely.
+        let cfg = format!(
+            r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+            toml_path(&target)
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+        apply(Some(source.clone()), false).unwrap();
+
+        // Target wins.
+        assert_eq!(
+            std::fs::read_to_string(target.join(".config/app.toml")).unwrap(),
+            "user's live edit"
+        );
+    }
+
+    /// Per-file conflict — source newer + content differs +
+    /// `on_anomaly = "skip"` → keep source's version. After the outer
+    /// junction, target ends up with source's content (so target's
+    /// file is effectively dropped, matching the file-level `skip`
+    /// semantic).
+    #[test]
+    fn merge_per_file_source_newer_skip_keeps_source() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let target = utf8(tmp.path().join("target"));
+        std::fs::create_dir_all(source.join("home/.config")).unwrap();
+        std::fs::create_dir_all(target.join(".config")).unwrap();
+        std::fs::write(source.join("home/.config/.yuilink"), "").unwrap();
+
+        // Target has the older copy, source has the newer edit.
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        write_with_mtime(&target.join(".config/app.toml"), "old target", past);
+        std::fs::write(source.join("home/.config/app.toml"), "fresh source").unwrap();
+
+        let cfg = format!(
+            r#"
+[absorb]
+on_anomaly = "skip"
+
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+            toml_path(&target)
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+        apply(Some(source.clone()), false).unwrap();
+
+        // Source kept — target now reads source's version through the
+        // junction (so target's old text is dropped).
+        assert_eq!(
+            std::fs::read_to_string(target.join(".config/app.toml")).unwrap(),
+            "fresh source"
+        );
+    }
+
+    /// Per-file conflict — source newer + content differs +
+    /// `on_anomaly = "force"` → target wins anyway.
+    #[test]
+    fn merge_per_file_source_newer_force_overwrites_source() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let target = utf8(tmp.path().join("target"));
+        std::fs::create_dir_all(source.join("home/.config")).unwrap();
+        std::fs::create_dir_all(target.join(".config")).unwrap();
+        std::fs::write(source.join("home/.config/.yuilink"), "").unwrap();
+
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        write_with_mtime(&target.join(".config/app.toml"), "old target", past);
+        std::fs::write(source.join("home/.config/app.toml"), "fresh source").unwrap();
+
+        let cfg = format!(
+            r#"
+[absorb]
+on_anomaly = "force"
+
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+            toml_path(&target)
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+        apply(Some(source.clone()), false).unwrap();
+
+        // Target overrides source despite being mtime-older.
+        assert_eq!(
+            std::fs::read_to_string(target.join(".config/app.toml")).unwrap(),
+            "old target"
+        );
+    }
+
+    /// Per-file conflict — bytes match → no-op. The merge classifies
+    /// this as RelinkOnly and skips the copy entirely (saves a lot of
+    /// I/O when migrating big chezmoi repos where source and target
+    /// have already shared inodes).
+    #[test]
+    fn merge_per_file_identical_content_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let target = utf8(tmp.path().join("target"));
+        std::fs::create_dir_all(source.join("home/.config")).unwrap();
+        std::fs::create_dir_all(target.join(".config")).unwrap();
+        std::fs::write(source.join("home/.config/.yuilink"), "").unwrap();
+        std::fs::write(source.join("home/.config/app.toml"), "same").unwrap();
+        std::fs::write(target.join(".config/app.toml"), "same").unwrap();
+
+        // Default policy — bytes match, classifier returns RelinkOnly,
+        // merge skips the copy. Apply must succeed without prompting.
+        let cfg = format!(
+            r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+            toml_path(&target)
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+        apply(Some(source.clone()), false).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(target.join(".config/app.toml")).unwrap(),
+            "same"
         );
     }
 
