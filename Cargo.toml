@@ -51,7 +51,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 whoami = "1"
 
 [target.'cfg(windows)'.dependencies]
-junction = "1"
+junction = "1.4.2"
 
 [dev-dependencies]
 assert_cmd = "2.2.1"
