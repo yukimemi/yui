@@ -1,6 +1,44 @@
-//! Path utilities for backup-mirroring and timestamp suffixing.
+//! Path utilities for backup-mirroring, timestamp suffixing, and
+//! cross-platform tilde expansion.
 
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
+
+/// Expand a leading `~` or `~/...` to the user's home directory.
+///
+/// Smooths over the `$HOME` (Unix) vs `$USERPROFILE` (Windows) split so
+/// `dst = "~/.config"` works on every platform without writing a Tera
+/// `env(...)` call. Home is resolved via [`home_dir`].
+///
+/// `~user` (other-user homes) is left untouched — we don't support that
+/// form. If `$HOME` / `$USERPROFILE` are both unset the input is also
+/// returned verbatim (better to surface a "no such path" error later than
+/// silently substitute an empty string).
+pub fn expand_tilde(s: &str) -> Utf8PathBuf {
+    match home_dir() {
+        Some(home) => expand_tilde_with(s, &home),
+        None => Utf8PathBuf::from(s),
+    }
+}
+
+/// Same as [`expand_tilde`] but with an explicit home path — used in tests
+/// to avoid touching the process-wide `HOME` env var.
+pub fn expand_tilde_with(s: &str, home: &Utf8Path) -> Utf8PathBuf {
+    if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
+        home.join(rest)
+    } else if s == "~" {
+        home.to_path_buf()
+    } else {
+        Utf8PathBuf::from(s)
+    }
+}
+
+/// `$HOME` (Unix) or `$USERPROFILE` (Windows), or `None` if neither is set.
+pub fn home_dir() -> Option<Utf8PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())
+        .map(Utf8PathBuf::from)
+}
 
 /// Mirror an absolute target path into a backup directory, dropping the drive
 /// colon on Windows so the path is filesystem-safe.
@@ -84,5 +122,63 @@ mod tests {
     fn append_dotfile() {
         let r = append_timestamp(Utf8Path::new(".gitconfig"), "20260429_143022123");
         assert_eq!(r, Utf8PathBuf::from(".gitconfig_20260429_143022123"));
+    }
+
+    #[test]
+    fn tilde_slash_expands() {
+        let home = Utf8Path::new("/h/u");
+        assert_eq!(
+            expand_tilde_with("~/foo", home),
+            Utf8PathBuf::from("/h/u/foo")
+        );
+        assert_eq!(
+            expand_tilde_with("~/.config/nvim", home),
+            Utf8PathBuf::from("/h/u/.config/nvim")
+        );
+    }
+
+    #[test]
+    fn tilde_backslash_expands_for_windows_input() {
+        // Tera renders may emit Windows-style separators; accept both.
+        let home = Utf8Path::new("C:/Users/u");
+        assert_eq!(
+            expand_tilde_with("~\\foo", home),
+            Utf8PathBuf::from("C:/Users/u/foo")
+        );
+    }
+
+    #[test]
+    fn lone_tilde_is_home() {
+        let home = Utf8Path::new("/h/u");
+        assert_eq!(expand_tilde_with("~", home), Utf8PathBuf::from("/h/u"));
+    }
+
+    #[test]
+    fn tilde_user_form_is_untouched() {
+        let home = Utf8Path::new("/h/u");
+        // We don't support `~root/...` style; leave it for the caller to
+        // see a useful error (file not found) rather than silently lying.
+        assert_eq!(
+            expand_tilde_with("~root/foo", home),
+            Utf8PathBuf::from("~root/foo")
+        );
+    }
+
+    #[test]
+    fn no_tilde_unchanged() {
+        let home = Utf8Path::new("/h/u");
+        assert_eq!(
+            expand_tilde_with("/abs/path", home),
+            Utf8PathBuf::from("/abs/path")
+        );
+        assert_eq!(
+            expand_tilde_with("rel/path", home),
+            Utf8PathBuf::from("rel/path")
+        );
+        // Mid-string `~` is not a home reference (matches POSIX/bash behaviour).
+        assert_eq!(
+            expand_tilde_with("/foo/~/bar", home),
+            Utf8PathBuf::from("/foo/~/bar")
+        );
     }
 }

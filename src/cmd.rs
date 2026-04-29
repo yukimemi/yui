@@ -185,7 +185,7 @@ fn collect_list_items(source: &Utf8Path, config: &Config, yui: &YuiVars) -> Resu
         };
         let dst = engine
             .render(&entry.dst, &tera_ctx)
-            .map(|s| s.trim().to_string())
+            .map(|s| paths::expand_tilde(s.trim()).to_string())
             .unwrap_or_else(|_| entry.dst.clone());
         items.push(ListItem {
             src: entry.src.clone(),
@@ -239,7 +239,7 @@ fn collect_list_items(source: &Utf8Path, config: &Config, yui: &YuiVars) -> Resu
             };
             let dst = engine
                 .render(&link.dst, &tera_ctx)
-                .map(|s| s.trim().to_string())
+                .map(|s| paths::expand_tilde(s.trim()).to_string())
                 .unwrap_or_else(|_| link.dst.clone());
             items.push(ListItem {
                 src: rel.clone(),
@@ -529,7 +529,7 @@ fn walk_and_link(
                         }
                     }
                     let dst_str = engine.render(&link.dst, tera_ctx)?;
-                    let dst = Utf8PathBuf::from(dst_str.trim());
+                    let dst = paths::expand_tilde(dst_str.trim());
                     link_dir_with_backup(src_dir, &dst, ctx)?;
                     linked_any = true;
                 }
@@ -622,7 +622,7 @@ fn resolve_source(source: Option<Utf8PathBuf>) -> Result<Utf8PathBuf> {
             return Ok(ancestor.to_path_buf());
         }
     }
-    if let Some(home) = home_dir() {
+    if let Some(home) = paths::home_dir() {
         for c in ["dotfiles", ".dotfiles", "src/dotfiles"] {
             let p = home.join(c);
             if p.join("config.toml").is_file() {
@@ -634,11 +634,13 @@ fn resolve_source(source: Option<Utf8PathBuf>) -> Result<Utf8PathBuf> {
 }
 
 fn absolutize(p: &Utf8Path) -> Result<Utf8PathBuf> {
-    if p.is_absolute() {
-        return Ok(p.to_path_buf());
+    // Expand `~` first so callers can pass `--source ~/dotfiles` directly.
+    let expanded = paths::expand_tilde(p.as_str());
+    if expanded.is_absolute() {
+        return Ok(expanded);
     }
     let cwd = current_dir_utf8()?;
-    Ok(cwd.join(p))
+    Ok(cwd.join(expanded))
 }
 
 fn current_dir_utf8() -> Result<Utf8PathBuf> {
@@ -646,12 +648,8 @@ fn current_dir_utf8() -> Result<Utf8PathBuf> {
     Utf8PathBuf::from_path_buf(cwd).map_err(|p| anyhow::anyhow!("non-UTF8 cwd: {}", p.display()))
 }
 
-fn home_dir() -> Option<Utf8PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .or_else(|| std::env::var("USERPROFILE").ok())
-        .map(Utf8PathBuf::from)
-}
+// Note: `home_dir()` lives in `paths.rs` so the tilde-expansion helper and
+// `resolve_source` share one HOME/USERPROFILE lookup.
 
 const SKELETON_CONFIG: &str = r#"# yui config — see https://github.com/yukimemi/yui
 
@@ -667,7 +665,8 @@ default_strategy = "marker"
 
 [[mount.entry]]
 src = "home"
-dst = "{{ env(name='HOME') | default(value=env(name='USERPROFILE')) }}"
+# `~` expands to $HOME / $USERPROFILE per OS at apply time, no Tera needed.
+dst = "~"
 
 # [[mount.entry]]
 # src  = "appdata"

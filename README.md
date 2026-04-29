@@ -60,12 +60,13 @@ git_email = "you@example.com"
 
 [[mount.entry]]
 src = "home"
-dst = "{{ env(name='HOME') | default(value=env(name='USERPROFILE')) }}"
+# `~` expands to $HOME on Unix and $USERPROFILE on Windows — use it freely.
+dst = "~"
 
 [[mount.entry]]
 src  = "appdata"
 dst  = "{{ env(name='APPDATA') }}"
-when = "{{ yui.os == 'windows' }}"
+when = "yui.os == 'windows'"
 ```
 
 `config.local.toml` (gitignored) is for machine-local overrides:
@@ -77,7 +78,10 @@ git_email = "you@work.example"
 
 Built-in variables exposed to Tera: `yui.os`, `yui.host`, `yui.user`,
 `yui.arch`, `yui.source`. Environment variables are read with
-`{{ env(name='HOME') }}` (Tera's standard function).
+`{{ env(name='HOME') }}`. Path values (in `dst`, `--source`, `YUI_SOURCE`,
+`.yuilink` `[[link]] dst`, etc.) accept a leading `~` / `~/...` which
+expands to `$HOME` (or `$USERPROFILE` on Windows) at apply time —
+`dst = "~/.config/foo"` Just Works™ across platforms.
 
 ## Status
 
