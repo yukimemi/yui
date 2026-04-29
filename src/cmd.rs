@@ -354,30 +354,36 @@ fn print_row(
     let dst = &item.dst;
     let arrow = icons.arrow;
 
+    // Pad each cell to its column width FIRST, then apply color. Doing it
+    // the other way round lets ANSI escape codes count as printable chars
+    // in `format!("{:<w$}")`, which silently breaks alignment when colors
+    // are enabled (caught in PR #11 review).
+    let cell_status = format!("{:<status_w$}", status);
+    let cell_src = format!("{:<src_w$}", src);
+    let cell_arrow = format!("{:<arrow_w$}", arrow);
+    let cell_dst = format!("{:<dst_w$}", dst);
+
     if !color {
-        println!(
-            "  {:<status_w$}  {:<src_w$}  {:<arrow_w$}  {:<dst_w$}  {when_str}",
-            status, src, arrow, dst
-        );
+        println!("  {cell_status}  {cell_src}  {cell_arrow}  {cell_dst}  {when_str}");
         return;
     }
 
     if item.active {
         println!(
-            "  {:<status_w$}  {:<src_w$}  {:<arrow_w$}  {:<dst_w$}  {}",
-            status.green().to_string(),
-            src.cyan().to_string(),
-            arrow.dimmed().to_string(),
-            dst.green().to_string(),
+            "  {}  {}  {}  {}  {}",
+            cell_status.green(),
+            cell_src.cyan(),
+            cell_arrow.dimmed(),
+            cell_dst.green(),
             when_str.dimmed()
         );
     } else {
         println!(
-            "  {:<status_w$}  {:<src_w$}  {:<arrow_w$}  {:<dst_w$}  {}",
-            status.red().dimmed().to_string(),
-            src.dimmed().to_string(),
-            arrow.dimmed().to_string(),
-            dst.dimmed().to_string(),
+            "  {}  {}  {}  {}  {}",
+            cell_status.red().dimmed(),
+            cell_src.dimmed(),
+            cell_arrow.dimmed(),
+            cell_dst.dimmed(),
             when_str.dimmed()
         );
     }
@@ -514,10 +520,13 @@ fn walk_and_link(
             Some(MarkerSpec::Override { links }) => {
                 let mut linked_any = false;
                 for link in &links {
-                    if let Some(when) = &link.when
-                        && !template::eval_truthy(when, engine, tera_ctx)?
-                    {
-                        continue;
+                    // Nested ifs (not let-chains) so the crate's MSRV
+                    // (rust-version = "1.85") stays buildable; let-chains
+                    // were stabilized in 1.88.
+                    if let Some(when) = &link.when {
+                        if !template::eval_truthy(when, engine, tera_ctx)? {
+                            continue;
+                        }
                     }
                     let dst_str = engine.render(&link.dst, tera_ctx)?;
                     let dst = Utf8PathBuf::from(dst_str.trim());
