@@ -1480,7 +1480,27 @@ fn link_dir_with_backup(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>) -> R
             link::link_dir(src, dst, ctx.dir_mode)?;
             Ok(())
         }
-        AutoAbsorb => {
+        AutoAbsorb | NeedsConfirm => {
+            // Reaching `link_dir_with_backup` means we're acting on a
+            // `.yuilink` marker (or a `[[mount.entry]]` whose `src` is a
+            // directory) — the user has explicitly opted into
+            // "this whole subtree is target-as-truth". A dir-level
+            // NeedsConfirm here is therefore *not* the same kind of
+            // anomaly that file-level NeedsConfirm represents (a single
+            // file the user edited and source got newer); it's just
+            // "source and target dirs are different inodes" — the
+            // marker already authorised us to merge.
+            //
+            // Per-file content conflicts *inside* the merge are still
+            // a real concern (target has X, source has X with
+            // different content). Those are surfaced from inside the
+            // merge itself — see `merge_dir_target_into_source`'s
+            // file-level dispatch — so the outer-dir decision falls
+            // straight through to absorb.
+            //
+            // The `auto` / `require_clean_git` knobs still gate, so
+            // turning them off restores the prompt before any
+            // whole-dir absorb.
             if !ctx.config.absorb.auto {
                 return handle_anomaly_dir(
                     src,
@@ -1499,12 +1519,6 @@ fn link_dir_with_backup(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>) -> R
             }
             absorb_target_dir_into_source(src, dst, ctx)
         }
-        NeedsConfirm => handle_anomaly_dir(
-            src,
-            dst,
-            ctx,
-            "anomaly: source and target are separate dirs with content drift",
-        ),
     }
 }
 
@@ -2396,6 +2410,47 @@ dst = "{}"
             source.join("home/.config/app/state.json").exists(),
             "target-only state.json should be merged into source"
         );
+    }
+
+    /// v0.7+: `home/.config/.yuilink` is the user's explicit
+    /// "this whole subtree is target-as-truth" declaration. A
+    /// dir-level NeedsConfirm at the marker root is therefore not a
+    /// real anomaly — the marker is consent. Default `[absorb]` (ask
+    /// + require_clean_git) should still absorb, no prompt.
+    #[test]
+    fn marker_dir_absorbs_with_default_ask_policy() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let target = utf8(tmp.path().join("target"));
+        std::fs::create_dir_all(source.join("home/.config")).unwrap();
+        std::fs::create_dir_all(target.join(".config/gh")).unwrap();
+        // Marker — user opts the whole .config dir into target-as-truth.
+        std::fs::write(source.join("home/.config/.yuilink"), "").unwrap();
+        // gh exists only on the target side (no entry in source).
+        std::fs::write(target.join(".config/gh/hosts.yml"), "oauth_token: x\n").unwrap();
+
+        // Default [absorb] (no override) — `on_anomaly = "ask"`,
+        // `auto = true`, `require_clean_git = true`. Pre-v0.7 this
+        // would have been routed through the ask prompt at dir level.
+        let cfg = format!(
+            r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+            toml_path(&target)
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+        // Even with default `ask`, the marker-rooted absorb proceeds.
+        // Test would hang on a stdin prompt if dir-level still treated
+        // this as an anomaly.
+        apply(Some(source.clone()), false).unwrap();
+
+        // Target-only file is now reachable through the junction and
+        // recorded in source.
+        assert!(target.join(".config/gh/hosts.yml").exists());
+        assert!(source.join("home/.config/gh/hosts.yml").exists());
     }
 
     #[test]
