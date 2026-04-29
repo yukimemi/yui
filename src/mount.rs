@@ -6,6 +6,7 @@ use tera::Context;
 
 use crate::Result;
 use crate::config::{MountEntry, MountStrategy};
+use crate::paths;
 use crate::template::Engine;
 
 /// A mount entry after Tera rendering of `dst` and `when`-filtering.
@@ -31,7 +32,7 @@ pub fn resolve(
             }
         }
         let dst_str = engine.render(&e.dst, ctx)?;
-        let dst = Utf8PathBuf::from(dst_str.trim());
+        let dst = paths::expand_tilde(dst_str.trim());
         out.push(ResolvedMount {
             src: e.src.clone(),
             dst,
