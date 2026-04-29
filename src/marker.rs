@@ -3,8 +3,8 @@
 //! Two forms are accepted:
 //!   - **empty file** → "junction this dir at the parent mount's dst"
 //!     (the original presence-only marker semantics)
-//!   - **TOML with `[[link]]` entries** → "junction this dir at each
-//!     entry's `dst`, when filtered" — overrides the parent mount's dst.
+//!   - **TOML with `[[link]]` entries** → declare explicit links from this
+//!     directory. Each entry produces one link (after `when` filter).
 //!
 //! ```toml
 //! # $DOTFILES/home/.config/nvim/.yuilink
@@ -13,8 +13,33 @@
 //!
 //! [[link]]
 //! dst = "{{ env(name='LOCALAPPDATA') }}/nvim"
-//! when = "{{ yui.os == 'windows' }}"
+//! when = "yui.os == 'windows'"
 //! ```
+//!
+//! Each `[[link]]` may carry an optional `src = "<filename>"` that scopes
+//! the link to a specific file inside the marker's directory rather than
+//! the directory itself:
+//!
+//! ```toml
+//! # $DOTFILES/home/.config/powershell/.yuilink
+//! [[link]]
+//! src = "profile.ps1"
+//! dst = "{{ env(name='USERPROFILE') }}/Documents/PowerShell/Microsoft.PowerShell_profile.ps1"
+//! when = "yui.os == 'windows'"
+//! ```
+//!
+//! Stacking semantics (v0.6+): a marker no longer stops the walker. The
+//! walker keeps descending past markers and aggregates link entries from
+//! every marker it encounters. A descendant marker therefore *adds*
+//! destinations on top of its ancestors rather than replacing them. Each
+//! entry's `dst` is still the source of truth — if you want the default
+//! `~/.config/nvim`-style placement, list it explicitly.
+//!
+//! Default-dst behaviour: with an empty / link-less marker the walker
+//! still emits the dir-level link to the parent mount's natural dst (the
+//! original "presence-only" behaviour). With explicit `[[link]]` entries
+//! that natural dst is *not* implied — the marker fully defines what
+//! gets linked at this dir.
 
 use camino::Utf8Path;
 use serde::Deserialize;
@@ -23,15 +48,21 @@ use crate::{Error, Result};
 
 #[derive(Debug, Clone)]
 pub enum MarkerSpec {
-    /// Empty marker — link this dir using the parent mount's dst.
+    /// Empty marker — link this dir using the parent mount's natural dst.
     PassThrough,
-    /// Per-dir override; each entry produces a link (after `when` filter).
-    /// The parent mount's dst is bypassed for this directory.
-    Override { links: Vec<MarkerLink> },
+    /// Explicit links. Each entry maps the marker's directory (or a
+    /// specific file inside it via `src`) to a destination.
+    Explicit { links: Vec<MarkerLink> },
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarkerLink {
+    /// Optional file scope. When set, this entry links the file at
+    /// `<marker-dir>/<src>` to `dst` instead of the directory itself.
+    /// Must be a single component (no path separators) so it stays a
+    /// sibling file of the marker.
+    #[serde(default)]
+    pub src: Option<String>,
     pub dst: String,
     #[serde(default)]
     pub when: Option<String>,
@@ -48,7 +79,7 @@ struct MarkerFile {
 /// Returns:
 ///   - `Ok(None)` — no marker file present
 ///   - `Ok(Some(PassThrough))` — present and empty / whitespace-only / no `[[link]]`
-///   - `Ok(Some(Override { ... }))` — present with `[[link]]` entries
+///   - `Ok(Some(Explicit { ... }))` — present with `[[link]]` entries
 ///   - `Err(_)` — present but malformed TOML, or other IO error
 pub fn read_spec(dir: &Utf8Path, marker_filename: &str) -> Result<Option<MarkerSpec>> {
     let path = dir.join(marker_filename);
@@ -65,7 +96,16 @@ pub fn read_spec(dir: &Utf8Path, marker_filename: &str) -> Result<Option<MarkerS
     if parsed.link.is_empty() {
         return Ok(Some(MarkerSpec::PassThrough));
     }
-    Ok(Some(MarkerSpec::Override { links: parsed.link }))
+    for link in &parsed.link {
+        if let Some(src) = &link.src {
+            if src.is_empty() || src.contains('/') || src.contains('\\') {
+                return Err(Error::Config(format!(
+                    "parse {path}: [[link]] src must be a single filename (no path separators), got {src:?}"
+                )));
+            }
+        }
+    }
+    Ok(Some(MarkerSpec::Explicit { links: parsed.link }))
 }
 
 /// Presence-only check: any `.yuilink` file (empty or with content) counts.
@@ -111,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    fn marker_with_links_is_override() {
+    fn marker_with_links_is_explicit() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join(".yuilink"),
@@ -121,21 +161,66 @@ dst = "/a"
 
 [[link]]
 dst = "/b"
-when = "{{ yui.os == 'windows' }}"
+when = "yui.os == 'windows'"
 "#,
         )
         .unwrap();
         let spec = read_spec(&root(&tmp), ".yuilink").unwrap().unwrap();
         match spec {
-            MarkerSpec::Override { links } => {
+            MarkerSpec::Explicit { links } => {
                 assert_eq!(links.len(), 2);
+                assert!(links[0].src.is_none());
                 assert_eq!(links[0].dst, "/a");
                 assert!(links[0].when.is_none());
+                assert!(links[1].src.is_none());
                 assert_eq!(links[1].dst, "/b");
-                assert_eq!(links[1].when.as_deref(), Some("{{ yui.os == 'windows' }}"));
+                assert_eq!(links[1].when.as_deref(), Some("yui.os == 'windows'"));
             }
-            _ => panic!("expected Override"),
+            _ => panic!("expected Explicit"),
         }
+    }
+
+    #[test]
+    fn marker_with_file_src_parses() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".yuilink"),
+            r#"
+[[link]]
+src = "profile.ps1"
+dst = "~/Documents/PowerShell/Microsoft.PowerShell_profile.ps1"
+when = "yui.os == 'windows'"
+"#,
+        )
+        .unwrap();
+        let spec = read_spec(&root(&tmp), ".yuilink").unwrap().unwrap();
+        match spec {
+            MarkerSpec::Explicit { links } => {
+                assert_eq!(links.len(), 1);
+                assert_eq!(links[0].src.as_deref(), Some("profile.ps1"));
+                assert_eq!(
+                    links[0].dst,
+                    "~/Documents/PowerShell/Microsoft.PowerShell_profile.ps1"
+                );
+            }
+            _ => panic!("expected Explicit"),
+        }
+    }
+
+    #[test]
+    fn marker_src_with_path_separator_errors() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".yuilink"),
+            r#"
+[[link]]
+src = "sub/file.txt"
+dst = "/anywhere"
+"#,
+        )
+        .unwrap();
+        let err = read_spec(&root(&tmp), ".yuilink").unwrap_err();
+        assert!(format!("{err}").contains("single filename"));
     }
 
     #[test]

@@ -137,6 +137,46 @@ when = "yui.os == 'windows'"
 
 `yui list` shows each link and which `when` would activate it.
 
+### Stacking markers and file-level entries
+
+Markers compose. A parent `.yuilink` no longer stops the walker, so
+you can junction a whole `~/.config` and *also* layer extra dsts onto
+specific subdirs:
+
+```toml
+# $DOTFILES/home/.config/.yuilink — junction the whole .config dir
+[[link]]
+dst = "~/.config"
+```
+
+```toml
+# $DOTFILES/home/.config/nvim/.yuilink — extra Windows-only dst
+[[link]]
+dst = "{{ env(name='LOCALAPPDATA') }}/nvim"
+when = "yui.os == 'windows'"
+```
+
+Both links land — the parent takes care of the natural placement, the
+child adds its OS-specific alternate.
+
+A `[[link]]` may also carry a `src = "<filename>"` to scope the link to
+a single sibling file rather than the directory itself. Useful for
+paths that don't follow `~/.config/<app>/` conventions, like the
+PowerShell profile on Windows:
+
+```toml
+# $DOTFILES/home/.config/powershell/.yuilink
+[[link]]
+src = "Microsoft.PowerShell_profile.ps1"
+dst = "{{ env(name='USERPROFILE') }}/Documents/PowerShell/Microsoft.PowerShell_profile.ps1"
+when = "yui.os == 'windows'"
+```
+
+`src` must be a single filename (no path separators); the file lives
+right next to the marker. The rest of the directory still falls
+through to whatever placement an ancestor (or the parent mount)
+provides.
+
 ## `.yuiignore` — exclude paths from being linked
 
 A `$DOTFILES/.yuiignore` file (gitignore syntax) keeps matched paths

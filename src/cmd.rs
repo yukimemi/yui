@@ -262,7 +262,7 @@ fn collect_list_items(source: &Utf8Path, config: &Config, yui: &YuiVars) -> Resu
             Some(s) => s,
             None => continue,
         };
-        let MarkerSpec::Override { links } = spec else {
+        let MarkerSpec::Explicit { links } = spec else {
             continue; // PassThrough markers are already implied by mount entry
         };
         let rel = dir_utf8
@@ -278,8 +278,16 @@ fn collect_list_items(source: &Utf8Path, config: &Config, yui: &YuiVars) -> Resu
                 .render(&link.dst, &tera_ctx)
                 .map(|s| paths::expand_tilde(s.trim()).to_string())
                 .unwrap_or_else(|_| link.dst.clone());
+            // File-level entry (`[[link]] src = "<filename>"`) targets a
+            // single file inside the marker dir; show that file path
+            // instead of the bare dir so `yui list` makes the scope
+            // obvious at a glance.
+            let src_display = match &link.src {
+                Some(filename) => rel.join(filename),
+                None => rel.clone(),
+            };
             items.push(ListItem {
-                src: rel.clone(),
+                src: src_display,
                 dst,
                 when: link.when.clone(),
                 active,
@@ -600,15 +608,43 @@ fn classify_walk(
     yuiignore: &ignore::gitignore::Gitignore,
     report: &mut Vec<StatusItem>,
 ) -> Result<()> {
+    classify_walk_inner(
+        src_dir,
+        dst_dir,
+        config,
+        strategy,
+        engine,
+        tera_ctx,
+        source_root,
+        yuiignore,
+        report,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_walk_inner(
+    src_dir: &Utf8Path,
+    dst_dir: &Utf8Path,
+    config: &Config,
+    strategy: MountStrategy,
+    engine: &mut template::Engine,
+    tera_ctx: &TeraContext,
+    source_root: &Utf8Path,
+    yuiignore: &ignore::gitignore::Gitignore,
+    report: &mut Vec<StatusItem>,
+    parent_covered: bool,
+) -> Result<()> {
     if paths::is_ignored(yuiignore, source_root, src_dir, /* is_dir */ true) {
         return Ok(());
     }
 
     let marker_filename = &config.mount.marker_filename;
+    let mut covered = parent_covered;
 
     if strategy == MountStrategy::Marker {
         match marker::read_spec(src_dir, marker_filename)? {
-            None => {} // no marker — fall through to recursive walk
+            None => {}
             Some(MarkerSpec::PassThrough) => {
                 let decision = absorb::classify(src_dir, dst_dir)?;
                 report.push(StatusItem {
@@ -616,9 +652,10 @@ fn classify_walk(
                     dst: dst_dir.to_path_buf(),
                     state: StatusState::Link(decision),
                 });
-                return Ok(());
+                covered = true;
             }
-            Some(MarkerSpec::Override { links }) => {
+            Some(MarkerSpec::Explicit { links }) => {
+                let mut emitted_dir_link = false;
                 for link in &links {
                     if let Some(when) = &link.when {
                         if !template::eval_truthy(when, engine, tera_ctx)? {
@@ -627,14 +664,33 @@ fn classify_walk(
                     }
                     let dst_str = engine.render(&link.dst, tera_ctx)?;
                     let dst = paths::expand_tilde(dst_str.trim());
-                    let decision = absorb::classify(src_dir, &dst)?;
-                    report.push(StatusItem {
-                        src: relative_for_display(source_root, src_dir),
-                        dst,
-                        state: StatusState::Link(decision),
-                    });
+                    if let Some(filename) = &link.src {
+                        let file_src = src_dir.join(filename);
+                        if !file_src.is_file() {
+                            anyhow::bail!(
+                                "marker at {src_dir}: [[link]] src={filename:?} \
+                                 not found"
+                            );
+                        }
+                        let decision = absorb::classify(&file_src, &dst)?;
+                        report.push(StatusItem {
+                            src: relative_for_display(source_root, &file_src),
+                            dst,
+                            state: StatusState::Link(decision),
+                        });
+                    } else {
+                        let decision = absorb::classify(src_dir, &dst)?;
+                        report.push(StatusItem {
+                            src: relative_for_display(source_root, src_dir),
+                            dst,
+                            state: StatusState::Link(decision),
+                        });
+                        emitted_dir_link = true;
+                    }
                 }
-                return Ok(());
+                if emitted_dir_link {
+                    covered = true;
+                }
             }
         }
     }
@@ -655,7 +711,7 @@ fn classify_walk(
             continue;
         }
         if ft.is_dir() {
-            classify_walk(
+            classify_walk_inner(
                 &src_path,
                 &dst_path,
                 config,
@@ -665,8 +721,9 @@ fn classify_walk(
                 source_root,
                 yuiignore,
                 report,
+                covered,
             )?;
-        } else if ft.is_file() {
+        } else if ft.is_file() && !covered {
             let decision = absorb::classify(&src_path, &dst_path)?;
             report.push(StatusItem {
                 src: relative_for_display(source_root, &src_path),
@@ -937,7 +994,7 @@ fn find_source_for_target(
             Some(s) => s,
             None => continue,
         };
-        let MarkerSpec::Override { links } = spec else {
+        let MarkerSpec::Explicit { links } = spec else {
             continue;
         };
         for link in &links {
@@ -948,6 +1005,14 @@ fn find_source_for_target(
             }
             let dst_str = engine.render(&link.dst, tera_ctx)?;
             let dst = paths::expand_tilde(dst_str.trim());
+            // File-level entry: dst points at a single file, so a match
+            // resolves directly to `<marker-dir>/<src filename>`.
+            if let Some(filename) = &link.src {
+                if target == dst {
+                    return Ok(Some(dir_utf8.join(filename)));
+                }
+                continue;
+            }
             if target == dst {
                 return Ok(Some(dir_utf8));
             }
@@ -1113,9 +1178,10 @@ fn process_mount(
         warn!("mount src missing: {src_root}");
         return Ok(());
     }
-    walk_and_link(&src_root, &m.dst, ctx, m.strategy, engine, tera_ctx)
+    walk_and_link(&src_root, &m.dst, ctx, m.strategy, engine, tera_ctx, false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_and_link(
     src_dir: &Utf8Path,
     dst_dir: &Utf8Path,
@@ -1123,6 +1189,7 @@ fn walk_and_link(
     strategy: MountStrategy,
     engine: &mut template::Engine,
     tera_ctx: &TeraContext,
+    parent_covered: bool,
 ) -> Result<()> {
     // `.yuiignore` short-circuit — entire subtrees that match are skipped
     // without even reading their marker / iterating their children.
@@ -1131,20 +1198,24 @@ fn walk_and_link(
     }
 
     let marker_filename = &ctx.config.mount.marker_filename;
+    let mut covered = parent_covered;
 
     if strategy == MountStrategy::Marker {
         match marker::read_spec(src_dir, marker_filename)? {
             None => {} // no marker — fall through to recursive walk
             Some(MarkerSpec::PassThrough) => {
+                // Empty marker = junction this dir at the natural
+                // mount-derived dst. Subsequent recursion keeps going so
+                // descendant markers can layer on extra dsts.
                 link_dir_with_backup(src_dir, dst_dir, ctx)?;
-                return Ok(());
+                covered = true;
             }
-            Some(MarkerSpec::Override { links }) => {
-                let mut linked_any = false;
+            Some(MarkerSpec::Explicit { links }) => {
+                let mut emitted_dir_link = false;
+                let mut emitted_any = false;
                 for link in &links {
                     // Nested ifs (not let-chains) so the crate's MSRV
-                    // (rust-version = "1.85") stays buildable; let-chains
-                    // were stabilized in 1.88.
+                    // (rust-version = "1.85") stays buildable.
                     if let Some(when) = &link.when {
                         if !template::eval_truthy(when, engine, tera_ctx)? {
                             continue;
@@ -1152,13 +1223,27 @@ fn walk_and_link(
                     }
                     let dst_str = engine.render(&link.dst, tera_ctx)?;
                     let dst = paths::expand_tilde(dst_str.trim());
-                    link_dir_with_backup(src_dir, &dst, ctx)?;
-                    linked_any = true;
+                    if let Some(filename) = &link.src {
+                        let file_src = src_dir.join(filename);
+                        if !file_src.is_file() {
+                            anyhow::bail!(
+                                "marker at {src_dir}: [[link]] src={filename:?} \
+                                 not found"
+                            );
+                        }
+                        link_file_with_backup(&file_src, &dst, ctx)?;
+                    } else {
+                        link_dir_with_backup(src_dir, &dst, ctx)?;
+                        emitted_dir_link = true;
+                    }
+                    emitted_any = true;
                 }
-                if !linked_any {
-                    info!("marker override at {src_dir} had no active links — skipping");
+                if !emitted_any {
+                    info!("marker at {src_dir} had no active links — skipping");
                 }
-                return Ok(());
+                if emitted_dir_link {
+                    covered = true;
+                }
             }
         }
     }
@@ -1185,9 +1270,18 @@ fn walk_and_link(
         }
 
         if ft.is_dir() {
-            walk_and_link(&src_path, &dst_path, ctx, strategy, engine, tera_ctx)?;
+            walk_and_link(
+                &src_path, &dst_path, ctx, strategy, engine, tera_ctx, covered,
+            )?;
         } else if ft.is_file() {
-            link_file_with_backup(&src_path, &dst_path, ctx)?;
+            // If an ancestor (or this dir itself) created a dir-level
+            // junction, the file is already accessible via that junction
+            // — emitting another per-file link would just duplicate work
+            // (and on Windows might land at a path that's already
+            // hard-linked through the parent).
+            if !covered {
+                link_file_with_backup(&src_path, &dst_path, ctx)?;
+            }
         }
     }
     Ok(())
@@ -1453,8 +1547,11 @@ dst = "~"
 # when = "yui.os == 'windows'"
 "#;
 
-const SKELETON_GITIGNORE: &str = r#"# yui internals (regenerable, do not commit)
-/.yui/
+const SKELETON_GITIGNORE: &str = r#"# yui per-machine state and backups (regenerable, do not commit).
+# .yui/bin/ is intentionally tracked — it holds your hook scripts.
+/.yui/state.json
+/.yui/state.json.tmp
+/.yui/backup/
 
 # >>> yui rendered (auto-managed, do not edit) >>>
 # <<< yui rendered (auto-managed) <<<
@@ -1667,7 +1764,11 @@ dst = "{}"
     }
 
     #[test]
-    fn apply_marker_override_skips_inactive_link() {
+    fn apply_marker_inactive_link_falls_through_to_default() {
+        // v0.6+ semantics: a marker that has only inactive links no
+        // longer suppresses the parent mount's natural placement. The
+        // walker keeps descending so per-file defaults still apply.
+        // (Use `.yuiignore` to actually exclude a subtree.)
         let tmp = TempDir::new().unwrap();
         let source = utf8(tmp.path().join("dotfiles"));
         let target_inactive = utf8(tmp.path().join("inactive"));
@@ -1702,11 +1803,11 @@ dst = "{}"
 
         apply(Some(source.clone()), false).unwrap();
 
-        // Inactive target untouched.
+        // Inactive marker target untouched.
         assert!(!target_inactive.join("nvim").exists());
-        // Parent mount also skipped the dir (marker claims it even when
-        // all links are inactive — the user's intent was per-dir override).
-        assert!(!parent_target.join(".config/nvim").exists());
+        // Parent mount's natural placement IS produced — the marker had
+        // no active dir-level link to claim coverage with.
+        assert!(parent_target.join(".config/nvim/init.lua").exists());
     }
 
     #[test]
@@ -2159,6 +2260,168 @@ dst = "{}"
         assert!(!source.join("home/note").exists());
         assert!(!target.join("note").exists());
         assert!(!target.join("note.tera").exists());
+    }
+
+    /// v0.6+: parent `.yuilink` doesn't stop the walker. A parent
+    /// marker can junction the whole dir, AND a child marker can layer
+    /// on extra dsts (e.g. an OS-specific alternate location).
+    #[test]
+    fn nested_marker_accumulates_extra_dst() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let parent_target = utf8(tmp.path().join("home"));
+        let extra_target = utf8(tmp.path().join("extra"));
+        std::fs::create_dir_all(source.join("home/.config/nvim")).unwrap();
+        std::fs::create_dir_all(&parent_target).unwrap();
+        std::fs::create_dir_all(&extra_target).unwrap();
+        std::fs::write(source.join("home/.config/nvim/init.lua"), "-- nvim\n").unwrap();
+
+        // Parent: junction the whole .config dir to <home>/.config.
+        std::fs::write(
+            source.join("home/.config/.yuilink"),
+            format!(
+                r#"
+[[link]]
+dst = "{}/.config"
+"#,
+                toml_path(&parent_target)
+            ),
+        )
+        .unwrap();
+        // Child: ALSO junction nvim/ to an extra path, but only on the
+        // running OS (so the test exercises an active link).
+        std::fs::write(
+            source.join("home/.config/nvim/.yuilink"),
+            format!(
+                r#"
+[[link]]
+dst = "{}/nvim"
+when = "{{{{ yui.os == '{}' }}}}"
+"#,
+                toml_path(&extra_target),
+                std::env::consts::OS
+            ),
+        )
+        .unwrap();
+
+        let cfg = format!(
+            r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+            toml_path(&parent_target)
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+        apply(Some(source.clone()), false).unwrap();
+
+        // Both links are present: parent's whole-.config junction reaches
+        // init.lua, and the child marker added an additional path.
+        assert!(parent_target.join(".config/nvim/init.lua").exists());
+        assert!(extra_target.join("nvim/init.lua").exists());
+    }
+
+    /// v0.6+: `[[link]] src = "<filename>"` links a single sibling file
+    /// to a custom dst, leaving the rest of the dir to default
+    /// behaviour. Useful for paths like the PowerShell profile that
+    /// have to live in a non-`~/.config` location on Windows.
+    #[test]
+    fn marker_file_link_targets_specific_file() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let parent_target = utf8(tmp.path().join("home"));
+        let docs_target = utf8(tmp.path().join("docs"));
+        std::fs::create_dir_all(source.join("home/.config/powershell")).unwrap();
+        std::fs::create_dir_all(&parent_target).unwrap();
+        std::fs::create_dir_all(&docs_target).unwrap();
+        std::fs::write(
+            source.join("home/.config/powershell/profile.ps1"),
+            "# profile\n",
+        )
+        .unwrap();
+        std::fs::write(source.join("home/.config/powershell/extra.txt"), "extra\n").unwrap();
+
+        // File-level entry only — no dir-level [[link]], so the dir
+        // itself still falls through to the default mount placement.
+        std::fs::write(
+            source.join("home/.config/powershell/.yuilink"),
+            format!(
+                r#"
+[[link]]
+src = "profile.ps1"
+dst = "{}/Microsoft.PowerShell_profile.ps1"
+"#,
+                toml_path(&docs_target)
+            ),
+        )
+        .unwrap();
+
+        let cfg = format!(
+            r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+            toml_path(&parent_target)
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+        apply(Some(source.clone()), false).unwrap();
+
+        // File-level target gets the link.
+        assert!(
+            docs_target
+                .join("Microsoft.PowerShell_profile.ps1")
+                .exists()
+        );
+        // Default per-file placement still happens for ALL files in the
+        // dir (the marker had no dir-level [[link]] to claim coverage).
+        assert!(
+            parent_target
+                .join(".config/powershell/profile.ps1")
+                .exists()
+        );
+        assert!(parent_target.join(".config/powershell/extra.txt").exists());
+    }
+
+    /// File-level [[link]] errors clearly when src points at a missing
+    /// file — config bug, not a silent skip.
+    #[test]
+    fn marker_file_link_missing_src_errors() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let parent_target = utf8(tmp.path().join("home"));
+        let docs_target = utf8(tmp.path().join("docs"));
+        std::fs::create_dir_all(source.join("home/.config/powershell")).unwrap();
+        std::fs::create_dir_all(&parent_target).unwrap();
+        std::fs::create_dir_all(&docs_target).unwrap();
+
+        std::fs::write(
+            source.join("home/.config/powershell/.yuilink"),
+            format!(
+                r#"
+[[link]]
+src = "missing.ps1"
+dst = "{}/profile.ps1"
+"#,
+                toml_path(&docs_target)
+            ),
+        )
+        .unwrap();
+
+        let cfg = format!(
+            r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+            toml_path(&parent_target)
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+        let err = apply(Some(source.clone()), false).unwrap_err();
+        assert!(format!("{err:#}").contains("missing.ps1"));
     }
 
     fn walkdir(root: &Utf8Path) -> Vec<Utf8PathBuf> {
