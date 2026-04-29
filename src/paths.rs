@@ -40,6 +40,21 @@ pub fn home_dir() -> Option<Utf8PathBuf> {
         .map(Utf8PathBuf::from)
 }
 
+/// Build a source-tree walker that skips yui's internal `.yui/` directory.
+///
+/// `.yui/backup/` can grow huge over time, and `.yui/rendered/` (future)
+/// would also live here — neither is part of the user's dotfiles, and
+/// walking them slows render / list / absorb-find by a lot. We also keep
+/// `.gitignore` / `.ignore` filtering disabled (`git_ignore(false)`,
+/// `ignore(false)`) so a user's unrelated ignore rules don't swallow
+/// legitimate `.tera` / `.yuilink` files deeper in the tree.
+pub fn source_walker(source: &Utf8Path) -> ignore::WalkBuilder {
+    let mut b = ignore::WalkBuilder::new(source);
+    b.hidden(false).git_ignore(false).ignore(false);
+    b.filter_entry(|entry| entry.file_name() != ".yui");
+    b
+}
+
 /// Mirror an absolute target path into a backup directory, dropping the drive
 /// colon on Windows so the path is filesystem-safe.
 ///

@@ -199,11 +199,7 @@ fn collect_list_items(source: &Utf8Path, config: &Config, yui: &YuiVars) -> Resu
     }
 
     // 2. .yuilink overrides under source
-    let walker = ignore::WalkBuilder::new(source)
-        .hidden(false)
-        .git_ignore(false)
-        .ignore(false)
-        .build();
+    let walker = paths::source_walker(source).build();
     let marker_filename = &config.mount.marker_filename;
     for entry in walker {
         let entry = match entry {
@@ -841,12 +837,8 @@ fn find_source_for_target(
 
     // 2. `.yuilink` Override markers — walk source, parse, render each
     //    `[[link]] dst`, see if target is the rendered dst (or nested
-    //    inside a junction'd dir).
-    let walker = ignore::WalkBuilder::new(source)
-        .hidden(false)
-        .git_ignore(false)
-        .ignore(false)
-        .build();
+    //    inside a junction'd dir). Skips `.yui/` (backup mirrors etc.).
+    let walker = paths::source_walker(source).build();
     let marker_filename = &config.mount.marker_filename;
     for ent in walker {
         let ent = match ent {
@@ -1144,7 +1136,11 @@ fn prompt_absorb_with_diff(src: &Utf8Path, dst: &Utf8Path, reason: &str) -> Resu
     }
     eprintln!();
     eprint!("absorb target into source? [y/N]: ");
-    std::io::stdout().flush().ok();
+    // Flush stderr (where the prompt was written) — flushing stdout was a
+    // bug; on a buffered stderr (rare but possible) the prompt would be
+    // hidden until after the user typed something. Caught in PR #15
+    // review (gemini-code-assist).
+    std::io::stderr().flush().ok();
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
     let answer = input.trim();

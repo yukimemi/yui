@@ -20,10 +20,10 @@
 
 use camino::{Utf8Path, Utf8PathBuf};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use ignore::WalkBuilder;
 use tera::Context as TeraContext;
 
 use crate::config::{Config, RenderRule};
+use crate::paths;
 use crate::template::{self, Engine};
 use crate::vars::YuiVars;
 use crate::{Error, Result};
@@ -61,15 +61,11 @@ pub fn render_all(
     let rules = compile_rules(&config.render.rule)?;
     let mut report = RenderReport::default();
 
-    // Disable .gitignore / .ignore filtering: the rendered counterparts
-    // we manage are themselves gitignored, and we don't want a user's
-    // unrelated ignore rules (e.g. `node_modules/`) to swallow templates
-    // that live deeper. `.yuiignore` will eventually do its own filtering.
-    let walker = WalkBuilder::new(source)
-        .hidden(false)
-        .git_ignore(false)
-        .ignore(false)
-        .build();
+    // Walk every file under source. Filtering is centralized in
+    // `paths::source_walker`: ignore-files OFF (so unrelated user rules
+    // don't swallow `.tera`s) and `.yui/` skipped (backup mirrors etc.
+    // shouldn't be rendered).
+    let walker = paths::source_walker(source).build();
     for entry in walker {
         let entry = match entry {
             Ok(e) => e,
