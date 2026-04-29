@@ -1675,11 +1675,16 @@ fn merge_resolve_file_conflict(
             Ok(())
         }
         Restore => {
-            // `Restore` means the source path was missing, but we only
-            // call this when `source_path.is_file()`. Treat as a copy
-            // for safety.
-            std::fs::copy(target_path, source_path)?;
-            Ok(())
+            // `Restore` is the classifier's "target is missing" arm.
+            // We only enter this function after the merge loop saw
+            // `target_path` as a regular file in the read_dir
+            // iteration, and the caller guards on `source_path.is_file()`
+            // — both exist by construction, so this branch is
+            // unreachable.
+            unreachable!(
+                "merge_resolve_file_conflict reached with both files present, \
+                 but classify returned Restore (target {target_path} / source {source_path})"
+            )
         }
         NeedsConfirm => {
             use crate::config::AnomalyAction::*;
