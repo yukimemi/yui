@@ -35,11 +35,19 @@
 //! entry's `dst` is still the source of truth — if you want the default
 //! `~/.config/nvim`-style placement, list it explicitly.
 //!
-//! Default-dst behaviour: with an empty / link-less marker the walker
-//! still emits the dir-level link to the parent mount's natural dst (the
-//! original "presence-only" behaviour). With explicit `[[link]]` entries
-//! that natural dst is *not* implied — the marker fully defines what
-//! gets linked at this dir.
+//! Default-dst behaviour, two cases (kept distinct on purpose):
+//!
+//!   - **Empty / link-less marker** — the walker still emits the
+//!     dir-level link to the parent mount's natural dst (the original
+//!     "presence-only" behaviour).
+//!   - **Directory-scoped `[[link]]`** (no `src`) — fully defines the
+//!     directory's placement. The parent mount's natural dst is *not*
+//!     implied; only what's listed here is linked at this dir.
+//!   - **File-scoped `[[link]]`** (with `src = "<filename>"`) — applies
+//!     only to the named sibling file. It does *not* claim
+//!     directory-level coverage, so per-file defaults from the parent
+//!     mount still apply to the rest of the dir (and to the same file
+//!     too, in addition to the explicit dst).
 
 use camino::Utf8Path;
 use serde::Deserialize;
@@ -98,9 +106,18 @@ pub fn read_spec(dir: &Utf8Path, marker_filename: &str) -> Result<Option<MarkerS
     }
     for link in &parsed.link {
         if let Some(src) = &link.src {
-            if src.is_empty() || src.contains('/') || src.contains('\\') {
+            // Reject anything that isn't a plain sibling file. `.` /
+            // `..` would point at the marker dir itself or its parent,
+            // and path separators would let the entry escape the dir
+            // entirely — neither matches the "single filename" promise.
+            if src.is_empty()
+                || src == "."
+                || src == ".."
+                || src.contains('/')
+                || src.contains('\\')
+            {
                 return Err(Error::Config(format!(
-                    "parse {path}: [[link]] src must be a single filename (no path separators), got {src:?}"
+                    "parse {path}: [[link]] src must be a single filename (no path separators or `.`/`..`), got {src:?}"
                 )));
             }
         }
@@ -221,6 +238,31 @@ dst = "/anywhere"
         .unwrap();
         let err = read_spec(&root(&tmp), ".yuilink").unwrap_err();
         assert!(format!("{err}").contains("single filename"));
+    }
+
+    #[test]
+    fn marker_src_dot_or_dotdot_errors() {
+        // `.` / `..` would silently escape the marker dir or point at
+        // the dir itself; neither is what `[[link]] src` is for.
+        for bad in [".", ".."] {
+            let tmp = TempDir::new().unwrap();
+            std::fs::write(
+                tmp.path().join(".yuilink"),
+                format!(
+                    r#"
+[[link]]
+src = "{bad}"
+dst = "/anywhere"
+"#
+                ),
+            )
+            .unwrap();
+            let err = read_spec(&root(&tmp), ".yuilink").unwrap_err();
+            assert!(
+                format!("{err}").contains("single filename"),
+                "expected rejection for src = {bad:?}, got {err}"
+            );
+        }
     }
 
     #[test]

@@ -1006,10 +1006,21 @@ fn find_source_for_target(
             let dst_str = engine.render(&link.dst, tera_ctx)?;
             let dst = paths::expand_tilde(dst_str.trim());
             // File-level entry: dst points at a single file, so a match
-            // resolves directly to `<marker-dir>/<src filename>`.
+            // resolves directly to `<marker-dir>/<src filename>`. Mirror
+            // the existence check that apply / status do so a missing
+            // sibling produces the same clear message regardless of
+            // entry point — consistent with the `marker at … src=… not
+            // found` shape users already see from those flows.
             if let Some(filename) = &link.src {
+                let file_src = dir_utf8.join(filename);
+                if !file_src.is_file() {
+                    anyhow::bail!(
+                        "marker at {dir_utf8}: [[link]] src={filename:?} \
+                         not found"
+                    );
+                }
                 if target == dst {
-                    return Ok(Some(dir_utf8.join(filename)));
+                    return Ok(Some(file_src));
                 }
                 continue;
             }
@@ -1239,7 +1250,14 @@ fn walk_and_link(
                     emitted_any = true;
                 }
                 if !emitted_any {
-                    info!("marker at {src_dir} had no active links — skipping");
+                    // v0.6+ semantics: with no active links, the walker
+                    // still descends and per-file defaults still apply.
+                    // Phrase it so users don't read "skipping" as
+                    // "subtree blocked" (the v0.5 behaviour).
+                    info!(
+                        "marker at {src_dir} had no active links \
+                         — falling back to defaults"
+                    );
                 }
                 if emitted_dir_link {
                     covered = true;
