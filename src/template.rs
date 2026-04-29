@@ -28,8 +28,24 @@ impl Engine {
     pub fn render(&mut self, src: &str, ctx: &Context) -> Result<String> {
         self.tera
             .render_str(src, ctx)
-            .map_err(|e| crate::Error::Template(format!("{e:#}")))
+            .map_err(|e| crate::Error::Template(format_tera_error(&e)))
     }
+}
+
+/// Tera's `Display` impl only emits the top-level message
+/// (`Failed to render '__tera_one_off'`), leaving the actual reason
+/// (`variable 'vars.home_root' not found in context` etc.) buried in
+/// the source chain. Walk the chain and join every level so the user
+/// sees something they can act on.
+fn format_tera_error(err: &tera::Error) -> String {
+    use std::error::Error as _;
+    let mut parts: Vec<String> = vec![err.to_string()];
+    let mut src = err.source();
+    while let Some(e) = src {
+        parts.push(e.to_string());
+        src = e.source();
+    }
+    parts.join(": ")
 }
 
 impl Default for Engine {
