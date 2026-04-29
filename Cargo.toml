@@ -31,7 +31,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1"
-camino = { version = "1", features = ["serde1"] }
+camino = { version = "1.2.2", features = ["serde1"] }
 clap = { version = "4", features = ["derive", "env"] }
 globset = "0.4"
 ignore = "0.4"
