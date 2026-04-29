@@ -13,11 +13,13 @@ use crate::config::IconsMode;
 /// the bind-points / icon colours used in `yui list` / `yui status` so
 /// help, list, and status all feel like the same tool.
 const HELP_STYLES: Styles = Styles::styled()
-    // Section headers ("Usage:", "Commands:", "Options:").
+    // "Commands:" / "Options:" / etc. section headers.
     .header(AnsiColor::BrightCyan.on_default().effects(Effects::BOLD))
-    // The literal "yui" / subcommand names in usage strings.
+    // The "Usage:" heading label itself (NOT the binary name — that
+    // falls under `literal` below).
     .usage(AnsiColor::BrightCyan.on_default().effects(Effects::BOLD))
-    // Subcommand / option literals (`--source`, `init`, …).
+    // Binary name in the usage line + every subcommand / option
+    // literal (`init`, `--source`, …).
     .literal(AnsiColor::Magenta.on_default().effects(Effects::BOLD))
     // <PLACEHOLDER> values inside option signatures.
     .placeholder(AnsiColor::Cyan.on_default())
