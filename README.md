@@ -163,14 +163,14 @@ Need to absorb a single file regardless of policy? `yui absorb
 |---|---|
 | `yui init [--git-hooks]` | scaffold `config.toml` + `.gitignore` in cwd |
 | `yui apply [--dry-run]` | render → link → auto-absorb |
-| `yui render [--check]` | template-only pass; `--check` fails on drift |
+| `yui render [--check] [--dry-run]` | template-only pass; `--check` fails on drift |
 | `yui link [--dry-run]` | alias for apply (kept for muscle memory) |
 | `yui list [--all] [--icons MODE] [--no-color]` | every src→dst mapping |
 | `yui status [--icons MODE] [--no-color]` | drift overview, exits non-zero on any divergence |
-| `yui absorb <target>` | manually pull a single target into source |
+| `yui absorb <target> [--dry-run]` | manually pull a single target into source |
 | `yui unlink <path>...` | tear down a specific link |
 | `yui doctor` | environment sanity check |
-| `yui gc-backup --older-than DUR` | clean old backups (planned) |
+| `yui gc-backup [--older-than DUR]` | clean old backups (**not yet implemented** — calling it errors out) |
 
 `--icons` accepts `unicode` (default), `nerd` (Nerd-Font glyphs),
 `ascii` (CI-log-safe). The `[ui] icons = "..."` config key sets it
@@ -178,7 +178,7 @@ globally.
 
 ## Status
 
-`v0.3.0` ships the absorb story end-to-end — chezmoi-replacement
+`v0.4.0` ships the absorb story end-to-end — chezmoi-replacement
 ready for simple repos. Known gaps:
 
 - no `.yuiignore` (gitignore-style exclusion) yet

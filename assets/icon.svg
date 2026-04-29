@@ -3,7 +3,6 @@
   <!--
     Two interlocking rings — coral (source) ↔ indigo (target) — with a
     small gold diamond at the intersection marking the bind point: 結.
-    See assets/alt/ for the design exploration that led here.
   -->
   <g fill="none" stroke-width="20" stroke-linecap="round">
     <circle cx="96"  cy="128" r="56" stroke="#d96459" />
