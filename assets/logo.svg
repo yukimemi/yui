@@ -16,7 +16,7 @@
         font-weight="700" font-size="58" letter-spacing="-2"
         fill="#1a1a1a">yui</text>
   <!-- tagline -->
-  <text x="120" y="96"
+  <text x="120" y="102"
         font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
         font-style="italic" font-size="16"
         fill="#5a5a5a">結 — target-as-truth dotfiles manager</text>
