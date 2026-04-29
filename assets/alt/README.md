@@ -1,7 +1,13 @@
 # Logo / icon alternatives
 
-Concept variants for `assets/icon.svg`. Pick whichever reads best at
-favicon size and ship it; the others stay here for reference.
+Concept variants explored for `assets/icon.svg`.
+
+**Selected**: rings + diamond — see `icon-rings-diamond.svg` (now also
+in `../icon.svg`). The rings carry "source ↔ target", the small gold
+diamond at the intersection marks 結 (the bind point) without reading
+as a literal eye the way a centered circle did.
+
+The other variants stay here as a record of the design exploration.
 
 | file | concept | tradeoffs |
 |---|---|---|

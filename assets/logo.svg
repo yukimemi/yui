@@ -6,6 +6,9 @@
       <circle cx="96"  cy="128" r="56" stroke="#d96459" />
       <circle cx="160" cy="128" r="56" stroke="#225378" />
     </g>
+    <rect x="120" y="120" width="16" height="16"
+          transform="rotate(45 128 128)"
+          fill="#c9a227" />
   </g>
   <!-- wordmark -->
   <text x="118" y="68"

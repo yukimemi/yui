@@ -6,6 +6,9 @@
       <circle cx="96"  cy="128" r="56" stroke="#f08c80" />
       <circle cx="160" cy="128" r="56" stroke="#7eb3da" />
     </g>
+    <rect x="120" y="120" width="16" height="16"
+          transform="rotate(45 128 128)"
+          fill="#e9c14a" />
   </g>
   <text x="118" y="68"
         font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
