@@ -13,6 +13,9 @@ keywords = ["dotfiles", "config", "symlink", "hardlink", "junction"]
 categories = ["command-line-utilities", "config"]
 include = [
     "src/**/*.rs",
+    "assets/icon.svg",
+    "assets/logo.svg",
+    "assets/logo-dark.svg",
     "Cargo.toml",
     "README.md",
     "LICENSE",
