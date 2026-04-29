@@ -298,11 +298,31 @@ pub fn load(source: &Utf8Path, yui: &YuiVars) -> Result<Config> {
     for file in &files {
         let raw = std::fs::read_to_string(file)
             .map_err(|e| Error::Config(format!("read {file}: {e}")))?;
+
+        // Pre-extract this file's own `[vars]` section as plain text and
+        // merge it into `vars_acc` BEFORE rendering. Without this, a
+        // file's `[[mount.entry]] dst = "{{ vars.home_root }}"` couldn't
+        // reference a `home_root` declared at the top of the same file
+        // — it would only see vars from previously-loaded files.
+        if let Some(file_vars) = pre_extract_vars(&raw, file)? {
+            deep_merge_table(&mut vars_acc, file_vars);
+        }
+        // Resolve cross-references within vars (`a = "{{ b }}"`,
+        // `b = "raw"` — possibly across files) by iteratively rendering
+        // every string value in `vars_acc` with `vars_acc` itself as
+        // the context, until nothing changes (or we've burned through
+        // the iteration budget — that catches genuine cycles).
+        resolve_vars_refs(&mut vars_acc, yui, &mut engine)?;
+
         let ctx = template::template_context(yui, &vars_acc);
         let rendered = engine.render(&raw, &ctx)?;
         let parsed: toml::Table =
             toml::from_str(&rendered).map_err(|e| Error::Config(format!("parse {file}: {e}")))?;
 
+        // Re-merge vars from the parsed (Tera-rendered) form. Pre-extract
+        // gives us the unrendered shape; the rendered form may have
+        // resolved `{{ env(...) }}` etc. and we want those resolved
+        // values visible to subsequent files.
         if let Some(toml::Value::Table(file_vars)) = parsed.get("vars") {
             deep_merge_table(&mut vars_acc, file_vars.clone());
         }
@@ -313,6 +333,141 @@ pub fn load(source: &Utf8Path, yui: &YuiVars) -> Result<Config> {
         .try_into()
         .map_err(|e| Error::Config(format!("schema: {e}")))?;
     Ok(cfg)
+}
+
+/// Pull just the `[vars]` (and `[vars.X]` sub-tables) out of a config
+/// file's raw text and parse them as standalone TOML, ignoring the
+/// rest. Returns `None` when the file has no `[vars]` section.
+///
+/// Skips Tera control blocks (`{% ... %}` lines) so a file using
+/// `{% set ... %}` at the top doesn't break the extraction. Any value
+/// inside `[vars]` that itself contains Tera (`{{ ... }}` or `{% ... %}`)
+/// would round-trip through TOML deserialization unchanged — Tera
+/// rendering is the second pass.
+fn pre_extract_vars(raw: &str, file: &Utf8Path) -> Result<Option<toml::Table>> {
+    let mut in_vars = false;
+    let mut found_vars = false;
+    let mut lines: Vec<&str> = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        // Strip a trailing comment so a section header like
+        // `[options]  # group` still ends the [vars] capture.
+        let header = trimmed.split('#').next().unwrap_or("").trim();
+        if header.starts_with("[") {
+            // Section start. `[vars]` or `[vars.<X>]` opens / continues
+            // the capture; anything else closes it.
+            let normalized: String = header.chars().filter(|c| !c.is_whitespace()).collect();
+            if normalized == "[vars]"
+                || normalized.starts_with("[vars.")
+                || normalized.starts_with("[vars[")
+            {
+                in_vars = true;
+                found_vars = true;
+                lines.push(line);
+                continue;
+            }
+            in_vars = false;
+            continue;
+        }
+        // Tera control block at column 0 — skip so the standalone
+        // TOML parse doesn't see `{% set ... %}` and choke. Inline
+        // `{{ ... }}` inside values is fine because TOML happily
+        // accepts them as plain strings.
+        if trimmed.starts_with("{%") {
+            continue;
+        }
+        if in_vars {
+            lines.push(line);
+        }
+    }
+    if !found_vars {
+        return Ok(None);
+    }
+    let extracted = lines.join("\n");
+    let parsed: toml::Table = toml::from_str(&extracted).map_err(|e| {
+        Error::Config(format!(
+            "pre-extract [vars] from {file}: {e} \
+             (the [vars] block must be parseable on its own — \
+             move computed values into a `set` block above the section)"
+        ))
+    })?;
+    if let Some(toml::Value::Table(vars)) = parsed.get("vars") {
+        Ok(Some(vars.clone()))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Maximum number of resolution iterations. Each iteration evaluates
+/// every templated string value in `vars` with the current vars as the
+/// context. Genuine cycles (`a = "{{ b }}"`, `b = "{{ a }}"`) hit this
+/// budget and bail out — leaving the values as-is rather than looping
+/// forever or panicking.
+const MAX_VARS_RESOLVE_ITERATIONS: usize = 8;
+
+/// Iteratively Tera-render every string value in a vars table using the
+/// vars table itself (plus `yui.*` / `env(…)`) as the rendering context,
+/// until no value changes between iterations.
+fn resolve_vars_refs(
+    vars: &mut toml::Table,
+    yui: &YuiVars,
+    engine: &mut template::Engine,
+) -> Result<()> {
+    for _ in 0..MAX_VARS_RESOLVE_ITERATIONS {
+        let ctx = template::template_context(yui, vars);
+        let mut changed = false;
+        render_strings_in_table(vars, engine, &ctx, &mut changed)?;
+        if !changed {
+            return Ok(());
+        }
+    }
+    // Hit the budget — likely a cycle. We leave the partially-resolved
+    // values in place (rather than erroring) so the rest of yui keeps
+    // working; downstream Tera renders will surface a useful error if
+    // the unresolved value lands somewhere it matters.
+    Ok(())
+}
+
+fn render_strings_in_table(
+    table: &mut toml::Table,
+    engine: &mut template::Engine,
+    ctx: &tera::Context,
+    changed: &mut bool,
+) -> Result<()> {
+    for (_k, value) in table.iter_mut() {
+        render_strings_in_value(value, engine, ctx, changed)?;
+    }
+    Ok(())
+}
+
+fn render_strings_in_value(
+    value: &mut toml::Value,
+    engine: &mut template::Engine,
+    ctx: &tera::Context,
+    changed: &mut bool,
+) -> Result<()> {
+    match value {
+        toml::Value::String(s) => {
+            if !s.contains("{{") && !s.contains("{%") {
+                return Ok(());
+            }
+            let rendered = engine.render(s.as_str(), ctx)?;
+            if rendered != *s {
+                *s = rendered;
+                *changed = true;
+            }
+        }
+        toml::Value::Table(t) => {
+            render_strings_in_table(t, engine, ctx, changed)?;
+        }
+        toml::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                render_strings_in_value(v, engine, ctx, changed)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// List config files in merge order:
@@ -546,5 +701,106 @@ dst = "/a"
         assert!(cfg.render.manage_gitignore);
         assert_eq!(cfg.backup.dir, ".yui/backup");
         assert_eq!(cfg.mount.marker_filename, ".yuilink");
+    }
+
+    /// Pre-extract: a value declared in `[vars]` should be visible to
+    /// other sections of the same file during Tera rendering. Without
+    /// pre-extract this would fail because the file's own vars aren't
+    /// added to the context until AFTER rendering.
+    #[test]
+    fn vars_visible_to_same_file_render() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp,
+            "config.toml",
+            r#"
+[vars]
+home_root = "/custom/home"
+
+[[mount.entry]]
+src = "home"
+dst = "{{ vars.home_root }}"
+"#,
+        );
+        let r = root(&tmp);
+        let cfg = load(&r, &yui_vars(&r)).unwrap();
+        assert_eq!(cfg.mount.entry.len(), 1);
+        assert_eq!(cfg.mount.entry[0].dst, "/custom/home");
+    }
+
+    /// Tera `set` blocks at the top of the file (used by some configs
+    /// for computed values) shouldn't break the standalone TOML parse
+    /// of the [vars] block that lives further down.
+    #[test]
+    fn vars_extract_skips_set_blocks() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp,
+            "config.toml",
+            r#"
+{% set computed = "abc" %}
+[vars]
+plain = "real"
+
+[[mount.entry]]
+src = "home"
+dst = "{{ vars.plain }}"
+"#,
+        );
+        let r = root(&tmp);
+        let cfg = load(&r, &yui_vars(&r)).unwrap();
+        assert_eq!(cfg.mount.entry[0].dst, "real");
+    }
+
+    /// Vars that reference other vars should resolve regardless of
+    /// declaration order (the resolver iterates until convergence).
+    #[test]
+    fn vars_cross_reference_resolves_either_order() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp,
+            "config.toml",
+            r#"
+[vars]
+a = "{{ vars.b }}"
+b = "raw"
+
+[[mount.entry]]
+src = "home"
+dst = "{{ vars.a }}"
+"#,
+        );
+        let r = root(&tmp);
+        let cfg = load(&r, &yui_vars(&r)).unwrap();
+        assert_eq!(cfg.mount.entry[0].dst, "raw");
+    }
+
+    /// Genuine cycles (`a = {{b}}` + `b = {{a}}`) shouldn't loop or
+    /// panic. The resolver bails after the iteration budget and leaves
+    /// the values as-is; downstream Tera renders that hit the
+    /// unresolved value will surface a clear error if it actually
+    /// matters at that site.
+    #[test]
+    fn vars_cycle_does_not_loop_forever() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp,
+            "config.toml",
+            r#"
+[vars]
+a = "{{ vars.b }}"
+b = "{{ vars.a }}"
+
+[[mount.entry]]
+src = "home"
+dst = "/anywhere"
+"#,
+        );
+        let r = root(&tmp);
+        // Loads without panicking. The unresolved a/b just stay as
+        // literal Tera strings; load() succeeds because no other
+        // section actually references them.
+        let cfg = load(&r, &yui_vars(&r)).unwrap();
+        assert_eq!(cfg.mount.entry[0].dst, "/anywhere");
     }
 }
