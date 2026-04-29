@@ -54,7 +54,14 @@ pub enum Command {
     Unlink { paths: Vec<Utf8PathBuf> },
 
     /// Show drift status (link-broken / replaced / template-drift)
-    Status,
+    Status {
+        /// Override [ui] icons mode for this invocation
+        #[arg(long, value_name = "MODE")]
+        icons: Option<IconsMode>,
+        /// Disable color output (also respected via NO_COLOR env)
+        #[arg(long)]
+        no_color: bool,
+    },
 
     /// List all src→dst link mappings (mount entries + .yuilink overrides)
     List {
@@ -96,7 +103,7 @@ impl Cli {
             Command::Render { check, dry_run } => cmd::render(source, check, dry_run),
             Command::Link { dry_run } => cmd::link(source, dry_run),
             Command::Unlink { paths } => cmd::unlink(source, paths),
-            Command::Status => cmd::status(source),
+            Command::Status { icons, no_color } => cmd::status(source, icons, no_color),
             Command::List {
                 all,
                 icons,
