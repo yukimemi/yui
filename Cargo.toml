@@ -32,7 +32,7 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = "1.0.102"
 camino = { version = "1.2.2", features = ["serde1"] }
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4.6.1", features = ["derive", "env"] }
 globset = "0.4.18"
 ignore = "0.4"
 indicatif = "0.17"
