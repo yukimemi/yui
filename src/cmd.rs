@@ -1571,6 +1571,19 @@ fn merge_dir_target_into_source(target: &Utf8Path, source: &Utf8Path) -> Result<
         let ft = entry.file_type()?;
 
         if ft.is_dir() && !ft.is_symlink() {
+            // Target is a real dir. If source has a non-dir entry at
+            // the same name (regular file, symlink, junction), it
+            // would block `create_dir_all` and the recursive merge.
+            // Honor target-wins by clearing the conflicting source
+            // entry first.
+            if let Ok(src_meta) = std::fs::symlink_metadata(&source_path) {
+                let sft = src_meta.file_type();
+                if !sft.is_dir() || sft.is_symlink() {
+                    link::unlink(&source_path).with_context(|| {
+                        format!("remove conflicting source entry before dir merge: {source_path}")
+                    })?;
+                }
+            }
             if !source_path.exists() {
                 std::fs::create_dir_all(&source_path).with_context(|| {
                     format!("create_dir_all({source_path}) during target→source merge")
@@ -1578,6 +1591,23 @@ fn merge_dir_target_into_source(target: &Utf8Path, source: &Utf8Path) -> Result<
             }
             merge_dir_target_into_source(&target_path, &source_path)?;
         } else if ft.is_file() {
+            // Target is a regular file. Symmetrical handling: if
+            // source has a directory or symlink at the same name,
+            // tear it down first so the file copy can land.
+            if let Ok(src_meta) = std::fs::symlink_metadata(&source_path) {
+                let sft = src_meta.file_type();
+                if sft.is_dir() && !sft.is_symlink() {
+                    remove_dir_link_or_real(&source_path).with_context(|| {
+                        format!("remove conflicting source dir before file merge: {source_path}")
+                    })?;
+                } else if sft.is_symlink() {
+                    link::unlink(&source_path).with_context(|| {
+                        format!(
+                            "remove conflicting source symlink before file merge: {source_path}"
+                        )
+                    })?;
+                }
+            }
             if let Some(parent) = source_path.parent() {
                 if !parent.exists() {
                     std::fs::create_dir_all(parent)?;
@@ -1646,7 +1676,8 @@ fn handle_anomaly_dir(
                 std::io::stderr().flush().ok();
                 let mut buf = String::new();
                 std::io::stdin().lock().read_line(&mut buf)?;
-                if matches!(buf.trim(), "y" | "Y" | "yes") {
+                let answer = buf.trim();
+                if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
                     absorb_target_dir_into_source(src, dst, ctx)
                 } else {
                     warn!("anomaly skipped by user: {dst}");
@@ -2451,6 +2482,60 @@ dst = "{}"
         // recorded in source.
         assert!(target.join(".config/gh/hosts.yml").exists());
         assert!(source.join("home/.config/gh/hosts.yml").exists());
+    }
+
+    /// File↔dir collisions during merge. Honor target-wins: if source
+    /// has a regular file at a path where target has a dir, the file
+    /// gets removed and the dir is created. Symmetrical for the
+    /// inverse case. Without the conflict-clearing the merge would
+    /// fail with `not a directory` / `path exists` deep in the recursion.
+    #[test]
+    fn merge_handles_file_vs_dir_collisions_target_wins() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let target = utf8(tmp.path().join("target"));
+        std::fs::create_dir_all(source.join("home/.config/foo")).unwrap();
+        std::fs::create_dir_all(target.join(".config")).unwrap();
+        std::fs::write(source.join("home/.config/.yuilink"), "").unwrap();
+
+        // Conflict A: source has `foo` as dir, target has `foo` as file.
+        std::fs::write(source.join("home/.config/foo/leaf.txt"), "src").unwrap();
+        std::fs::write(target.join(".config/foo"), "target file body").unwrap();
+        // Conflict B: source has `bar` as file, target has `bar` as dir.
+        std::fs::write(source.join("home/.config/bar"), "src file body").unwrap();
+        std::fs::create_dir_all(target.join(".config/bar")).unwrap();
+        std::fs::write(target.join(".config/bar/inside.txt"), "target nested").unwrap();
+
+        let cfg = format!(
+            r#"
+[absorb]
+on_anomaly = "force"
+
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+            toml_path(&target)
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+        apply(Some(source.clone()), false).unwrap();
+
+        // After absorb the target's view (which equals source via
+        // junction) carries target's shapes:
+        // `foo` is a regular file
+        let foo_meta = std::fs::symlink_metadata(target.join(".config/foo")).unwrap();
+        assert!(foo_meta.file_type().is_file(), "foo should be a file");
+        assert_eq!(
+            std::fs::read_to_string(target.join(".config/foo")).unwrap(),
+            "target file body"
+        );
+        // `bar` is a directory with the nested file
+        let bar_meta = std::fs::symlink_metadata(target.join(".config/bar")).unwrap();
+        assert!(bar_meta.file_type().is_dir(), "bar should be a dir");
+        assert_eq!(
+            std::fs::read_to_string(target.join(".config/bar/inside.txt")).unwrap(),
+            "target nested"
+        );
     }
 
     #[test]
