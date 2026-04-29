@@ -1069,6 +1069,7 @@ pub fn hooks_run(source: Option<Utf8PathBuf>, name: Option<String>, force: bool)
         None => config.hook.iter().collect(),
     };
 
+    let mut state = hook::State::load(&source)?;
     for h in targets {
         let outcome = hook::run_hook(
             h,
@@ -1077,6 +1078,7 @@ pub fn hooks_run(source: Option<Utf8PathBuf>, name: Option<String>, force: bool)
             &config.vars,
             &mut engine,
             &tera_ctx,
+            &mut state,
             /* dry_run */ false,
             force,
         )?;
@@ -1088,6 +1090,9 @@ pub fn hooks_run(source: Option<Utf8PathBuf>, name: Option<String>, force: bool)
             HookOutcome::DryRun => "would run (dry-run)",
         };
         info!("hook[{}]: {label}", h.name);
+        if outcome == HookOutcome::Ran {
+            state.save(&source)?;
+        }
     }
     Ok(())
 }

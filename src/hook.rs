@@ -69,15 +69,20 @@ impl State {
         }
     }
 
+    /// Atomically persist the state to disk: write to a sibling `.tmp`
+    /// file then rename, so an interrupted save can't leave a half-
+    /// written state.json behind. (gemini medium PR #20)
     pub fn save(&self, source: &Utf8Path) -> Result<()> {
         let path = source.join(STATE_REL_PATH);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let tmp = path.with_extension("json.tmp");
         let mut body = serde_json::to_string_pretty(self)
             .map_err(|e| Error::Config(format!("serialize state: {e}")))?;
         body.push('\n');
-        std::fs::write(&path, body)?;
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 }
@@ -125,8 +130,10 @@ pub fn build_hook_context(
     ctx
 }
 
-/// Decide whether to run `hook` and run it if so. Side-effects:
-/// updates `.yui/state.json` on a successful run; nothing otherwise.
+/// Decide whether to run `hook` and run it if so. Updates `state` in
+/// memory on a successful run — caller is responsible for persisting
+/// (typically via `state.save(source)` after each `Ran` outcome, so a
+/// later hook failure doesn't lose the record of the earlier success).
 ///
 /// `force = true` bypasses the `when_run` state check (still respects
 /// `when` — an explicit `yui hooks run <name>` shouldn't suddenly run a
@@ -139,6 +146,7 @@ pub fn run_hook(
     vars: &toml::Table,
     engine: &mut Engine,
     base_ctx: &TeraContext,
+    state: &mut State,
     dry_run: bool,
     force: bool,
 ) -> Result<HookOutcome> {
@@ -150,16 +158,21 @@ pub fn run_hook(
 
     let script_path = source.join(&hook.script);
 
-    // Compute the script hash up front (cheap, and we want it to record
-    // on a successful run regardless of mode).
-    let current_hash = match std::fs::read(&script_path) {
-        Ok(bytes) => Some(sha256_hex(&bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e.into()),
+    // Hash the script body only when the `when_run` policy actually
+    // uses the value (`Onchange`). For `Once` / `Every` we don't need
+    // the hash either for the decision OR for state, so skip the
+    // read+SHA. (gemini medium PR #20)
+    let current_hash = if hook.when_run == WhenRun::Onchange {
+        match std::fs::read(&script_path) {
+            Ok(bytes) => Some(sha256_hex(&bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        }
+    } else {
+        None
     };
 
     if !force {
-        let state = State::load(source)?;
         let prior = state.hooks.get(&hook.name);
         match hook.when_run {
             WhenRun::Once => {
@@ -178,15 +191,19 @@ pub fn run_hook(
         }
     }
 
-    if dry_run {
-        return Ok(HookOutcome::DryRun);
-    }
-
-    if current_hash.is_none() {
+    // Validate that the script exists *before* the dry-run early
+    // return — `apply --dry-run` should still surface a missing script
+    // as an error rather than silently reporting "would run". (gemini
+    // medium PR #20)
+    if !script_path.is_file() {
         return Err(Error::Other(anyhow::anyhow!(
             "hook[{}]: script not found at {script_path}",
             hook.name
         )));
+    }
+
+    if dry_run {
+        return Ok(HookOutcome::DryRun);
     }
 
     let hook_ctx = build_hook_context(yui, vars, &script_path);
@@ -216,19 +233,14 @@ pub fn run_hook(
         )));
     }
 
-    let mut state = State::load(source)?;
     state.version = STATE_VERSION;
     state.hooks.insert(
         hook.name.clone(),
         HookState {
             last_run_at: Some(now_iso8601()),
-            last_content_hash: match hook.when_run {
-                WhenRun::Onchange => current_hash,
-                _ => None,
-            },
+            last_content_hash: current_hash,
         },
     );
-    state.save(source)?;
 
     Ok(HookOutcome::Ran)
 }
@@ -245,6 +257,7 @@ pub fn run_phase(
     phase: HookPhase,
     dry_run: bool,
 ) -> Result<()> {
+    let mut state = State::load(source)?;
     for hook in &config.hook {
         if hook.phase != phase {
             continue;
@@ -256,6 +269,7 @@ pub fn run_phase(
             &config.vars,
             engine,
             base_ctx,
+            &mut state,
             dry_run,
             /* force */ false,
         )?;
@@ -264,6 +278,11 @@ pub fn run_phase(
             HookPhase::Post => "post",
         };
         info!("hook[{}] {phase_name}: {:?}", hook.name, outcome);
+        // Save after each successful run so a later failure doesn't
+        // discard the earlier successes.
+        if outcome == HookOutcome::Ran {
+            state.save(source)?;
+        }
     }
     Ok(())
 }
@@ -352,23 +371,55 @@ mod tests {
         path
     }
 
-    #[test]
-    fn dry_run_returns_dry_run_outcome() {
-        let tmp = TempDir::new().unwrap();
-        let source = utf8(tmp.path().to_path_buf());
-        write_script(&source, ".yui/bin/h.sh", "#!/bin/sh\nexit 0\n");
-        let hook = HookConfig {
+    /// Helper that wraps run_hook + a freshly-loaded state. Used by all
+    /// the test cases below — the production callers (`run_phase`,
+    /// `cmd::hooks_run`) reuse one State across multiple hooks, but
+    /// per-test isolation is fine here.
+    #[allow(clippy::too_many_arguments)]
+    fn run_hook_test(
+        hook: &HookConfig,
+        source: &Utf8Path,
+        yui: &YuiVars,
+        vars: &toml::Table,
+        engine: &mut Engine,
+        ctx: &TeraContext,
+        dry_run: bool,
+        force: bool,
+    ) -> Result<HookOutcome> {
+        let mut state = State::load(source)?;
+        let outcome = run_hook(
+            hook, source, yui, vars, engine, ctx, &mut state, dry_run, force,
+        )?;
+        if outcome == HookOutcome::Ran {
+            state.save(source)?;
+        }
+        Ok(outcome)
+    }
+
+    /// Most tests need only a `bash` hook; this builds one with the
+    /// usual defaults. Caller picks the `when_run`.
+    fn bash_hook(when_run: WhenRun, when: Option<&str>) -> HookConfig {
+        HookConfig {
             name: "h".into(),
             script: ".yui/bin/h.sh".into(),
             command: "bash".into(),
             args: vec!["{{ script_path }}".into()],
-            when_run: WhenRun::Every,
+            when_run,
             phase: HookPhase::Post,
-            when: None,
-        };
+            when: when.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn dry_run_returns_dry_run_outcome() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().to_path_buf());
+        // Script must exist — dry_run now validates existence.
+        write_script(&source, ".yui/bin/h.sh", "#!/bin/sh\nexit 0\n");
+        let hook = bash_hook(WhenRun::Every, None);
         let vars = toml::Table::new();
         let (mut engine, ctx) = make_engine_and_ctx(&source, &vars);
-        let outcome = run_hook(
+        let outcome = run_hook_test(
             &hook,
             &source,
             &yui_vars(&source),
@@ -380,8 +431,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome, HookOutcome::DryRun);
-        // No state file written on dry-run.
         assert!(!source.join(STATE_REL_PATH).exists());
+    }
+
+    #[test]
+    fn dry_run_errors_when_script_missing() {
+        // Even in dry-run we should validate that the script exists —
+        // otherwise `apply --dry-run` would happily report "would run"
+        // for a misconfigured hook. (gemini PR #20 medium #4.)
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().to_path_buf());
+        let hook = bash_hook(WhenRun::Every, None);
+        let vars = toml::Table::new();
+        let (mut engine, ctx) = make_engine_and_ctx(&source, &vars);
+        let err = run_hook_test(
+            &hook,
+            &source,
+            &yui_vars(&source),
+            &vars,
+            &mut engine,
+            &ctx,
+            /* dry_run */ true,
+            /* force */ false,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("script not found"));
     }
 
     #[test]
@@ -389,18 +463,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let source = utf8(tmp.path().to_path_buf());
         write_script(&source, ".yui/bin/h.sh", "#!/bin/sh\nexit 1\n"); // would fail if run
-        let hook = HookConfig {
-            name: "h".into(),
-            script: ".yui/bin/h.sh".into(),
-            command: "bash".into(),
-            args: vec!["{{ script_path }}".into()],
-            when_run: WhenRun::Every,
-            phase: HookPhase::Post,
-            when: Some("yui.os == 'no-such-os'".into()),
-        };
+        let hook = bash_hook(WhenRun::Every, Some("yui.os == 'no-such-os'"));
         let vars = toml::Table::new();
         let (mut engine, ctx) = make_engine_and_ctx(&source, &vars);
-        let outcome = run_hook(
+        let outcome = run_hook_test(
             &hook,
             &source,
             &yui_vars(&source),
@@ -416,28 +482,52 @@ mod tests {
     }
 
     #[test]
+    fn force_still_respects_when_filter() {
+        // --force bypasses the time/hash state check, but the OS gate
+        // (`when = "yui.os == 'no-such-os'"`) is a real config filter
+        // that should still keep the hook from running.
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().to_path_buf());
+        write_script(&source, ".yui/bin/h.sh", "#!/bin/sh\nexit 1\n");
+        let hook = bash_hook(WhenRun::Every, Some("yui.os == 'no-such-os'"));
+        let vars = toml::Table::new();
+        let (mut engine, ctx) = make_engine_and_ctx(&source, &vars);
+        let outcome = run_hook_test(
+            &hook,
+            &source,
+            &yui_vars(&source),
+            &vars,
+            &mut engine,
+            &ctx,
+            false,
+            /* force */ true,
+        )
+        .unwrap();
+        assert_eq!(outcome, HookOutcome::SkippedWhenFalse);
+    }
+
+    // The remaining tests actually spawn `bash` so they're Unix-only —
+    // Windows GitHub runners don't have bash on $PATH (and we don't
+    // want to tie the test suite to Git Bash's path on Windows). The
+    // production code is portable; the tests just pick a portable
+    // command set when CI matters.
+
+    #[cfg(unix)]
+    #[test]
     fn once_runs_first_then_skips() {
         let tmp = TempDir::new().unwrap();
         let source = utf8(tmp.path().to_path_buf());
         let marker = source.join(".ran");
-        let script = write_script(
+        write_script(
             &source,
             ".yui/bin/h.sh",
             &format!("#!/bin/sh\necho ok > {:?}\n", marker.as_str()),
         );
-        let _ = script; // keep script_path alive
-        let hook = HookConfig {
-            name: "h".into(),
-            script: ".yui/bin/h.sh".into(),
-            command: "bash".into(),
-            args: vec!["{{ script_path }}".into()],
-            when_run: WhenRun::Once,
-            phase: HookPhase::Post,
-            when: None,
-        };
+        let hook = bash_hook(WhenRun::Once, None);
         let vars = toml::Table::new();
         let (mut engine, ctx) = make_engine_and_ctx(&source, &vars);
-        let first = run_hook(
+
+        let first = run_hook_test(
             &hook,
             &source,
             &yui_vars(&source),
@@ -449,13 +539,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first, HookOutcome::Ran);
-        assert!(
-            marker.exists(),
-            "first invocation should have run the script"
-        );
+        assert!(marker.exists());
         std::fs::remove_file(&marker).unwrap();
 
-        let second = run_hook(
+        let second = run_hook_test(
             &hook,
             &source,
             &yui_vars(&source),
@@ -467,12 +554,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(second, HookOutcome::SkippedOnce);
-        assert!(
-            !marker.exists(),
-            "second invocation should NOT have run the script"
-        );
+        assert!(!marker.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn onchange_runs_when_hash_differs() {
         let tmp = TempDir::new().unwrap();
@@ -482,20 +567,11 @@ mod tests {
         std::fs::create_dir_all(script.parent().unwrap()).unwrap();
         let body_v1 = format!("#!/bin/sh\necho v1 > {:?}\n", marker.as_str());
         std::fs::write(&script, &body_v1).unwrap();
-        let hook = HookConfig {
-            name: "h".into(),
-            script: ".yui/bin/h.sh".into(),
-            command: "bash".into(),
-            args: vec!["{{ script_path }}".into()],
-            when_run: WhenRun::Onchange,
-            phase: HookPhase::Post,
-            when: None,
-        };
+        let hook = bash_hook(WhenRun::Onchange, None);
         let vars = toml::Table::new();
         let (mut engine, ctx) = make_engine_and_ctx(&source, &vars);
 
-        // First run — fresh script, no state, runs.
-        let first = run_hook(
+        let first = run_hook_test(
             &hook,
             &source,
             &yui_vars(&source),
@@ -509,8 +585,7 @@ mod tests {
         assert_eq!(first, HookOutcome::Ran);
         std::fs::remove_file(&marker).unwrap();
 
-        // Second run — same script, hash matches, skipped.
-        let second = run_hook(
+        let second = run_hook_test(
             &hook,
             &source,
             &yui_vars(&source),
@@ -524,10 +599,9 @@ mod tests {
         assert_eq!(second, HookOutcome::SkippedUnchanged);
         assert!(!marker.exists());
 
-        // Edit script — hash differs, runs again.
         let body_v2 = format!("#!/bin/sh\necho v2 > {:?}\n", marker.as_str());
         std::fs::write(&script, &body_v2).unwrap();
-        let third = run_hook(
+        let third = run_hook_test(
             &hook,
             &source,
             &yui_vars(&source),
@@ -542,6 +616,7 @@ mod tests {
         assert!(marker.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn force_bypasses_state_check() {
         let tmp = TempDir::new().unwrap();
@@ -554,20 +629,11 @@ mod tests {
             format!("#!/bin/sh\necho hi >> {:?}\n", marker.as_str()),
         )
         .unwrap();
-        let hook = HookConfig {
-            name: "h".into(),
-            script: ".yui/bin/h.sh".into(),
-            command: "bash".into(),
-            args: vec!["{{ script_path }}".into()],
-            when_run: WhenRun::Once,
-            phase: HookPhase::Post,
-            when: None,
-        };
+        let hook = bash_hook(WhenRun::Once, None);
         let vars = toml::Table::new();
         let (mut engine, ctx) = make_engine_and_ctx(&source, &vars);
 
-        // Run once normally — succeeds.
-        let _ = run_hook(
+        let _ = run_hook_test(
             &hook,
             &source,
             &yui_vars(&source),
@@ -578,8 +644,7 @@ mod tests {
             false,
         )
         .unwrap();
-        // Forced second run — bypasses `Once` check, runs anyway.
-        let forced = run_hook(
+        let forced = run_hook_test(
             &hook,
             &source,
             &yui_vars(&source),
@@ -592,43 +657,56 @@ mod tests {
         .unwrap();
         assert_eq!(forced, HookOutcome::Ran);
         let body = std::fs::read_to_string(&marker).unwrap();
-        assert_eq!(
-            body.lines().count(),
-            2,
-            "force should have re-run the script"
-        );
+        assert_eq!(body.lines().count(), 2);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn force_still_respects_when_filter() {
-        // --force bypasses the time/hash state check, but the OS gate
-        // (`when = "yui.os == 'no-such-os'"`) is a real config filter
-        // that should still keep the hook from running.
+    fn run_phase_saves_after_each_success() {
+        // Two `every` hooks; both run, both records persist in
+        // state.json — verifying we save inside the loop, not at end.
         let tmp = TempDir::new().unwrap();
         let source = utf8(tmp.path().to_path_buf());
-        write_script(&source, ".yui/bin/h.sh", "#!/bin/sh\nexit 1\n");
-        let hook = HookConfig {
-            name: "h".into(),
-            script: ".yui/bin/h.sh".into(),
-            command: "bash".into(),
-            args: vec!["{{ script_path }}".into()],
-            when_run: WhenRun::Every,
-            phase: HookPhase::Post,
-            when: Some("yui.os == 'no-such-os'".into()),
+        write_script(&source, ".yui/bin/a.sh", "#!/bin/sh\nexit 0\n");
+        write_script(&source, ".yui/bin/b.sh", "#!/bin/sh\nexit 0\n");
+        let cfg = Config {
+            hook: vec![
+                HookConfig {
+                    name: "a".into(),
+                    script: ".yui/bin/a.sh".into(),
+                    command: "bash".into(),
+                    args: vec!["{{ script_path }}".into()],
+                    when_run: WhenRun::Every,
+                    phase: HookPhase::Post,
+                    when: None,
+                },
+                HookConfig {
+                    name: "b".into(),
+                    script: ".yui/bin/b.sh".into(),
+                    command: "bash".into(),
+                    args: vec!["{{ script_path }}".into()],
+                    when_run: WhenRun::Every,
+                    phase: HookPhase::Post,
+                    when: None,
+                },
+            ],
+            ..Default::default()
         };
-        let vars = toml::Table::new();
-        let (mut engine, ctx) = make_engine_and_ctx(&source, &vars);
-        let outcome = run_hook(
-            &hook,
+        let yui = yui_vars(&source);
+        let mut engine = Engine::new();
+        let ctx = template::template_context(&yui, &cfg.vars);
+        run_phase(
+            &cfg,
             &source,
-            &yui_vars(&source),
-            &vars,
+            &yui,
             &mut engine,
             &ctx,
+            HookPhase::Post,
             false,
-            /* force */ true,
         )
         .unwrap();
-        assert_eq!(outcome, HookOutcome::SkippedWhenFalse);
+        let state = State::load(&source).unwrap();
+        assert!(state.hooks.contains_key("a"));
+        assert!(state.hooks.contains_key("b"));
     }
 }
