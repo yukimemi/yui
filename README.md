@@ -137,6 +137,29 @@ when = "yui.os == 'windows'"
 
 `yui list` shows each link and which `when` would activate it.
 
+## `.yuiignore` — exclude paths from being linked
+
+A `$DOTFILES/.yuiignore` file (gitignore syntax) keeps matched paths
+out of every yui flow — render skips them, list omits them, and apply
+won't link them. Useful for editor lock-files, build artifacts, OS
+junk like `.DS_Store`, and anything else that lives next to your real
+config but shouldn't be propagated:
+
+```gitignore
+# $DOTFILES/.yuiignore
+**/.DS_Store
+**/lock.json
+home/.config/nvim/lazy-lock.json     # exact path also works
+
+# Exclude all of build/ except the one file we DO want linked
+build/
+!build/result.toml
+```
+
+Currently only the repo-root `.yuiignore` is honored — nested
+`.yuiignore` files inside subdirectories are not yet walked, so put
+all your rules at the top.
+
 ## Anomalies and the `[absorb]` policy
 
 When source AND target both diverge from each other, `yui` can't
@@ -181,7 +204,6 @@ globally.
 `v0.4.0` ships the absorb story end-to-end — chezmoi-replacement
 ready for simple repos. Known gaps:
 
-- no `.yuiignore` (gitignore-style exclusion) yet
 - no hook-script support (chezmoi's `run_*` scripts)
 - no built-in encryption (use `pass` / `1password-cli` from a Tera
   template instead)

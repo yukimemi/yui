@@ -73,9 +73,11 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     )?;
 
     let backup_root = source.join(&config.backup.dir);
+    let yuiignore = paths::load_yuiignore(&source)?;
     let ctx = ApplyCtx {
         config: &config,
         source: &source,
+        yuiignore: &yuiignore,
         file_mode: resolve_file_mode(config.link.file_mode),
         dir_mode: resolve_dir_mode(config.link.dir_mode),
         backup_root: &backup_root,
@@ -116,8 +118,12 @@ fn log_render_report(r: &RenderReport) {
 /// Bundle of immutable settings threaded through the apply walk.
 struct ApplyCtx<'a> {
     config: &'a Config,
-    /// Source repo root — needed for git-clean checks during absorb.
+    /// Source repo root — needed for git-clean checks during absorb and
+    /// for resolving paths inside `is_ignored` against `.yuiignore`.
     source: &'a Utf8Path,
+    /// Patterns from `$source/.yuiignore`. Empty matcher when the file
+    /// is absent.
+    yuiignore: &'a ignore::gitignore::Gitignore,
     file_mode: EffectiveFileMode,
     dir_mode: EffectiveDirMode,
     backup_root: &'a Utf8Path,
@@ -178,6 +184,7 @@ struct ListItem {
 fn collect_list_items(source: &Utf8Path, config: &Config, yui: &YuiVars) -> Result<Vec<ListItem>> {
     let mut engine = template::Engine::new();
     let tera_ctx = template::template_context(yui, &config.vars);
+    let yuiignore = paths::load_yuiignore(source)?;
     let mut items = Vec::new();
 
     // 1. config.toml [[mount.entry]] entries
@@ -220,6 +227,10 @@ fn collect_list_items(source: &Utf8Path, config: &Config, yui: &YuiVars) -> Resu
             Ok(p) => p,
             Err(_) => continue,
         };
+        // .yuiignore filter — markers inside ignored subtrees are skipped.
+        if paths::is_ignored(&yuiignore, source, &dir_utf8, true) {
+            continue;
+        }
         let spec = match marker::read_spec(&dir_utf8, marker_filename)? {
             Some(s) => s,
             None => continue,
@@ -485,6 +496,7 @@ pub fn status(
     }
 
     // 2. Link drift — classify each src→dst pair under every mount.
+    let yuiignore = paths::load_yuiignore(&source)?;
     for m in &mounts {
         let src_root = source.join(&m.src);
         if !src_root.is_dir() {
@@ -499,6 +511,7 @@ pub fn status(
             &mut engine,
             &tera_ctx,
             &source,
+            &yuiignore,
             &mut report,
         )?;
     }
@@ -553,8 +566,13 @@ fn classify_walk(
     engine: &mut template::Engine,
     tera_ctx: &TeraContext,
     source_root: &Utf8Path,
+    yuiignore: &ignore::gitignore::Gitignore,
     report: &mut Vec<StatusItem>,
 ) -> Result<()> {
+    if paths::is_ignored(yuiignore, source_root, src_dir, /* is_dir */ true) {
+        return Ok(());
+    }
+
     let marker_filename = &config.mount.marker_filename;
 
     if strategy == MountStrategy::Marker {
@@ -602,6 +620,9 @@ fn classify_walk(
         let src_path = src_dir.join(name);
         let dst_path = dst_dir.join(name);
         let ft = entry.file_type()?;
+        if paths::is_ignored(yuiignore, source_root, &src_path, ft.is_dir()) {
+            continue;
+        }
         if ft.is_dir() {
             classify_walk(
                 &src_path,
@@ -611,6 +632,7 @@ fn classify_walk(
                 engine,
                 tera_ctx,
                 source_root,
+                yuiignore,
                 report,
             )?;
         } else if ft.is_file() {
@@ -797,9 +819,11 @@ pub fn absorb(source: Option<Utf8PathBuf>, target: Utf8PathBuf, dry_run: bool) -
     }
 
     let backup_root = source.join(&config.backup.dir);
+    let yuiignore = paths::load_yuiignore(&source)?;
     let ctx = ApplyCtx {
         config: &config,
         source: &source,
+        yuiignore: &yuiignore,
         file_mode: resolve_file_mode(config.link.file_mode),
         dir_mode: resolve_dir_mode(config.link.dir_mode),
         backup_root: &backup_root,
@@ -821,6 +845,8 @@ fn find_source_for_target(
     engine: &mut template::Engine,
     tera_ctx: &TeraContext,
 ) -> Result<Option<Utf8PathBuf>> {
+    let yuiignore = paths::load_yuiignore(source)?;
+
     // 1. Mount entries — render dst, see if target is inside it.
     for entry in &config.mount.entry {
         if let Some(when) = &entry.when {
@@ -831,7 +857,14 @@ fn find_source_for_target(
         let dst_str = engine.render(&entry.dst, tera_ctx)?;
         let dst_root = paths::expand_tilde(dst_str.trim());
         if let Ok(rel) = target.strip_prefix(&dst_root) {
-            return Ok(Some(source.join(&entry.src).join(rel)));
+            let candidate = source.join(&entry.src).join(rel);
+            // Honor `.yuiignore` even on manual absorb — if you've
+            // ignored a path, you've explicitly opted out of yui's
+            // managing it.
+            if paths::is_ignored(&yuiignore, source, &candidate, candidate.is_dir()) {
+                continue;
+            }
+            return Ok(Some(candidate));
         }
     }
 
@@ -859,6 +892,9 @@ fn find_source_for_target(
             Ok(p) => p,
             Err(_) => continue,
         };
+        if paths::is_ignored(&yuiignore, source, &dir_utf8, true) {
+            continue;
+        }
         let spec = match marker::read_spec(&dir_utf8, marker_filename)? {
             Some(s) => s,
             None => continue,
@@ -952,6 +988,12 @@ fn walk_and_link(
     engine: &mut template::Engine,
     tera_ctx: &TeraContext,
 ) -> Result<()> {
+    // `.yuiignore` short-circuit — entire subtrees that match are skipped
+    // without even reading their marker / iterating their children.
+    if paths::is_ignored(ctx.yuiignore, ctx.source, src_dir, /* is_dir */ true) {
+        return Ok(());
+    }
+
     let marker_filename = &ctx.config.mount.marker_filename;
 
     if strategy == MountStrategy::Marker {
@@ -998,10 +1040,13 @@ fn walk_and_link(
             // Templates are handled by the render flow before linking.
             continue;
         }
-
         let src_path = src_dir.join(name);
         let dst_path = dst_dir.join(name);
         let ft = entry.file_type()?;
+
+        if paths::is_ignored(ctx.yuiignore, ctx.source, &src_path, ft.is_dir()) {
+            continue;
+        }
 
         if ft.is_dir() {
             walk_and_link(&src_path, &dst_path, ctx, strategy, engine, tera_ctx)?;
@@ -1906,6 +1951,78 @@ dst = "{}"
         std::fs::write(&stranger, "not yui's").unwrap();
         let err = absorb(Some(source), stranger, false).unwrap_err();
         assert!(format!("{err}").contains("no mount entry"));
+    }
+
+    #[test]
+    fn yuiignore_excludes_file_from_linking() {
+        let tmp = TempDir::new().unwrap();
+        let (source, target) = setup_minimal_dotfiles(&tmp);
+        std::fs::write(source.join("home/.bashrc"), "kept").unwrap();
+        std::fs::write(source.join("home/lock.json"), "ignored").unwrap();
+        // Exclude `lock.json` files anywhere under source.
+        std::fs::write(source.join(".yuiignore"), "**/lock.json\n").unwrap();
+        apply(Some(source.clone()), false).unwrap();
+        assert!(target.join(".bashrc").exists());
+        assert!(
+            !target.join("lock.json").exists(),
+            "yuiignore should keep lock.json out of target"
+        );
+    }
+
+    #[test]
+    fn yuiignore_excludes_directory_subtree() {
+        let tmp = TempDir::new().unwrap();
+        let (source, target) = setup_minimal_dotfiles(&tmp);
+        std::fs::create_dir_all(source.join("home/cache")).unwrap();
+        std::fs::write(source.join("home/.bashrc"), "kept").unwrap();
+        std::fs::write(source.join("home/cache/a"), "ignored").unwrap();
+        std::fs::write(source.join("home/cache/b"), "also ignored").unwrap();
+        // Trailing slash → match dirs only; entire subtree skipped.
+        std::fs::write(source.join(".yuiignore"), "home/cache/\n").unwrap();
+        apply(Some(source.clone()), false).unwrap();
+        assert!(target.join(".bashrc").exists());
+        assert!(
+            !target.join("cache").exists(),
+            "yuiignore'd subtree should not appear in target"
+        );
+    }
+
+    #[test]
+    fn yuiignore_negation_re_includes_file() {
+        let tmp = TempDir::new().unwrap();
+        let (source, target) = setup_minimal_dotfiles(&tmp);
+        std::fs::write(source.join("home/keep.cache"), "kept by negation").unwrap();
+        std::fs::write(source.join("home/drop.cache"), "ignored").unwrap();
+        // Ignore all .cache files except keep.cache.
+        std::fs::write(source.join(".yuiignore"), "*.cache\n!keep.cache\n").unwrap();
+        apply(Some(source.clone()), false).unwrap();
+        assert!(target.join("keep.cache").exists());
+        assert!(!target.join("drop.cache").exists());
+    }
+
+    #[test]
+    fn yuiignore_skips_template_in_render() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let target = utf8(tmp.path().join("target"));
+        std::fs::create_dir_all(source.join("home")).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(source.join("home/note.tera"), "{{ yui.os }}").unwrap();
+        std::fs::write(source.join(".yuiignore"), "home/note*\n").unwrap();
+        let cfg = format!(
+            r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+            toml_path(&target)
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+        apply(Some(source.clone()), false).unwrap();
+        // Neither the template nor the rendered output linked.
+        assert!(!source.join("home/note").exists());
+        assert!(!target.join("note").exists());
+        assert!(!target.join("note.tera").exists());
     }
 
     fn walkdir(root: &Utf8Path) -> Vec<Utf8PathBuf> {

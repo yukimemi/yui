@@ -59,12 +59,14 @@ pub fn render_all(
     let mut engine = Engine::new();
     let ctx = template::template_context(yui, &config.vars);
     let rules = compile_rules(&config.render.rule)?;
+    let yuiignore = paths::load_yuiignore(source)?;
     let mut report = RenderReport::default();
 
     // Walk every file under source. Filtering is centralized in
     // `paths::source_walker`: ignore-files OFF (so unrelated user rules
     // don't swallow `.tera`s) and `.yui/` skipped (backup mirrors etc.
-    // shouldn't be rendered).
+    // shouldn't be rendered). `.yuiignore` patterns are checked per
+    // entry below.
     let walker = paths::source_walker(source).build();
     for entry in walker {
         let entry = match entry {
@@ -85,6 +87,11 @@ pub fn render_all(
             Ok(p) => p,
             Err(_) => continue,
         };
+        // `.yuiignore` filter — also skip rendering the rendered counterpart
+        // (since that's what'd land in the user's tree).
+        if paths::is_ignored(&yuiignore, source, &template_path, false) {
+            continue;
+        }
         process_template(
             &template_path,
             source,
