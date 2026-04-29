@@ -1485,8 +1485,27 @@ fn link_dir_with_backup(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>) -> R
             // `.yui/backup/...`. Without this fall-through the absorb
             // chokes on `Directory not empty` (Windows error 145) for
             // anything migrated from a per-file dotfiles manager.
-            if link::unlink(dst).is_err() {
-                std::fs::remove_dir_all(dst)?;
+            //
+            // Narrow the fallback to the case it's actually for: the
+            // target still exists and is a real (non-link) directory.
+            // Anything else — permission denied, I/O error, the path
+            // suddenly being a file or junction — propagates instead
+            // of being silently coerced into `remove_dir_all`.
+            if let Err(unlink_err) = link::unlink(dst) {
+                let meta = std::fs::symlink_metadata(dst).with_context(|| {
+                    format!("stat {dst} after link::unlink failed: {unlink_err}")
+                })?;
+                let ft = meta.file_type();
+                if ft.is_dir() && !ft.is_symlink() {
+                    std::fs::remove_dir_all(dst).with_context(|| {
+                        format!(
+                            "remove_dir_all({dst}) after link::unlink failed: \
+                             {unlink_err}"
+                        )
+                    })?;
+                } else {
+                    return Err(unlink_err).with_context(|| format!("unlink({dst}) before relink"));
+                }
             }
             info!("relink dir: {src} → {dst}");
             link::link_dir(src, dst, ctx.dir_mode)?;
