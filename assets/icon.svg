@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="yui">
+  <title>yui — target-as-truth dotfiles</title>
+  <!--
+    Two interlocking rings — coral (source) ↔ indigo (target) — with a
+    small gold diamond at the intersection marking the bind point: 結.
+  -->
+  <g fill="none" stroke-width="20" stroke-linecap="round">
+    <circle cx="96"  cy="128" r="56" stroke="#d96459" />
+    <circle cx="160" cy="128" r="56" stroke="#225378" />
+  </g>
+  <rect x="120" y="120" width="16" height="16"
+        transform="rotate(45 128 128)"
+        fill="#c9a227" />
+</svg>

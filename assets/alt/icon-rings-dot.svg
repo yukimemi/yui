@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="yui (rings+dot variant)">
+  <title>yui — interlocking rings with a gold "yui" dot</title>
+  <!--
+    Variant 5: same two interlocking rings as the main icon, but with
+    a small gold dot in the intersection. Reads as "the binding point
+    is highlighted" — closer to a literal 結 (tied at this point).
+    Dot radius 7 (was 11) for more breathing room — fewer "eye" vibes.
+  -->
+  <g fill="none" stroke-width="20" stroke-linecap="round">
+    <circle cx="96"  cy="128" r="56" stroke="#d96459" />
+    <circle cx="160" cy="128" r="56" stroke="#225378" />
+  </g>
+  <!-- Gold "bind" dot at the geometric center of the intersection. -->
+  <circle cx="128" cy="128" r="7" fill="#c9a227" />
+</svg>
