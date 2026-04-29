@@ -36,7 +36,7 @@ clap = { version = "4", features = ["derive", "env"] }
 globset = "0.4"
 ignore = "0.4"
 indicatif = "0.17"
-jiff = { version = "0.2", features = ["serde"] }
+jiff = { version = "0.2.24", features = ["serde"] }
 owo-colors = "4"
 same-file = "1"
 serde = { version = "1", features = ["derive"] }
