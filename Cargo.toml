@@ -48,7 +48,7 @@ whoami = "1"
 junction = "1"
 
 [dev-dependencies]
-assert_cmd = "2"
+assert_cmd = "2.2.1"
 assert_fs = "1"
 predicates = "3"
 tempfile = "3"
