@@ -229,21 +229,9 @@ fn split_yui_when(raw: &str) -> Option<(&str, &str)> {
     Some((expr, &raw[body_start..]))
 }
 
-/// Evaluate a Tera expression as a truthy/falsy boolean. Accepts either a
-/// bare expression (`yui.os == 'linux'`) or a pre-wrapped one
-/// (`{{ yui.os == 'linux' }}`); used for both file-header `yui:when` and
-/// config `[[render.rule]] when` to keep the user-facing forms consistent
-/// with `[[mount.entry]] when` (which the user writes wrapped).
+/// Local alias for [`template::eval_truthy`] to keep call sites short.
 fn eval_when(expr: &str, engine: &mut Engine, ctx: &TeraContext) -> Result<bool> {
-    let trimmed = expr.trim_start();
-    let to_render = if trimmed.starts_with("{{") || trimmed.starts_with("{%") {
-        expr.to_string()
-    } else {
-        format!("{{{{ {expr} }}}}")
-    };
-    let out = engine.render(&to_render, ctx)?;
-    let s = out.trim();
-    Ok(s.eq_ignore_ascii_case("true") || s == "1")
+    template::eval_truthy(expr, engine, ctx)
 }
 
 fn template_target(template_path: &Utf8Path) -> Utf8PathBuf {
