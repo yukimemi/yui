@@ -52,6 +52,14 @@ pub fn home_dir() -> Option<Utf8PathBuf> {
 /// Patterns use full gitignore syntax: glob (`*`, `**`), negation
 /// (`!`), trailing-slash dir-only matching, comments (`#`). Paths
 /// outside `source` short-circuit to `false`.
+///
+/// If an ancestor directory is itself ignored, we return `true`
+/// immediately rather than descending into its `.yuiignore` — the
+/// recursive walkers (`walk_and_link`, `classify_walk_inner`) skip
+/// ignored subtrees entirely, so they never see the inner rules.
+/// Honouring inner whitelists here would let manual `absorb` pick a
+/// path that apply / status would never have linked. (Caught in PR
+/// #50 review.)
 pub fn is_ignored_at(source: &Utf8Path, path: &Utf8Path, is_dir: bool) -> crate::Result<bool> {
     let Ok(rel) = path.strip_prefix(source) else {
         return Ok(false);
@@ -66,6 +74,9 @@ pub fn is_ignored_at(source: &Utf8Path, path: &Utf8Path, is_dir: bool) -> crate:
         cur.push(c);
         if cur == path {
             break;
+        }
+        if stack.is_ignored(&cur, /* is_dir */ true) {
+            return Ok(true);
         }
         stack.push_dir(&cur)?;
     }
@@ -336,6 +347,25 @@ mod tests {
         stack.pop_dir(&no_ignore); // no-op
         // Root layer is still in place.
         assert!(stack.is_ignored(&root.join("a.lock"), false));
+    }
+
+    /// A nested `!negation` cannot un-ignore a path whose ancestor
+    /// directory is itself excluded — the recursive walkers never
+    /// descend that subtree, so `is_ignored_at` must agree. (PR #50
+    /// review caught this gap.)
+    #[test]
+    fn is_ignored_at_short_circuits_on_ignored_ancestor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let keepers = root.join("home").join("keepers");
+        std::fs::create_dir_all(&keepers).unwrap();
+        // Root excludes the entire `home/keepers/` dir.
+        std::fs::write(root.join(".yuiignore"), "home/keepers/\n").unwrap();
+        // Inner negation tries to re-include a single file.
+        std::fs::write(keepers.join(".yuiignore"), "!wanted.lock\n").unwrap();
+        // The walkers never descend into keepers/, so manual absorb
+        // must agree the file is ignored.
+        assert!(is_ignored_at(&root, &keepers.join("wanted.lock"), false).unwrap());
     }
 
     #[test]
