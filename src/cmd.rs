@@ -27,26 +27,170 @@ use crate::{absorb, backup, paths};
 // `OwoColorize::hidden(&self)`). Each print function imports the trait
 // locally with `use owo_colors::OwoColorize as _;`.
 
-pub fn init(source: Option<Utf8PathBuf>, _git_hooks: bool) -> Result<()> {
+pub fn init(source: Option<Utf8PathBuf>, git_hooks: bool) -> Result<()> {
     let dir = match source {
         Some(s) => absolutize(&s)?,
         None => current_dir_utf8()?,
     };
     std::fs::create_dir_all(&dir)?;
     let config_path = dir.join("config.toml");
-    if config_path.exists() {
+    let scaffolded = if !config_path.exists() {
+        std::fs::write(&config_path, SKELETON_CONFIG)?;
+        info!("initialized yui source repo at {dir}");
+        info!("created: {config_path}");
+        true
+    } else if git_hooks {
+        // Existing repo + hooks-only invocation: just install the
+        // hooks. Don't bail like we used to — a user who already has
+        // a populated dotfiles repo shouldn't need to delete
+        // config.toml to opt into the render-drift hooks.
+        info!(
+            "config.toml already exists at {config_path} \
+             — skipping scaffold, installing git hooks only"
+        );
+        false
+    } else {
         anyhow::bail!("config.toml already exists at {config_path}");
+    };
+
+    // .gitignore upkeep is `init`'s responsibility — running it
+    // again on an existing repo (e.g. for a hooks-only install)
+    // should still backfill the yui-required ignore lines if the
+    // .gitignore has drifted. The rendered-template section is
+    // separately maintained by `apply`'s render flow, so we only
+    // touch the state / backup / config.local entries here.
+    ensure_gitignore_yui_entries(&dir)?;
+
+    if git_hooks {
+        install_git_hooks(&dir)?;
     }
-    std::fs::write(&config_path, SKELETON_CONFIG)?;
-    let gitignore_path = dir.join(".gitignore");
-    if !gitignore_path.exists() {
-        std::fs::write(&gitignore_path, SKELETON_GITIGNORE)?;
+    if scaffolded {
+        info!("next: edit config.toml, then run `yui apply`");
     }
-    info!("initialized yui source repo at {dir}");
-    info!("created: {config_path}");
-    info!("next: edit config.toml, then run `yui apply`");
     Ok(())
 }
+
+/// .gitignore lines yui needs every dotfiles repo to carry. Anything
+/// the render flow auto-manages (the `# >>> yui rendered ... <<<`
+/// section) lives there; what `init` owns is the per-machine state +
+/// backup pile + the `config.local.toml` carve-out.
+const YUI_REQUIRED_GITIGNORE: &[&str] = &[
+    "/.yui/state.json",
+    "/.yui/state.json.tmp",
+    "/.yui/backup/",
+    "config.local.toml",
+];
+
+/// Ensure each `YUI_REQUIRED_GITIGNORE` line is present in the repo's
+/// `.gitignore`. Creates the file with the full skeleton when it's
+/// missing entirely, and appends only the missing entries (in a
+/// labelled section) when it already exists. Idempotent — re-running
+/// `init` is a no-op once the entries are in place.
+fn ensure_gitignore_yui_entries(dir: &Utf8Path) -> Result<()> {
+    let path = dir.join(".gitignore");
+    if !path.exists() {
+        std::fs::write(&path, SKELETON_GITIGNORE)?;
+        info!("created: {path}");
+        return Ok(());
+    }
+    let existing = std::fs::read_to_string(&path)?;
+    let missing: Vec<&str> = YUI_REQUIRED_GITIGNORE
+        .iter()
+        .copied()
+        .filter(|entry| !existing.lines().any(|line| line.trim() == *entry))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut next = existing;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    if !next.is_empty() {
+        next.push('\n');
+    }
+    next.push_str("# yui per-machine state and backups (added by `yui init`).\n");
+    for entry in &missing {
+        next.push_str(entry);
+        next.push('\n');
+    }
+    std::fs::write(&path, next)?;
+    info!(
+        "updated .gitignore: appended {} yui entr{} ({})",
+        missing.len(),
+        if missing.len() == 1 { "y" } else { "ies" },
+        missing.join(", ")
+    );
+    Ok(())
+}
+
+/// Install yui's render-drift hooks into the source repo's
+/// `.git/hooks/`. Both pre-commit and pre-push run `yui render --check`
+/// — pre-commit catches the easy case (you forgot to `apply` before
+/// committing), pre-push is the safety net that catches anything a
+/// bypassed pre-commit (or a `git commit --no-verify`) let slip
+/// through.
+///
+/// Asks git for the hooks directory via `rev-parse --git-path hooks`
+/// so `core.hooksPath` (configured globally or per-repo to redirect
+/// hooks elsewhere) is honoured, and worktrees / bare repos / GIT_DIR
+/// overrides come along for the ride. Refuses to overwrite existing
+/// hooks — the user has to delete them first if they want yui to
+/// manage that slot.
+fn install_git_hooks(source: &Utf8Path) -> Result<()> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "hooks"])
+        .current_dir(source.as_std_path())
+        .output()
+        .with_context(|| format!("git rev-parse --git-path hooks in {source}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "--git-hooks: {source} doesn't look like a git repo \
+             (run `git init` first). git: {}",
+            stderr.trim()
+        );
+    }
+    let raw = String::from_utf8(out.stdout)?;
+    let hooks_dir = {
+        let p = Utf8PathBuf::from(raw.trim());
+        if p.is_absolute() { p } else { source.join(p) }
+    };
+    std::fs::create_dir_all(&hooks_dir).with_context(|| format!("mkdir -p {hooks_dir}"))?;
+
+    for (name, body) in [("pre-commit", PRE_COMMIT_HOOK), ("pre-push", PRE_PUSH_HOOK)] {
+        let path = hooks_dir.join(name);
+        if path.exists() {
+            warn!("--git-hooks: {path} already exists — leaving it alone");
+            continue;
+        }
+        std::fs::write(&path, body).with_context(|| format!("write hook {path}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms)?;
+        }
+        info!("installed: {path}");
+    }
+    Ok(())
+}
+
+const PRE_COMMIT_HOOK: &str = r#"#!/bin/sh
+# Installed by `yui init --git-hooks`.
+# Reject the commit if any `*.tera` template would render to something
+# that diverges from the rendered output staged alongside it. Run
+# `yui apply` (or `yui render`) to refresh and re-commit.
+exec yui render --check
+"#;
+
+const PRE_PUSH_HOOK: &str = r#"#!/bin/sh
+# Installed by `yui init --git-hooks`.
+# Same render-drift check as pre-commit, mirrored on push so a
+# `--no-verify` commit doesn't sneak diverged state to the remote.
+exec yui render --check
+"#;
 
 pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     let source = resolve_source(source)?;
@@ -2720,6 +2864,160 @@ dst = "{}"
         std::fs::write(dir.join("config.toml"), "preexisting").unwrap();
         let err = init(Some(dir), false).unwrap_err();
         assert!(format!("{err}").contains("already exists"));
+    }
+
+    /// `init` is now in charge of the `.yui/` state / backup ignore
+    /// lines, even on a re-run against an existing repo. Pre-fix it
+    /// silently left a half-populated `.gitignore` alone if the user
+    /// didn't have the entries in place; now it appends the missing
+    /// ones idempotently.
+    #[test]
+    fn init_appends_missing_gitignore_entries_into_existing_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = utf8(tmp.path().join("dotfiles"));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Existing .gitignore that DOESN'T yet have any yui entries.
+        let user_gitignore = "# user entries\n*.swp\nnode_modules/\n";
+        std::fs::write(dir.join(".gitignore"), user_gitignore).unwrap();
+
+        init(Some(dir.clone()), false).unwrap();
+
+        let body = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        // The user's existing lines survive untouched.
+        assert!(body.contains("*.swp"));
+        assert!(body.contains("node_modules/"));
+        // Each yui-required line was appended.
+        assert!(body.contains("/.yui/state.json"));
+        assert!(body.contains("/.yui/backup/"));
+        assert!(body.contains("config.local.toml"));
+        // Re-running init on the already-fixed-up file is a no-op.
+        let before_rerun = body.clone();
+        // `init` would normally bail on an existing config; remove it so
+        // the second call doesn't trip that guard.
+        std::fs::remove_file(dir.join("config.toml")).unwrap();
+        init(Some(dir.clone()), false).unwrap();
+        let after_rerun = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert_eq!(
+            before_rerun, after_rerun,
+            "init must be idempotent when the gitignore already has every yui entry"
+        );
+    }
+
+    /// `init --git-hooks` against an *existing* repo (config.toml
+    /// already there) skips the scaffold and just installs the hooks.
+    /// Pre-fix this combo bailed with "config.toml already exists",
+    /// which forced users with a populated dotfiles repo to delete
+    /// their config before they could opt into the render-drift hooks.
+    #[test]
+    fn init_with_git_hooks_installs_into_existing_repo() {
+        let tmp = TempDir::new().unwrap();
+        let dir = utf8(tmp.path().join("dotfiles"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.as_std_path())
+            .status()
+            .expect("git init");
+        if !st.success() {
+            return;
+        }
+        // Pre-existing user config — init should NOT overwrite it.
+        let user_config = "# user already wrote this\n";
+        std::fs::write(dir.join("config.toml"), user_config).unwrap();
+
+        // hooks-only invocation: succeeds, leaves config alone.
+        init(Some(dir.clone()), /* git_hooks */ true).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.toml")).unwrap(),
+            user_config
+        );
+        assert!(dir.join(".git/hooks/pre-commit").is_file());
+        assert!(dir.join(".git/hooks/pre-push").is_file());
+    }
+
+    /// `init --git-hooks` writes pre-commit / pre-push that run the
+    /// render-drift check against `.git/hooks/`. We need a real git
+    /// repo for `git rev-parse --git-path hooks` to point at, so
+    /// prepare one before calling init.
+    #[test]
+    fn init_with_git_hooks_writes_pre_commit_and_pre_push() {
+        let tmp = TempDir::new().unwrap();
+        let dir = utf8(tmp.path().join("dotfiles"));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Bootstrap a git repo at `dir`.
+        let st = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.as_std_path())
+            .status()
+            .expect("git init");
+        if !st.success() {
+            // Skip if git isn't on PATH on this CI runner.
+            eprintln!("skipping: git not available");
+            return;
+        }
+        init(Some(dir.clone()), /* git_hooks */ true).unwrap();
+
+        let pre_commit = dir.join(".git/hooks/pre-commit");
+        let pre_push = dir.join(".git/hooks/pre-push");
+        assert!(pre_commit.is_file(), "pre-commit hook should be written");
+        assert!(pre_push.is_file(), "pre-push hook should be written");
+
+        let body = std::fs::read_to_string(&pre_commit).unwrap();
+        assert!(
+            body.contains("yui render --check"),
+            "pre-commit hook should call `yui render --check`, got: {body}"
+        );
+    }
+
+    /// `init --git-hooks` against a non-git directory must fail with a
+    /// clear message instead of silently doing nothing — the user
+    /// asked for hooks and we couldn't deliver.
+    #[test]
+    fn init_with_git_hooks_errors_outside_a_git_repo() {
+        let tmp = TempDir::new().unwrap();
+        let dir = utf8(tmp.path().join("not-a-repo"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = init(Some(dir), /* git_hooks */ true).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("git repo") || msg.contains("git rev-parse"),
+            "expected error to mention the git issue, got: {msg}"
+        );
+    }
+
+    /// Pre-existing hooks are not silently overwritten — yui leaves
+    /// the user's prior file alone (warns) and writes the missing one.
+    #[test]
+    fn init_with_git_hooks_does_not_clobber_existing_hooks() {
+        let tmp = TempDir::new().unwrap();
+        let dir = utf8(tmp.path().join("dotfiles"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.as_std_path())
+            .status()
+            .expect("git init");
+        if !st.success() {
+            return;
+        }
+        let hooks = dir.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("pre-commit"), "#! /bin/sh\nexit 0\n").unwrap();
+
+        init(Some(dir.clone()), true).unwrap();
+
+        // Existing pre-commit untouched, pre-push freshly written.
+        let pc = std::fs::read_to_string(hooks.join("pre-commit")).unwrap();
+        assert!(
+            !pc.contains("yui render --check"),
+            "existing pre-commit must not be overwritten"
+        );
+        let pp = std::fs::read_to_string(hooks.join("pre-push")).unwrap();
+        assert!(
+            pp.contains("yui render --check"),
+            "missing pre-push should be written: {pp}"
+        );
     }
 
     /// Build a minimal `apply`-able dotfiles tree for absorb tests.
