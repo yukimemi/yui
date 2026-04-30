@@ -36,10 +36,6 @@ pub fn init(source: Option<Utf8PathBuf>, git_hooks: bool) -> Result<()> {
     let config_path = dir.join("config.toml");
     let scaffolded = if !config_path.exists() {
         std::fs::write(&config_path, SKELETON_CONFIG)?;
-        let gitignore_path = dir.join(".gitignore");
-        if !gitignore_path.exists() {
-            std::fs::write(&gitignore_path, SKELETON_GITIGNORE)?;
-        }
         info!("initialized yui source repo at {dir}");
         info!("created: {config_path}");
         true
@@ -57,12 +53,74 @@ pub fn init(source: Option<Utf8PathBuf>, git_hooks: bool) -> Result<()> {
         anyhow::bail!("config.toml already exists at {config_path}");
     };
 
+    // .gitignore upkeep is `init`'s responsibility — running it
+    // again on an existing repo (e.g. for a hooks-only install)
+    // should still backfill the yui-required ignore lines if the
+    // .gitignore has drifted. The rendered-template section is
+    // separately maintained by `apply`'s render flow, so we only
+    // touch the state / backup / config.local entries here.
+    ensure_gitignore_yui_entries(&dir)?;
+
     if git_hooks {
         install_git_hooks(&dir)?;
     }
     if scaffolded {
         info!("next: edit config.toml, then run `yui apply`");
     }
+    Ok(())
+}
+
+/// .gitignore lines yui needs every dotfiles repo to carry. Anything
+/// the render flow auto-manages (the `# >>> yui rendered ... <<<`
+/// section) lives there; what `init` owns is the per-machine state +
+/// backup pile + the `config.local.toml` carve-out.
+const YUI_REQUIRED_GITIGNORE: &[&str] = &[
+    "/.yui/state.json",
+    "/.yui/state.json.tmp",
+    "/.yui/backup/",
+    "config.local.toml",
+];
+
+/// Ensure each `YUI_REQUIRED_GITIGNORE` line is present in the repo's
+/// `.gitignore`. Creates the file with the full skeleton when it's
+/// missing entirely, and appends only the missing entries (in a
+/// labelled section) when it already exists. Idempotent — re-running
+/// `init` is a no-op once the entries are in place.
+fn ensure_gitignore_yui_entries(dir: &Utf8Path) -> Result<()> {
+    let path = dir.join(".gitignore");
+    if !path.exists() {
+        std::fs::write(&path, SKELETON_GITIGNORE)?;
+        info!("created: {path}");
+        return Ok(());
+    }
+    let existing = std::fs::read_to_string(&path)?;
+    let missing: Vec<&str> = YUI_REQUIRED_GITIGNORE
+        .iter()
+        .copied()
+        .filter(|entry| !existing.lines().any(|line| line.trim() == *entry))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut next = existing;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    if !next.is_empty() {
+        next.push('\n');
+    }
+    next.push_str("# yui per-machine state and backups (added by `yui init`).\n");
+    for entry in &missing {
+        next.push_str(entry);
+        next.push('\n');
+    }
+    std::fs::write(&path, next)?;
+    info!(
+        "updated .gitignore: appended {} yui entr{} ({})",
+        missing.len(),
+        if missing.len() == 1 { "y" } else { "ies" },
+        missing.join(", ")
+    );
     Ok(())
 }
 
@@ -2806,6 +2864,43 @@ dst = "{}"
         std::fs::write(dir.join("config.toml"), "preexisting").unwrap();
         let err = init(Some(dir), false).unwrap_err();
         assert!(format!("{err}").contains("already exists"));
+    }
+
+    /// `init` is now in charge of the `.yui/` state / backup ignore
+    /// lines, even on a re-run against an existing repo. Pre-fix it
+    /// silently left a half-populated `.gitignore` alone if the user
+    /// didn't have the entries in place; now it appends the missing
+    /// ones idempotently.
+    #[test]
+    fn init_appends_missing_gitignore_entries_into_existing_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = utf8(tmp.path().join("dotfiles"));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Existing .gitignore that DOESN'T yet have any yui entries.
+        let user_gitignore = "# user entries\n*.swp\nnode_modules/\n";
+        std::fs::write(dir.join(".gitignore"), user_gitignore).unwrap();
+
+        init(Some(dir.clone()), false).unwrap();
+
+        let body = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        // The user's existing lines survive untouched.
+        assert!(body.contains("*.swp"));
+        assert!(body.contains("node_modules/"));
+        // Each yui-required line was appended.
+        assert!(body.contains("/.yui/state.json"));
+        assert!(body.contains("/.yui/backup/"));
+        assert!(body.contains("config.local.toml"));
+        // Re-running init on the already-fixed-up file is a no-op.
+        let before_rerun = body.clone();
+        // `init` would normally bail on an existing config; remove it so
+        // the second call doesn't trip that guard.
+        std::fs::remove_file(dir.join("config.toml")).unwrap();
+        init(Some(dir.clone()), false).unwrap();
+        let after_rerun = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert_eq!(
+            before_rerun, after_rerun,
+            "init must be idempotent when the gitignore already has every yui entry"
+        );
     }
 
     /// `init --git-hooks` against an *existing* repo (config.toml
