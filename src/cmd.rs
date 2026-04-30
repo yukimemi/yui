@@ -1103,13 +1103,16 @@ pub fn hooks_list(
     let rows: Vec<HookRow> = config
         .hook
         .iter()
-        .map(|h| {
+        .map(|h| -> Result<HookRow> {
+            // Propagate Tera errors instead of silently coercing them
+            // to "inactive" — a syntax error in the user's `when`
+            // expression should surface, not hide.
             let active = match &h.when {
                 None => true,
-                Some(w) => template::eval_truthy(w, &mut engine, &tera_ctx).unwrap_or(false),
+                Some(w) => template::eval_truthy(w, &mut engine, &tera_ctx)?,
             };
             let last_run_at = state.hooks.get(&h.name).and_then(|s| s.last_run_at.clone());
-            HookRow {
+            Ok(HookRow {
                 name: h.name.clone(),
                 phase: match h.phase {
                     HookPhase::Pre => "pre",
@@ -1123,9 +1126,9 @@ pub fn hooks_list(
                 last_run_at,
                 when: h.when.clone(),
                 active,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     print_hooks_table(&rows, icons, color);
 
