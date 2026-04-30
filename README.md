@@ -323,8 +323,8 @@ Used in production for the author's own ~/dotfiles. Known gaps:
 
 - no built-in encryption (use `pass` / `1password-cli` from a Tera
   template instead)
-- `yui gc-backup` is a stub today (tracked in [#46]) — prune
-  `.yui/backup/` by hand for now
+- `yui gc-backup` panics on call today (`todo!()`, tracked in [#46])
+  — prune `.yui/backup/` by hand for now
 
 ## License
 

@@ -34,20 +34,35 @@ pub fn init(source: Option<Utf8PathBuf>, git_hooks: bool) -> Result<()> {
     };
     std::fs::create_dir_all(&dir)?;
     let config_path = dir.join("config.toml");
-    if config_path.exists() {
+    let scaffolded = if !config_path.exists() {
+        std::fs::write(&config_path, SKELETON_CONFIG)?;
+        let gitignore_path = dir.join(".gitignore");
+        if !gitignore_path.exists() {
+            std::fs::write(&gitignore_path, SKELETON_GITIGNORE)?;
+        }
+        info!("initialized yui source repo at {dir}");
+        info!("created: {config_path}");
+        true
+    } else if git_hooks {
+        // Existing repo + hooks-only invocation: just install the
+        // hooks. Don't bail like we used to — a user who already has
+        // a populated dotfiles repo shouldn't need to delete
+        // config.toml to opt into the render-drift hooks.
+        info!(
+            "config.toml already exists at {config_path} \
+             — skipping scaffold, installing git hooks only"
+        );
+        false
+    } else {
         anyhow::bail!("config.toml already exists at {config_path}");
-    }
-    std::fs::write(&config_path, SKELETON_CONFIG)?;
-    let gitignore_path = dir.join(".gitignore");
-    if !gitignore_path.exists() {
-        std::fs::write(&gitignore_path, SKELETON_GITIGNORE)?;
-    }
-    info!("initialized yui source repo at {dir}");
-    info!("created: {config_path}");
+    };
+
     if git_hooks {
         install_git_hooks(&dir)?;
     }
-    info!("next: edit config.toml, then run `yui apply`");
+    if scaffolded {
+        info!("next: edit config.toml, then run `yui apply`");
+    }
     Ok(())
 }
 
@@ -58,18 +73,18 @@ pub fn init(source: Option<Utf8PathBuf>, git_hooks: bool) -> Result<()> {
 /// bypassed pre-commit (or a `git commit --no-verify`) let slip
 /// through.
 ///
-/// Honors `git rev-parse --git-dir` so it works in worktrees as well
-/// as plain repos. Refuses to overwrite existing hooks — the user has
-/// to delete them first if they want yui to manage that slot.
+/// Asks git for the hooks directory via `rev-parse --git-path hooks`
+/// so `core.hooksPath` (configured globally or per-repo to redirect
+/// hooks elsewhere) is honoured, and worktrees / bare repos / GIT_DIR
+/// overrides come along for the ride. Refuses to overwrite existing
+/// hooks — the user has to delete them first if they want yui to
+/// manage that slot.
 fn install_git_hooks(source: &Utf8Path) -> Result<()> {
-    // Resolve `.git` (or wherever the actual git dir lives in a
-    // worktree) by asking git directly. Hand-coding `source/.git` would
-    // miss worktrees + bare-repo + GIT_DIR env-override scenarios.
     let out = std::process::Command::new("git")
-        .args(["rev-parse", "--git-dir"])
+        .args(["rev-parse", "--git-path", "hooks"])
         .current_dir(source.as_std_path())
         .output()
-        .with_context(|| format!("git rev-parse --git-dir in {source}"))?;
+        .with_context(|| format!("git rev-parse --git-path hooks in {source}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!(
@@ -79,11 +94,10 @@ fn install_git_hooks(source: &Utf8Path) -> Result<()> {
         );
     }
     let raw = String::from_utf8(out.stdout)?;
-    let git_dir = {
+    let hooks_dir = {
         let p = Utf8PathBuf::from(raw.trim());
         if p.is_absolute() { p } else { source.join(p) }
     };
-    let hooks_dir = git_dir.join("hooks");
     std::fs::create_dir_all(&hooks_dir).with_context(|| format!("mkdir -p {hooks_dir}"))?;
 
     for (name, body) in [("pre-commit", PRE_COMMIT_HOOK), ("pre-push", PRE_PUSH_HOOK)] {
@@ -2794,10 +2808,43 @@ dst = "{}"
         assert!(format!("{err}").contains("already exists"));
     }
 
+    /// `init --git-hooks` against an *existing* repo (config.toml
+    /// already there) skips the scaffold and just installs the hooks.
+    /// Pre-fix this combo bailed with "config.toml already exists",
+    /// which forced users with a populated dotfiles repo to delete
+    /// their config before they could opt into the render-drift hooks.
+    #[test]
+    fn init_with_git_hooks_installs_into_existing_repo() {
+        let tmp = TempDir::new().unwrap();
+        let dir = utf8(tmp.path().join("dotfiles"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.as_std_path())
+            .status()
+            .expect("git init");
+        if !st.success() {
+            return;
+        }
+        // Pre-existing user config — init should NOT overwrite it.
+        let user_config = "# user already wrote this\n";
+        std::fs::write(dir.join("config.toml"), user_config).unwrap();
+
+        // hooks-only invocation: succeeds, leaves config alone.
+        init(Some(dir.clone()), /* git_hooks */ true).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.toml")).unwrap(),
+            user_config
+        );
+        assert!(dir.join(".git/hooks/pre-commit").is_file());
+        assert!(dir.join(".git/hooks/pre-push").is_file());
+    }
+
     /// `init --git-hooks` writes pre-commit / pre-push that run the
     /// render-drift check against `.git/hooks/`. We need a real git
-    /// repo for `git rev-parse --git-dir` to point at, so prepare one
-    /// before calling init.
+    /// repo for `git rev-parse --git-path hooks` to point at, so
+    /// prepare one before calling init.
     #[test]
     fn init_with_git_hooks_writes_pre_commit_and_pre_push() {
         let tmp = TempDir::new().unwrap();
