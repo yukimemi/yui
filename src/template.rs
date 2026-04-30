@@ -79,6 +79,26 @@ pub fn template_context<V: Serialize>(yui: &YuiVars, vars: &V) -> Context {
     let mut ctx = Context::new();
     ctx.insert("yui", yui);
     ctx.insert("vars", vars);
+    // Hook-level placeholders that the *real* hook context fills in
+    // at execute time. Seeding them as self-referencing strings
+    // here means a `[[hook]] args = ["{{ script_path }}"]` survives
+    // the config-load Tera pass intact instead of erroring on
+    // "Variable `script_path` not found in context" — Tera looks
+    // them up, gets the literal `{{ script_path }}` back, and
+    // emits it verbatim. The hook executor then re-renders with
+    // the real path via `build_hook_context`, which `Context::insert`
+    // overrides cleanly. Without this, every reference would have
+    // to be wrapped in `{% raw %}{% endraw %}`, which is ugly UX
+    // for the very tokens hook authors reach for first.
+    for placeholder in [
+        "script_path",
+        "script_dir",
+        "script_name",
+        "script_stem",
+        "script_ext",
+    ] {
+        ctx.insert(placeholder, &format!("{{{{ {placeholder} }}}}"));
+    }
     ctx
 }
 

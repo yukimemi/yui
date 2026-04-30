@@ -803,4 +803,39 @@ dst = "/anywhere"
         let cfg = load(&r, &yui_vars(&r)).unwrap();
         assert_eq!(cfg.mount.entry[0].dst, "/anywhere");
     }
+
+    /// Hook-level Tera tokens (`{{ script_path }}` etc.) must survive
+    /// the config-load render verbatim — otherwise every author would
+    /// have to wrap them in `{% raw %}{% endraw %}`. The placeholders
+    /// are seeded as self-references in `template_context` so Tera
+    /// just emits them back; the hook executor's
+    /// `build_hook_context` overrides them with real paths at run
+    /// time.
+    #[test]
+    fn hook_script_vars_survive_config_load_render_verbatim() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp,
+            "config.toml",
+            r#"
+[[mount.entry]]
+src = "home"
+dst = "/home/u"
+
+[[hook]]
+name = "deno-build"
+script = ".yui/bin/build.ts"
+command = "deno"
+args = ["run", "-A", "{{ script_path }}"]
+when_run = "onchange"
+"#,
+        );
+        let r = root(&tmp);
+        let cfg = load(&r, &yui_vars(&r)).unwrap();
+        assert_eq!(cfg.hook.len(), 1);
+        // The args literal made it through config-load untouched —
+        // the third arg is `{{ script_path }}`, ready for the hook
+        // executor to render with the real path.
+        assert_eq!(cfg.hook[0].args, vec!["run", "-A", "{{ script_path }}"]);
+    }
 }
