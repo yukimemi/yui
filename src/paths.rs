@@ -40,56 +40,47 @@ pub fn home_dir() -> Option<Utf8PathBuf> {
         .map(Utf8PathBuf::from)
 }
 
-/// Load `$source/.yuiignore` as a gitignore-style matcher.
+/// One-shot `.yuiignore` test for a single path under `source`.
 ///
-/// Returns an empty matcher when the file is absent (so `is_ignored`
-/// becomes a no-op). Patterns use full gitignore syntax: glob (`*`,
-/// `**`), negation (`!`), trailing-slash dir-only matching, comments
-/// (`#`).
+/// Builds a fresh `YuiIgnoreStack`, pushes every directory between
+/// `source` and `path.parent()` (so a deeply-nested `.yuiignore`
+/// participates), then asks the stack. Use this when you have a
+/// single candidate path to check (e.g. manual `absorb`'s
+/// mount-derived candidate); for recursive walks, push/pop on the
+/// hot path with a single long-lived `YuiIgnoreStack` instead.
 ///
-/// Currently only the repo-root `.yuiignore` is honored — nested
-/// `.yuiignore` files inside subdirectories are not yet walked. (The
-/// 95% case is "exclude `**/lock.json` once at the top".) If you need
-/// per-subtree rules, file an issue with the use case.
-pub fn load_yuiignore(source: &Utf8Path) -> crate::Result<ignore::gitignore::Gitignore> {
-    let path = source.join(".yuiignore");
-    if !path.is_file() {
-        return Ok(ignore::gitignore::Gitignore::empty());
-    }
-    let mut builder = ignore::gitignore::GitignoreBuilder::new(source);
-    if let Some(e) = builder.add(path.as_std_path()) {
-        return Err(crate::Error::Config(format!("parsing {path}: {e}")));
-    }
-    builder
-        .build()
-        .map_err(|e| crate::Error::Config(format!("building .yuiignore: {e}")))
-}
-
-/// Test a path against the loaded `.yuiignore` matcher.
+/// Patterns use full gitignore syntax: glob (`*`, `**`), negation
+/// (`!`), trailing-slash dir-only matching, comments (`#`). Paths
+/// outside `source` short-circuit to `false`.
 ///
-/// `path` is treated relative to `source` (gitignore convention). Paths
-/// that don't live under `source` can't possibly match a source-rooted
-/// rule, so they short-circuit to `false`. Without this guard, an
-/// absolute path passed through `unwrap_or(path)` would land on the
-/// matcher as an absolute, which `Gitignore` would test using its
-/// rightmost component — leading to spurious matches for paths outside
-/// the repo. (Caught in PR #19 review.)
-///
-/// Uses `matched_path_or_any_parents` so an ignored ancestor directory
-/// causes the descendant file to be ignored too.
-pub fn is_ignored(
-    gi: &ignore::gitignore::Gitignore,
-    source: &Utf8Path,
-    path: &Utf8Path,
-    is_dir: bool,
-) -> bool {
+/// If an ancestor directory is itself ignored, we return `true`
+/// immediately rather than descending into its `.yuiignore` — the
+/// recursive walkers (`walk_and_link`, `classify_walk_inner`) skip
+/// ignored subtrees entirely, so they never see the inner rules.
+/// Honouring inner whitelists here would let manual `absorb` pick a
+/// path that apply / status would never have linked. (Caught in PR
+/// #50 review.)
+pub fn is_ignored_at(source: &Utf8Path, path: &Utf8Path, is_dir: bool) -> crate::Result<bool> {
     let Ok(rel) = path.strip_prefix(source) else {
-        return false;
+        return Ok(false);
     };
-    matches!(
-        gi.matched_path_or_any_parents(rel.as_std_path(), is_dir),
-        ignore::Match::Ignore(_)
-    )
+    let mut stack = YuiIgnoreStack::new();
+    stack.push_dir(source)?;
+    let mut cur = source.to_owned();
+    for component in rel.components() {
+        let Utf8Component::Normal(c) = component else {
+            continue;
+        };
+        cur.push(c);
+        if cur == path {
+            break;
+        }
+        if stack.is_ignored(&cur, /* is_dir */ true) {
+            return Ok(true);
+        }
+        stack.push_dir(&cur)?;
+    }
+    Ok(stack.is_ignored(path, is_dir))
 }
 
 /// Build a source-tree walker that skips yui's internal `.yui/` directory.
@@ -100,11 +91,83 @@ pub fn is_ignored(
 /// `.gitignore` / `.ignore` filtering disabled (`git_ignore(false)`,
 /// `ignore(false)`) so a user's unrelated ignore rules don't swallow
 /// legitimate `.tera` / `.yuilink` files deeper in the tree.
+///
+/// `.yuiignore` is registered as a custom ignore filename so the
+/// walker honours nested rules (every subdir that has a `.yuiignore`
+/// adds its patterns scoped to that subtree, like git does with
+/// `.gitignore`). The manual recursive walks in `cmd.rs` use the
+/// `YuiIgnoreStack` companion type to get the same behaviour.
 pub fn source_walker(source: &Utf8Path) -> ignore::WalkBuilder {
     let mut b = ignore::WalkBuilder::new(source);
     b.hidden(false).git_ignore(false).ignore(false);
+    b.add_custom_ignore_filename(".yuiignore");
     b.filter_entry(|entry| entry.file_name() != ".yui");
     b
+}
+
+/// Stack of `.yuiignore` matchers for manual recursive walks. Each
+/// frame remembers the directory it was loaded from + the parsed
+/// matcher; testing a path walks innermost → outermost so a deeper
+/// `.yuiignore` overrides a shallower one (gitignore semantics).
+///
+/// Walkers `push_dir(d)` before iterating `d`'s entries and
+/// `pop_dir(d)` once they're done with the subtree. The same
+/// `YuiIgnoreStack` instance is threaded through the whole walk so
+/// the stack stays consistent across recursion.
+#[derive(Debug, Default)]
+pub struct YuiIgnoreStack {
+    layers: Vec<(Utf8PathBuf, ignore::gitignore::Gitignore)>,
+}
+
+impl YuiIgnoreStack {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Load `.yuiignore` from `dir` (if present) and push its rules
+    /// as a new layer. No-op when the file is absent.
+    pub fn push_dir(&mut self, dir: &Utf8Path) -> crate::Result<()> {
+        let path = dir.join(".yuiignore");
+        if !path.is_file() {
+            return Ok(());
+        }
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(dir);
+        if let Some(e) = builder.add(path.as_std_path()) {
+            return Err(crate::Error::Config(format!("parsing {path}: {e}")));
+        }
+        let gi = builder
+            .build()
+            .map_err(|e| crate::Error::Config(format!("building {path}: {e}")))?;
+        self.layers.push((dir.to_owned(), gi));
+        Ok(())
+    }
+
+    /// Pop the top layer if it was loaded from `dir`. Pairs with
+    /// `push_dir` — calling it on a directory that didn't push a
+    /// layer is a no-op.
+    pub fn pop_dir(&mut self, dir: &Utf8Path) {
+        if matches!(self.layers.last(), Some((p, _)) if p == dir) {
+            self.layers.pop();
+        }
+    }
+
+    /// Decide whether `path` should be ignored. Walks frames inside
+    /// → outside; the first decisive match (Ignore or Whitelist)
+    /// wins, so a deeper `.yuiignore` can both exclude *and*
+    /// re-include paths the parent missed.
+    pub fn is_ignored(&self, path: &Utf8Path, is_dir: bool) -> bool {
+        for (anchor, gi) in self.layers.iter().rev() {
+            let Ok(rel) = path.strip_prefix(anchor) else {
+                continue;
+            };
+            match gi.matched_path_or_any_parents(rel.as_std_path(), is_dir) {
+                ignore::Match::Ignore(_) => return true,
+                ignore::Match::Whitelist(_) => return false,
+                ignore::Match::None => continue,
+            }
+        }
+        false
+    }
 }
 
 /// Mirror an absolute target path into a backup directory, dropping the drive
@@ -229,6 +292,97 @@ mod tests {
             expand_tilde_with("~root/foo", home),
             Utf8PathBuf::from("~root/foo")
         );
+    }
+
+    #[test]
+    fn yui_ignore_stack_root_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        std::fs::write(root.join(".yuiignore"), "*.lock\n").unwrap();
+        let mut stack = YuiIgnoreStack::new();
+        stack.push_dir(&root).unwrap();
+        assert!(stack.is_ignored(&root.join("foo.lock"), false));
+        assert!(!stack.is_ignored(&root.join("foo.txt"), false));
+        stack.pop_dir(&root);
+        // After pop the matcher is gone — same path is no longer ignored.
+        assert!(!stack.is_ignored(&root.join("foo.lock"), false));
+    }
+
+    #[test]
+    fn yui_ignore_stack_nested_overrides_parent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let inner = root.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(root.join(".yuiignore"), "*.lock\n").unwrap();
+        // Nested re-includes everything via `!*.lock`.
+        std::fs::write(inner.join(".yuiignore"), "!*.lock\n").unwrap();
+
+        let mut stack = YuiIgnoreStack::new();
+        stack.push_dir(&root).unwrap();
+        assert!(stack.is_ignored(&root.join("a.lock"), false));
+        stack.push_dir(&inner).unwrap();
+        assert!(
+            !stack.is_ignored(&inner.join("a.lock"), false),
+            "deeper layer's whitelist should win"
+        );
+        stack.pop_dir(&inner);
+        // After leaving inner, root rule applies again.
+        assert!(stack.is_ignored(&root.join("b.lock"), false));
+    }
+
+    #[test]
+    fn yui_ignore_stack_pop_only_matches_top() {
+        // pop_dir for a directory that didn't push anything is a no-op,
+        // so a missing `.yuiignore` doesn't desync the stack.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        std::fs::write(root.join(".yuiignore"), "*.lock\n").unwrap();
+        let no_ignore = root.join("plain");
+        std::fs::create_dir_all(&no_ignore).unwrap();
+
+        let mut stack = YuiIgnoreStack::new();
+        stack.push_dir(&root).unwrap();
+        stack.push_dir(&no_ignore).unwrap(); // no .yuiignore, no-op
+        stack.pop_dir(&no_ignore); // no-op
+        // Root layer is still in place.
+        assert!(stack.is_ignored(&root.join("a.lock"), false));
+    }
+
+    /// A nested `!negation` cannot un-ignore a path whose ancestor
+    /// directory is itself excluded — the recursive walkers never
+    /// descend that subtree, so `is_ignored_at` must agree. (PR #50
+    /// review caught this gap.)
+    #[test]
+    fn is_ignored_at_short_circuits_on_ignored_ancestor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let keepers = root.join("home").join("keepers");
+        std::fs::create_dir_all(&keepers).unwrap();
+        // Root excludes the entire `home/keepers/` dir.
+        std::fs::write(root.join(".yuiignore"), "home/keepers/\n").unwrap();
+        // Inner negation tries to re-include a single file.
+        std::fs::write(keepers.join(".yuiignore"), "!wanted.lock\n").unwrap();
+        // The walkers never descend into keepers/, so manual absorb
+        // must agree the file is ignored.
+        assert!(is_ignored_at(&root, &keepers.join("wanted.lock"), false).unwrap());
+    }
+
+    #[test]
+    fn is_ignored_at_walks_intermediate_yuiignores() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let mid = root.join("mid");
+        let leaf = mid.join("leaf");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(mid.join(".yuiignore"), "secret*\n").unwrap();
+        // mid/.yuiignore must be picked up when checking leaf/secret.txt
+        assert!(is_ignored_at(&root, &leaf.join("secret.txt"), false).unwrap());
+        assert!(!is_ignored_at(&root, &leaf.join("public.txt"), false).unwrap());
+        // Path outside the source root is not ignored.
+        let outside =
+            Utf8PathBuf::from_path_buf(tmp.path().parent().unwrap().to_path_buf()).unwrap();
+        assert!(!is_ignored_at(&root, &outside.join("anywhere"), false).unwrap());
     }
 
     #[test]

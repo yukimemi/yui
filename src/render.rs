@@ -54,7 +54,6 @@ pub fn render_all(
     source: &Utf8Path,
     config: &Config,
     yui: &YuiVars,
-    yuiignore: &ignore::gitignore::Gitignore,
     dry_run: bool,
 ) -> Result<RenderReport> {
     let mut engine = Engine::new();
@@ -65,8 +64,9 @@ pub fn render_all(
     // Walk every file under source. Filtering is centralized in
     // `paths::source_walker`: ignore-files OFF (so unrelated user rules
     // don't swallow `.tera`s) and `.yui/` skipped (backup mirrors etc.
-    // shouldn't be rendered). `.yuiignore` patterns are checked per
-    // entry below.
+    // shouldn't be rendered). `.yuiignore` is registered as a custom
+    // ignore filename, so nested `.yuiignore` files are honored
+    // automatically — no extra per-entry check needed here.
     let walker = paths::source_walker(source).build();
     for entry in walker {
         let entry = match entry {
@@ -87,11 +87,6 @@ pub fn render_all(
             Ok(p) => p,
             Err(_) => continue,
         };
-        // `.yuiignore` filter — also skip rendering the rendered counterpart
-        // (since that's what'd land in the user's tree).
-        if paths::is_ignored(yuiignore, source, &template_path, false) {
-            continue;
-        }
         process_template(
             &template_path,
             source,
@@ -404,14 +399,7 @@ mod tests {
             &r.join("home/.gitconfig.tera"),
             "[user]\n  os = {{ yui.os }}\n",
         );
-        let report = render_all(
-            &r,
-            &empty_config(),
-            &yui_vars(&r),
-            &ignore::gitignore::Gitignore::empty(),
-            false,
-        )
-        .unwrap();
+        let report = render_all(&r, &empty_config(), &yui_vars(&r), false).unwrap();
         assert_eq!(report.written.len(), 1);
         assert_eq!(
             std::fs::read_to_string(r.join("home/.gitconfig")).unwrap(),
@@ -427,14 +415,7 @@ mod tests {
         let mut cfg = empty_config();
         cfg.vars
             .insert("greet".into(), toml::Value::String("hello".into()));
-        let _ = render_all(
-            &r,
-            &cfg,
-            &yui_vars(&r),
-            &ignore::gitignore::Gitignore::empty(),
-            false,
-        )
-        .unwrap();
+        let _ = render_all(&r, &cfg, &yui_vars(&r), false).unwrap();
         assert_eq!(
             std::fs::read_to_string(r.join("home/foo")).unwrap(),
             "hello"
@@ -449,14 +430,7 @@ mod tests {
             &r.join("home/foo.tera"),
             "{# yui:when yui.os == 'windows' #}\nbody",
         );
-        let report = render_all(
-            &r,
-            &empty_config(),
-            &yui_vars(&r),
-            &ignore::gitignore::Gitignore::empty(),
-            false,
-        )
-        .unwrap();
+        let report = render_all(&r, &empty_config(), &yui_vars(&r), false).unwrap();
         assert!(report.written.is_empty());
         assert_eq!(report.skipped_when_false.len(), 1);
         assert!(!r.join("home/foo").exists());
@@ -470,14 +444,7 @@ mod tests {
             &r.join("home/foo.tera"),
             "{# yui:when yui.os == 'linux' #}\nbody",
         );
-        let report = render_all(
-            &r,
-            &empty_config(),
-            &yui_vars(&r),
-            &ignore::gitignore::Gitignore::empty(),
-            false,
-        )
-        .unwrap();
+        let report = render_all(&r, &empty_config(), &yui_vars(&r), false).unwrap();
         assert_eq!(report.written.len(), 1);
         assert_eq!(std::fs::read_to_string(r.join("home/foo")).unwrap(), "body");
     }
@@ -492,14 +459,7 @@ mod tests {
             r#match: "home/win/**".into(),
             when: Some("{{ yui.os == 'windows' }}".into()),
         });
-        let report = render_all(
-            &r,
-            &cfg,
-            &yui_vars(&r),
-            &ignore::gitignore::Gitignore::empty(),
-            false,
-        )
-        .unwrap();
+        let report = render_all(&r, &cfg, &yui_vars(&r), false).unwrap();
         assert_eq!(report.skipped_when_false.len(), 1);
         assert!(report.written.is_empty());
     }
@@ -515,14 +475,7 @@ mod tests {
             r#match: "home/win/**".into(),
             when: Some("{{ yui.os == 'windows' }}".into()),
         });
-        let report = render_all(
-            &r,
-            &cfg,
-            &yui_vars(&r),
-            &ignore::gitignore::Gitignore::empty(),
-            false,
-        )
-        .unwrap();
+        let report = render_all(&r, &cfg, &yui_vars(&r), false).unwrap();
         assert_eq!(report.written.len(), 1);
     }
 
@@ -532,14 +485,7 @@ mod tests {
         let r = root(&tmp);
         write(&r.join("home/foo.tera"), "body");
         write(&r.join("home/foo"), "body"); // already in sync
-        let report = render_all(
-            &r,
-            &empty_config(),
-            &yui_vars(&r),
-            &ignore::gitignore::Gitignore::empty(),
-            false,
-        )
-        .unwrap();
+        let report = render_all(&r, &empty_config(), &yui_vars(&r), false).unwrap();
         assert!(report.written.is_empty());
         assert_eq!(report.unchanged.len(), 1);
     }
@@ -550,14 +496,7 @@ mod tests {
         let r = root(&tmp);
         write(&r.join("home/foo.tera"), "fresh body");
         write(&r.join("home/foo"), "manually edited");
-        let report = render_all(
-            &r,
-            &empty_config(),
-            &yui_vars(&r),
-            &ignore::gitignore::Gitignore::empty(),
-            false,
-        )
-        .unwrap();
+        let report = render_all(&r, &empty_config(), &yui_vars(&r), false).unwrap();
         assert!(report.has_drift());
         assert_eq!(report.diverged.len(), 1);
         // existing content NOT overwritten
@@ -572,14 +511,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let r = root(&tmp);
         write(&r.join("home/foo.tera"), "body");
-        let _ = render_all(
-            &r,
-            &empty_config(),
-            &yui_vars(&r),
-            &ignore::gitignore::Gitignore::empty(),
-            true,
-        )
-        .unwrap();
+        let _ = render_all(&r, &empty_config(), &yui_vars(&r), true).unwrap();
         assert!(!r.join("home/foo").exists());
         assert!(!r.join(".gitignore").exists());
     }
@@ -590,14 +522,7 @@ mod tests {
         let r = root(&tmp);
         write(&r.join("home/foo.tera"), "body");
         write(&r.join("home/bar.tera"), "body2");
-        let _ = render_all(
-            &r,
-            &empty_config(),
-            &yui_vars(&r),
-            &ignore::gitignore::Gitignore::empty(),
-            false,
-        )
-        .unwrap();
+        let _ = render_all(&r, &empty_config(), &yui_vars(&r), false).unwrap();
         let gi = std::fs::read_to_string(r.join(".gitignore")).unwrap();
         assert!(gi.contains(GITIGNORE_BEGIN));
         assert!(gi.contains(GITIGNORE_END));
@@ -615,14 +540,7 @@ mod tests {
         let r = root(&tmp);
         write(&r.join(".gitignore"), "node_modules/\ntarget/\n");
         write(&r.join("home/foo.tera"), "body");
-        let _ = render_all(
-            &r,
-            &empty_config(),
-            &yui_vars(&r),
-            &ignore::gitignore::Gitignore::empty(),
-            false,
-        )
-        .unwrap();
+        let _ = render_all(&r, &empty_config(), &yui_vars(&r), false).unwrap();
         let gi = std::fs::read_to_string(r.join(".gitignore")).unwrap();
         assert!(gi.contains("node_modules/"));
         assert!(gi.contains("target/"));
@@ -639,14 +557,7 @@ mod tests {
             &format!("node_modules/\n\n{GITIGNORE_BEGIN}\nstale/path\n{GITIGNORE_END}\n\nfoo\n"),
         );
         write(&r.join("home/foo.tera"), "body");
-        let _ = render_all(
-            &r,
-            &empty_config(),
-            &yui_vars(&r),
-            &ignore::gitignore::Gitignore::empty(),
-            false,
-        )
-        .unwrap();
+        let _ = render_all(&r, &empty_config(), &yui_vars(&r), false).unwrap();
         let gi = std::fs::read_to_string(r.join(".gitignore")).unwrap();
         assert!(gi.contains("node_modules/"));
         assert!(gi.contains("home/foo"));
@@ -662,14 +573,7 @@ mod tests {
         // Pre-existing .gitignore that would normally hide `node_modules/`.
         write(&r.join(".gitignore"), "node_modules/\n");
         write(&r.join("node_modules/foo.tera"), "body");
-        let report = render_all(
-            &r,
-            &empty_config(),
-            &yui_vars(&r),
-            &ignore::gitignore::Gitignore::empty(),
-            false,
-        )
-        .unwrap();
+        let report = render_all(&r, &empty_config(), &yui_vars(&r), false).unwrap();
         // Template under a gitignored dir is still discovered + rendered.
         assert_eq!(report.written.len(), 1);
         assert!(r.join("node_modules/foo").exists());
@@ -685,14 +589,7 @@ mod tests {
             "{# yui:when yui.os == 'windows' #}\nbody",
         );
         write(&r.join("home/foo"), "old rendered output");
-        let report = render_all(
-            &r,
-            &empty_config(),
-            &yui_vars(&r),
-            &ignore::gitignore::Gitignore::empty(),
-            false,
-        )
-        .unwrap();
+        let report = render_all(&r, &empty_config(), &yui_vars(&r), false).unwrap();
         assert_eq!(report.skipped_when_false.len(), 1);
         // Stale sibling was cleaned up so apply won't link it.
         assert!(!r.join("home/foo").exists());
@@ -709,14 +606,7 @@ mod tests {
             r#match: "home/win/**".into(),
             when: Some("{{ yui.os == 'windows' }}".into()),
         });
-        let report = render_all(
-            &r,
-            &cfg,
-            &yui_vars(&r),
-            &ignore::gitignore::Gitignore::empty(),
-            false,
-        )
-        .unwrap();
+        let report = render_all(&r, &cfg, &yui_vars(&r), false).unwrap();
         assert_eq!(report.skipped_when_false.len(), 1);
         assert!(!r.join("home/win/settings").exists());
     }
@@ -727,14 +617,7 @@ mod tests {
         let r = root(&tmp);
         write(&r.join("home/foo.tera"), "{# yui:when false #}\nbody");
         write(&r.join("home/foo"), "old rendered output");
-        let _ = render_all(
-            &r,
-            &empty_config(),
-            &yui_vars(&r),
-            &ignore::gitignore::Gitignore::empty(),
-            true,
-        )
-        .unwrap();
+        let _ = render_all(&r, &empty_config(), &yui_vars(&r), true).unwrap();
         // Dry-run leaves the on-disk file alone.
         assert_eq!(
             std::fs::read_to_string(r.join("home/foo")).unwrap(),
@@ -749,14 +632,7 @@ mod tests {
         write(&r.join("home/foo.tera"), "body");
         let mut cfg = empty_config();
         cfg.render.manage_gitignore = false;
-        let _ = render_all(
-            &r,
-            &cfg,
-            &yui_vars(&r),
-            &ignore::gitignore::Gitignore::empty(),
-            false,
-        )
-        .unwrap();
+        let _ = render_all(&r, &cfg, &yui_vars(&r), false).unwrap();
         assert!(r.join("home/foo").exists());
         assert!(!r.join(".gitignore").exists());
     }

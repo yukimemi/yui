@@ -196,9 +196,6 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     let source = resolve_source(source)?;
     let yui = YuiVars::detect(&source);
     let config = config::load(&source, &yui)?;
-    // Load `.yuiignore` once and thread through render + walk so the
-    // matcher isn't re-built per-flow.
-    let yuiignore = paths::load_yuiignore(&source)?;
 
     let mut engine = template::Engine::new();
     let tera_ctx = template::template_context(&yui, &config.vars);
@@ -216,7 +213,7 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     )?;
 
     // 1. Render templates first so the link walk picks up rendered files.
-    let render_report = render::render_all(&source, &config, &yui, &yuiignore, dry_run)?;
+    let render_report = render::render_all(&source, &config, &yui, dry_run)?;
     log_render_report(&render_report);
     if render_report.has_drift() {
         anyhow::bail!(
@@ -237,7 +234,6 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     let ctx = ApplyCtx {
         config: &config,
         source: &source,
-        yuiignore: &yuiignore,
         file_mode: resolve_file_mode(config.link.file_mode),
         dir_mode: resolve_dir_mode(config.link.dir_mode),
         backup_root: &backup_root,
@@ -250,10 +246,20 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
         info!("dry-run: nothing will be written");
     }
 
-    for m in &mounts {
-        info!("mount: {} → {}", m.src, m.dst);
-        process_mount(&source, m, &ctx, &mut engine, &tera_ctx)?;
-    }
+    // Nested `.yuiignore` stack — push on dir entry, pop on exit.
+    // Seed with the source-root layer so root-level rules apply from
+    // the start without `walk_and_link` having to special-case it.
+    let mut yuiignore = paths::YuiIgnoreStack::new();
+    yuiignore.push_dir(&source)?;
+    let walk_result = (|| -> Result<()> {
+        for m in &mounts {
+            info!("mount: {} → {}", m.src, m.dst);
+            process_mount(&source, m, &ctx, &mut engine, &tera_ctx, &mut yuiignore)?;
+        }
+        Ok(())
+    })();
+    yuiignore.pop_dir(&source);
+    walk_result?;
 
     // 3. Post-apply hooks (after every link is in place).
     hook::run_phase(
@@ -287,14 +293,15 @@ fn log_render_report(r: &RenderReport) {
 }
 
 /// Bundle of immutable settings threaded through the apply walk.
+///
+/// `.yuiignore` rules are not in here — they need a `&mut` stack
+/// (push on dir entry, pop on dir exit) which doesn't compose with
+/// `ApplyCtx` being shared by `&`. The stack is plumbed through
+/// `walk_and_link` as its own parameter instead.
 struct ApplyCtx<'a> {
     config: &'a Config,
-    /// Source repo root — needed for git-clean checks during absorb and
-    /// for resolving paths inside `is_ignored` against `.yuiignore`.
+    /// Source repo root — needed for git-clean checks during absorb.
     source: &'a Utf8Path,
-    /// Patterns from `$source/.yuiignore`. Empty matcher when the file
-    /// is absent.
-    yuiignore: &'a ignore::gitignore::Gitignore,
     file_mode: EffectiveFileMode,
     dir_mode: EffectiveDirMode,
     backup_root: &'a Utf8Path,
@@ -355,7 +362,6 @@ struct ListItem {
 fn collect_list_items(source: &Utf8Path, config: &Config, yui: &YuiVars) -> Result<Vec<ListItem>> {
     let mut engine = template::Engine::new();
     let tera_ctx = template::template_context(yui, &config.vars);
-    let yuiignore = paths::load_yuiignore(source)?;
     let mut items = Vec::new();
 
     // 1. config.toml [[mount.entry]] entries
@@ -398,10 +404,9 @@ fn collect_list_items(source: &Utf8Path, config: &Config, yui: &YuiVars) -> Resu
             Ok(p) => p,
             Err(_) => continue,
         };
-        // .yuiignore filter — markers inside ignored subtrees are skipped.
-        if paths::is_ignored(&yuiignore, source, &dir_utf8, true) {
-            continue;
-        }
+        // .yuiignore filtering happens in `source_walker` via
+        // `add_custom_ignore_filename` — markers under ignored
+        // subtrees never reach here.
         let spec = match marker::read_spec(&dir_utf8, marker_filename)? {
             Some(s) => s,
             None => continue,
@@ -596,9 +601,8 @@ pub fn render(source: Option<Utf8PathBuf>, check: bool, dry_run: bool) -> Result
     let source = resolve_source(source)?;
     let yui = YuiVars::detect(&source);
     let config = config::load(&source, &yui)?;
-    let yuiignore = paths::load_yuiignore(&source)?;
     // --check is a stricter dry-run: never writes, exits non-zero on drift.
-    let report = render::render_all(&source, &config, &yui, &yuiignore, dry_run || check)?;
+    let report = render::render_all(&source, &config, &yui, dry_run || check)?;
     log_render_report(&report);
     if check && report.has_drift() {
         anyhow::bail!("render drift detected ({} file(s))", report.diverged.len());
@@ -659,14 +663,10 @@ pub fn status(
     let color = !no_color && supports_color_stdout();
 
     let mut report: Vec<StatusItem> = Vec::new();
-    // Load `.yuiignore` once and reuse for both render-drift detection
-    // and the link-drift walk below.
-    let yuiignore = paths::load_yuiignore(&source)?;
 
     // 1. Template drift — render in dry-run mode and surface anything
     //    whose rendered counterpart on disk no longer matches.
-    let render_report =
-        render::render_all(&source, &config, &yui, &yuiignore, /* dry_run */ true)?;
+    let render_report = render::render_all(&source, &config, &yui, /* dry_run */ true)?;
     for rendered in &render_report.diverged {
         // `diverged` holds the rendered path; the template lives at
         // `<rendered>.tera`. Show the .tera as src so it's clear which
@@ -680,24 +680,33 @@ pub fn status(
     }
 
     // 2. Link drift — classify each src→dst pair under every mount.
-    for m in &mounts {
-        let src_root = source.join(&m.src);
-        if !src_root.is_dir() {
-            warn!("mount src missing: {src_root}");
-            continue;
+    // Single nested-`.yuiignore` stack threaded across all mounts.
+    // Seed the source-root layer so root rules apply from the start.
+    let mut yuiignore = paths::YuiIgnoreStack::new();
+    yuiignore.push_dir(&source)?;
+    let walk_result = (|| -> Result<()> {
+        for m in &mounts {
+            let src_root = source.join(&m.src);
+            if !src_root.is_dir() {
+                warn!("mount src missing: {src_root}");
+                continue;
+            }
+            classify_walk(
+                &src_root,
+                &m.dst,
+                &config,
+                m.strategy,
+                &mut engine,
+                &tera_ctx,
+                &source,
+                &mut yuiignore,
+                &mut report,
+            )?;
         }
-        classify_walk(
-            &src_root,
-            &m.dst,
-            &config,
-            m.strategy,
-            &mut engine,
-            &tera_ctx,
-            &source,
-            &yuiignore,
-            &mut report,
-        )?;
-    }
+        Ok(())
+    })();
+    yuiignore.pop_dir(&source);
+    walk_result?;
 
     report.sort_by(|a, b| a.src.cmp(&b.src).then_with(|| a.dst.cmp(&b.dst)));
 
@@ -749,7 +758,7 @@ fn classify_walk(
     engine: &mut template::Engine,
     tera_ctx: &TeraContext,
     source_root: &Utf8Path,
-    yuiignore: &ignore::gitignore::Gitignore,
+    yuiignore: &mut paths::YuiIgnoreStack,
     report: &mut Vec<StatusItem>,
 ) -> Result<()> {
     classify_walk_inner(
@@ -775,14 +784,45 @@ fn classify_walk_inner(
     engine: &mut template::Engine,
     tera_ctx: &TeraContext,
     source_root: &Utf8Path,
-    yuiignore: &ignore::gitignore::Gitignore,
+    yuiignore: &mut paths::YuiIgnoreStack,
     report: &mut Vec<StatusItem>,
     parent_covered: bool,
 ) -> Result<()> {
-    if paths::is_ignored(yuiignore, source_root, src_dir, /* is_dir */ true) {
+    if yuiignore.is_ignored(src_dir, /* is_dir */ true) {
         return Ok(());
     }
+    // Layer this dir's .yuiignore (if any) on top before we recurse;
+    // pop on exit so siblings don't see our subtree's rules.
+    yuiignore.push_dir(src_dir)?;
+    let result = classify_walk_inner_body(
+        src_dir,
+        dst_dir,
+        config,
+        strategy,
+        engine,
+        tera_ctx,
+        source_root,
+        yuiignore,
+        report,
+        parent_covered,
+    );
+    yuiignore.pop_dir(src_dir);
+    result
+}
 
+#[allow(clippy::too_many_arguments)]
+fn classify_walk_inner_body(
+    src_dir: &Utf8Path,
+    dst_dir: &Utf8Path,
+    config: &Config,
+    strategy: MountStrategy,
+    engine: &mut template::Engine,
+    tera_ctx: &TeraContext,
+    source_root: &Utf8Path,
+    yuiignore: &mut paths::YuiIgnoreStack,
+    report: &mut Vec<StatusItem>,
+    parent_covered: bool,
+) -> Result<()> {
     let marker_filename = &config.mount.marker_filename;
     let mut covered = parent_covered;
 
@@ -851,7 +891,7 @@ fn classify_walk_inner(
         let src_path = src_dir.join(name);
         let dst_path = dst_dir.join(name);
         let ft = entry.file_type()?;
-        if paths::is_ignored(yuiignore, source_root, &src_path, ft.is_dir()) {
+        if yuiignore.is_ignored(&src_path, ft.is_dir()) {
             continue;
         }
         if ft.is_dir() {
@@ -1033,18 +1073,9 @@ pub fn absorb(source: Option<Utf8PathBuf>, target: Utf8PathBuf, dry_run: bool) -
 
     let mut engine = template::Engine::new();
     let tera_ctx = template::template_context(&yui, &config.vars);
-    // Single load — the matcher is shared with both find_source_for_target
-    // and the eventual ApplyCtx below.
-    let yuiignore = paths::load_yuiignore(&source)?;
 
-    let src_path = match find_source_for_target(
-        &source,
-        &config,
-        &target,
-        &mut engine,
-        &tera_ctx,
-        &yuiignore,
-    )? {
+    let src_path = match find_source_for_target(&source, &config, &target, &mut engine, &tera_ctx)?
+    {
         Some(s) => s,
         None => anyhow::bail!(
             "no mount entry / .yuilink override claims target {target}; \
@@ -1063,7 +1094,6 @@ pub fn absorb(source: Option<Utf8PathBuf>, target: Utf8PathBuf, dry_run: bool) -
     let ctx = ApplyCtx {
         config: &config,
         source: &source,
-        yuiignore: &yuiignore,
         file_mode: resolve_file_mode(config.link.file_mode),
         dir_mode: resolve_dir_mode(config.link.dir_mode),
         backup_root: &backup_root,
@@ -1084,7 +1114,6 @@ fn find_source_for_target(
     target: &Utf8Path,
     engine: &mut template::Engine,
     tera_ctx: &TeraContext,
-    yuiignore: &ignore::gitignore::Gitignore,
 ) -> Result<Option<Utf8PathBuf>> {
     // 1. Mount entries — render dst, see if target is inside it.
     for entry in &config.mount.entry {
@@ -1099,8 +1128,9 @@ fn find_source_for_target(
             let candidate = source.join(&entry.src).join(rel);
             // Honor `.yuiignore` even on manual absorb — if you've
             // ignored a path, you've explicitly opted out of yui's
-            // managing it.
-            if paths::is_ignored(yuiignore, source, &candidate, candidate.is_dir()) {
+            // managing it. One-shot stack walk along the candidate's
+            // parents picks up nested `.yuiignore` files too.
+            if paths::is_ignored_at(source, &candidate, candidate.is_dir())? {
                 continue;
             }
             return Ok(Some(candidate));
@@ -1109,7 +1139,9 @@ fn find_source_for_target(
 
     // 2. `.yuilink` Override markers — walk source, parse, render each
     //    `[[link]] dst`, see if target is the rendered dst (or nested
-    //    inside a junction'd dir). Skips `.yui/` (backup mirrors etc.).
+    //    inside a junction'd dir). `source_walker` skips `.yui/` and
+    //    honours nested `.yuiignore` files automatically, so markers
+    //    inside ignored subtrees never reach this loop.
     let walker = paths::source_walker(source).build();
     let marker_filename = &config.mount.marker_filename;
     for ent in walker {
@@ -1131,9 +1163,6 @@ fn find_source_for_target(
             Ok(p) => p,
             Err(_) => continue,
         };
-        if paths::is_ignored(yuiignore, source, &dir_utf8, true) {
-            continue;
-        }
         let spec = match marker::read_spec(&dir_utf8, marker_filename)? {
             Some(s) => s,
             None => continue,
@@ -1747,19 +1776,23 @@ pub fn hooks_run(source: Option<Utf8PathBuf>, name: Option<String>, force: bool)
 // internals
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn process_mount(
     source: &Utf8Path,
     m: &ResolvedMount,
     ctx: &ApplyCtx<'_>,
     engine: &mut template::Engine,
     tera_ctx: &TeraContext,
+    yuiignore: &mut paths::YuiIgnoreStack,
 ) -> Result<()> {
     let src_root = source.join(&m.src);
     if !src_root.is_dir() {
         warn!("mount src missing: {src_root}");
         return Ok(());
     }
-    walk_and_link(&src_root, &m.dst, ctx, m.strategy, engine, tera_ctx, false)
+    walk_and_link(
+        &src_root, &m.dst, ctx, m.strategy, engine, tera_ctx, yuiignore, false,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1770,14 +1803,42 @@ fn walk_and_link(
     strategy: MountStrategy,
     engine: &mut template::Engine,
     tera_ctx: &TeraContext,
+    yuiignore: &mut paths::YuiIgnoreStack,
     parent_covered: bool,
 ) -> Result<()> {
     // `.yuiignore` short-circuit — entire subtrees that match are skipped
     // without even reading their marker / iterating their children.
-    if paths::is_ignored(ctx.yuiignore, ctx.source, src_dir, /* is_dir */ true) {
+    if yuiignore.is_ignored(src_dir, /* is_dir */ true) {
         return Ok(());
     }
+    // Layer this dir's `.yuiignore` (if any) on top, run the body, pop
+    // before returning so siblings don't see our subtree's rules.
+    yuiignore.push_dir(src_dir)?;
+    let result = walk_and_link_body(
+        src_dir,
+        dst_dir,
+        ctx,
+        strategy,
+        engine,
+        tera_ctx,
+        yuiignore,
+        parent_covered,
+    );
+    yuiignore.pop_dir(src_dir);
+    result
+}
 
+#[allow(clippy::too_many_arguments)]
+fn walk_and_link_body(
+    src_dir: &Utf8Path,
+    dst_dir: &Utf8Path,
+    ctx: &ApplyCtx<'_>,
+    strategy: MountStrategy,
+    engine: &mut template::Engine,
+    tera_ctx: &TeraContext,
+    yuiignore: &mut paths::YuiIgnoreStack,
+    parent_covered: bool,
+) -> Result<()> {
     let marker_filename = &ctx.config.mount.marker_filename;
     let mut covered = parent_covered;
 
@@ -1853,13 +1914,13 @@ fn walk_and_link(
         let dst_path = dst_dir.join(name);
         let ft = entry.file_type()?;
 
-        if paths::is_ignored(ctx.yuiignore, ctx.source, &src_path, ft.is_dir()) {
+        if yuiignore.is_ignored(&src_path, ft.is_dir()) {
             continue;
         }
 
         if ft.is_dir() {
             walk_and_link(
-                &src_path, &dst_path, ctx, strategy, engine, tera_ctx, covered,
+                &src_path, &dst_path, ctx, strategy, engine, tera_ctx, yuiignore, covered,
             )?;
         } else if ft.is_file() {
             // If an ancestor (or this dir itself) created a dir-level
@@ -3612,6 +3673,75 @@ dst = "{}"
         apply(Some(source.clone()), false).unwrap();
         assert!(target.join("keep.cache").exists());
         assert!(!target.join("drop.cache").exists());
+    }
+
+    /// Issue #47: a `.yuiignore` placed in a nested subdirectory must
+    /// scope its rules to that subtree, just like `.gitignore`.
+    /// `home/inner/.yuiignore` excluding `secret*` should drop
+    /// `home/inner/secret.txt` but leave `home/secret.txt` alone.
+    #[test]
+    fn nested_yuiignore_only_affects_its_subtree() {
+        let tmp = TempDir::new().unwrap();
+        let (source, target) = setup_minimal_dotfiles(&tmp);
+        std::fs::create_dir_all(source.join("home/inner")).unwrap();
+        std::fs::write(source.join("home/secret.txt"), "outer keep").unwrap();
+        std::fs::write(source.join("home/inner/secret.txt"), "inner drop").unwrap();
+        std::fs::write(source.join("home/inner/keep.txt"), "inner keep").unwrap();
+        // Nested ignore — affects only `home/inner/`.
+        std::fs::write(source.join("home/inner/.yuiignore"), "secret*\n").unwrap();
+        apply(Some(source.clone()), false).unwrap();
+        assert!(
+            target.join("secret.txt").exists(),
+            "outer secret.txt is outside the nested .yuiignore scope"
+        );
+        assert!(target.join("inner/keep.txt").exists());
+        assert!(
+            !target.join("inner/secret.txt").exists(),
+            "inner secret.txt should be excluded by the nested .yuiignore"
+        );
+    }
+
+    /// A nested `.yuiignore` can re-include (via `!negation`) a file
+    /// the root ignore had excluded — gitignore's last-rule-wins
+    /// semantics, scoped per-subtree.
+    #[test]
+    fn nested_yuiignore_negation_overrides_root_rule() {
+        let tmp = TempDir::new().unwrap();
+        let (source, target) = setup_minimal_dotfiles(&tmp);
+        std::fs::create_dir_all(source.join("home/keepers")).unwrap();
+        std::fs::write(source.join("home/drop.lock"), "outer drop").unwrap();
+        std::fs::write(source.join("home/keepers/wanted.lock"), "inner keep").unwrap();
+        std::fs::write(source.join(".yuiignore"), "*.lock\n").unwrap();
+        // Re-include `*.lock` only inside keepers/.
+        std::fs::write(source.join("home/keepers/.yuiignore"), "!*.lock\n").unwrap();
+        apply(Some(source.clone()), false).unwrap();
+        assert!(
+            !target.join("drop.lock").exists(),
+            "root rule still drops outer .lock file"
+        );
+        assert!(
+            target.join("keepers/wanted.lock").exists(),
+            "nested negation re-includes .lock under keepers/"
+        );
+    }
+
+    /// `yui status` walk uses the same nested-`.yuiignore` semantics:
+    /// a nested ignore scoped to one subtree must NOT make a sibling
+    /// subtree's identical filename look ignored.
+    #[test]
+    fn nested_yuiignore_status_walk_scoped() {
+        let tmp = TempDir::new().unwrap();
+        let (source, _target) = setup_minimal_dotfiles(&tmp);
+        std::fs::create_dir_all(source.join("home/a")).unwrap();
+        std::fs::create_dir_all(source.join("home/b")).unwrap();
+        std::fs::write(source.join("home/a/foo.txt"), "a-foo").unwrap();
+        std::fs::write(source.join("home/b/foo.txt"), "b-foo").unwrap();
+        // Only `home/a/` ignores foo.txt.
+        std::fs::write(source.join("home/a/.yuiignore"), "foo.txt\n").unwrap();
+        apply(Some(source.clone()), false).unwrap();
+        // status should not error; walk completes despite the nested rule.
+        let res = status(Some(source), None, /* no_color */ true);
+        assert!(res.is_ok() || matches!(&res, Err(e) if format!("{e}").contains("diverged")));
     }
 
     #[test]
