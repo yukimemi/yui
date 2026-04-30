@@ -1047,17 +1047,28 @@ pub fn doctor(
     // gracefully. A missing source is the single most common cause of yui
     // misbehaving, so we want to surface it loudly and skip the dependent
     // probes rather than blowing up.
-    let yui = YuiVars::detect(Utf8Path::new("."));
     let resolved_source = resolve_source(source);
 
-    // Pull `[ui] icons` from the loaded config when we have one — otherwise
-    // fall back to the unicode default. CLI flags still override.
-    let cfg = match &resolved_source {
-        Ok(s) => config::load(s, &yui).ok(),
+    // `YuiVars::detect` reads `yui.source` from the resolved source path
+    // (so `{{ yui.source }}` renders correctly in config templates); when
+    // no source is detected we fall back to `.` so identity probes can
+    // still report os/arch/user/host.
+    let yui = match &resolved_source {
+        Ok(s) => YuiVars::detect(s),
+        Err(_) => YuiVars::detect(Utf8Path::new(".")),
+    };
+
+    // Cache the loaded config — both the icons-override fallback and the
+    // hooks-section probe need it. `cfg_res` keeps the original error
+    // around so the `repo / config` probe can render a meaningful
+    // message instead of just "not loaded".
+    let cfg_res = match &resolved_source {
+        Ok(s) => Some(config::load(s, &yui)),
         Err(_) => None,
     };
+    let cfg = cfg_res.as_ref().and_then(|r| r.as_ref().ok());
     let icons_mode = icons_override
-        .or_else(|| cfg.as_ref().map(|c| c.ui.icons))
+        .or_else(|| cfg.map(|c| c.ui.icons))
         .unwrap_or_default();
     let icons = Icons::for_mode(icons_mode);
     let color = !no_color && supports_color_stdout();
@@ -1076,18 +1087,18 @@ pub fn doctor(
         Ok(s) => {
             have_source = true;
             probes.push(Probe::ok("source", s.to_string()));
-            match config::load(s, &yui) {
-                Ok(cfg) => {
+            match cfg_res.as_ref().expect("cfg_res set when source is Ok") {
+                Ok(c) => {
                     probes.push(Probe::ok(
                         "config",
                         format!(
                             "{} mount{} · {} hook{} · {} render rule{}",
-                            cfg.mount.entry.len(),
-                            plural(cfg.mount.entry.len()),
-                            cfg.hook.len(),
-                            plural(cfg.hook.len()),
-                            cfg.render.rule.len(),
-                            plural(cfg.render.rule.len()),
+                            c.mount.entry.len(),
+                            plural(c.mount.entry.len()),
+                            c.hook.len(),
+                            plural(c.hook.len()),
+                            c.render.rule.len(),
+                            plural(c.render.rule.len()),
                         ),
                     ));
                 }
@@ -1126,32 +1137,30 @@ pub fn doctor(
 
     // ── hooks ─────────────────────────────────────────────────
     if have_source {
-        if let Ok(s) = &resolved_source {
-            if let Ok(cfg) = config::load(s, &yui) {
-                probes.push(Probe::group("hooks"));
-                if cfg.hook.is_empty() {
-                    probes.push(Probe::ok("hooks", "(none configured)"));
-                } else {
-                    let mut missing = 0usize;
-                    for h in &cfg.hook {
-                        if !s.join(&h.script).is_file() {
-                            missing += 1;
-                            probes.push(Probe::error(
-                                format!("hook[{}]", h.name),
-                                format!("script not found at {}", h.script),
-                            ));
-                        }
-                    }
-                    if missing == 0 {
-                        probes.push(Probe::ok(
-                            "scripts",
-                            format!(
-                                "{} hook{} configured, all scripts present",
-                                cfg.hook.len(),
-                                plural(cfg.hook.len())
-                            ),
+        if let (Ok(s), Some(c)) = (&resolved_source, cfg) {
+            probes.push(Probe::group("hooks"));
+            if c.hook.is_empty() {
+                probes.push(Probe::ok("hooks", "(none configured)"));
+            } else {
+                let mut missing = 0usize;
+                for h in &c.hook {
+                    if !s.join(&h.script).is_file() {
+                        missing += 1;
+                        probes.push(Probe::error(
+                            format!("hook[{}]", h.name),
+                            format!("script not found at {}", h.script),
                         ));
                     }
+                }
+                if missing == 0 {
+                    probes.push(Probe::ok(
+                        "scripts",
+                        format!(
+                            "{} hook{} configured, all scripts present",
+                            c.hook.len(),
+                            plural(c.hook.len())
+                        ),
+                    ));
                 }
             }
         }
@@ -1268,41 +1277,47 @@ impl Probe {
             }
             Self::Ok { label, detail } => {
                 let icon = icons.ok;
+                // Pad the raw label first; styling adds invisible ANSI
+                // bytes that `format!("{:<14}")` would count as visible
+                // width and silently break alignment between rows.
+                let padded = format!("{label:<14}");
                 if color {
                     println!(
-                        "    {}  {:<14}  {}",
+                        "    {}  {}  {}",
                         icon.green(),
-                        label.bold(),
+                        padded.bold(),
                         detail.dimmed()
                     );
                 } else {
-                    println!("    {icon}  {label:<14}  {detail}");
+                    println!("    {icon}  {padded}  {detail}");
                 }
             }
             Self::Warn { label, detail } => {
                 let icon = icons.warn;
+                let padded = format!("{label:<14}");
                 if color {
                     println!(
-                        "    {}  {:<14}  {}",
+                        "    {}  {}  {}",
                         icon.yellow(),
-                        label.bold().yellow(),
+                        padded.bold().yellow(),
                         detail
                     );
                 } else {
-                    println!("    {icon}  {label:<14}  {detail}");
+                    println!("    {icon}  {padded}  {detail}");
                 }
             }
             Self::Error { label, detail } => {
                 let icon = icons.error;
+                let padded = format!("{label:<14}");
                 if color {
                     println!(
-                        "    {}  {:<14}  {}",
+                        "    {}  {}  {}",
                         icon.red().bold(),
-                        label.bold().red(),
+                        padded.bold().red(),
                         detail.red()
                     );
                 } else {
-                    println!("    {icon}  {label:<14}  {detail}");
+                    println!("    {icon}  {padded}  {detail}");
                 }
             }
         }
