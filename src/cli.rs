@@ -115,11 +115,30 @@ pub enum Command {
         no_color: bool,
     },
 
-    /// Garbage-collect old backups
+    /// Garbage-collect old backups under `$DOTFILES/.yui/backup/`.
+    ///
+    /// With no `--older-than`, prints every parsed backup with its
+    /// age + size and exits without deleting (a survey).
+    /// With `--older-than DUR`, deletes entries whose timestamp
+    /// suffix is older than DUR. Backups whose name doesn't match
+    /// yui's `<stem>_<YYYYMMDD_HHMMSSfff>[.<ext>]` shape are left
+    /// alone — anything you dropped into `.yui/backup/` by hand
+    /// stays there.
     GcBackup {
-        /// e.g. "30d", "6m"
-        #[arg(long)]
+        /// Age threshold; e.g. `30d`, `2w`, `12h`, `6mo`, `1y`.
+        /// Omit to run a non-destructive survey instead.
+        #[arg(long, value_name = "DUR")]
         older_than: Option<String>,
+        /// Preview the deletion (no files removed). Only meaningful
+        /// when `--older-than` is also given.
+        #[arg(long)]
+        dry_run: bool,
+        /// Override [ui] icons mode for this invocation
+        #[arg(long, value_name = "MODE")]
+        icons: Option<IconsMode>,
+        /// Disable color output (also respected via NO_COLOR env)
+        #[arg(long)]
+        no_color: bool,
     },
 
     /// Manage `[[hook]]` scripts
@@ -170,7 +189,12 @@ impl Cli {
             } => cmd::list(source, all, icons, no_color),
             Command::Absorb { target, dry_run } => cmd::absorb(source, target, dry_run),
             Command::Doctor { icons, no_color } => cmd::doctor(source, icons, no_color),
-            Command::GcBackup { older_than } => cmd::gc_backup(source, older_than),
+            Command::GcBackup {
+                older_than,
+                dry_run,
+                icons,
+                no_color,
+            } => cmd::gc_backup(source, older_than, dry_run, icons, no_color),
             Command::Hooks { action } => match action {
                 HookAction::List { icons, no_color } => cmd::hooks_list(source, icons, no_color),
                 HookAction::Run { name, force } => cmd::hooks_run(source, name, force),
