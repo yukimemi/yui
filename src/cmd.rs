@@ -1546,7 +1546,7 @@ pub fn gc_backup(
         return Ok(());
     }
     // Oldest first — that's the natural "what should I prune?" order.
-    entries.sort_by(|a, b| a.ts.cmp(&b.ts));
+    entries.sort_by_key(|e| e.ts);
     let now = jiff::Zoned::now();
 
     match older_than {
@@ -1662,16 +1662,18 @@ fn walk_gc_backups_rec(dir: &Utf8Path, out: &mut Vec<BackupEntry>) -> Result<()>
             } else {
                 walk_gc_backups_rec(&path, out)?;
             }
-        } else if ft.is_file()
-            && let Some(ts) = parse_backup_suffix(name)
-        {
-            let size = entry.metadata()?.len();
-            out.push(BackupEntry {
-                path,
-                ts,
-                kind: BackupKind::File,
-                size_bytes: size,
-            });
+        } else if ft.is_file() {
+            // Nested ifs (not let-chains) so the crate's MSRV
+            // (rust-version = "1.85") stays buildable.
+            if let Some(ts) = parse_backup_suffix(name) {
+                let size = entry.metadata()?.len();
+                out.push(BackupEntry {
+                    path,
+                    ts,
+                    kind: BackupKind::File,
+                    size_bytes: size,
+                });
+            }
         }
     }
     Ok(())
@@ -1724,10 +1726,12 @@ fn parse_backup_suffix(name: &str) -> Option<jiff::civil::DateTime> {
     if let Some(ts) = parse_ts_at_end(name) {
         return Some(ts);
     }
-    if let Some((before, _ext)) = name.rsplit_once('.')
-        && let Some(ts) = parse_ts_at_end(before)
-    {
-        return Some(ts);
+    // Nested ifs (not let-chains) so the crate's MSRV
+    // (rust-version = "1.85") stays buildable.
+    if let Some((before, _ext)) = name.rsplit_once('.') {
+        if let Some(ts) = parse_ts_at_end(before) {
+            return Some(ts);
+        }
     }
     None
 }
@@ -1767,9 +1771,14 @@ fn parse_ts(s: &str) -> Option<jiff::civil::DateTime> {
     jiff::civil::DateTime::new(year, month, day, hour, minute, second, ms * 1_000_000).ok()
 }
 
-/// Parse a duration string in the shorthand the issue spec calls
-/// out: `30d`, `2w`, `12h`, `6m` / `6mo` (months), `1y`. Whitespace
-/// around the number is tolerated; the unit is case-insensitive.
+/// Parse a duration string in the shorthand `30d`, `2w`, `12h`,
+/// `6mo` (months), `1y`, `5m` (minutes). Whitespace around the
+/// number is tolerated; the unit is case-insensitive.
+///
+/// `m` means **minutes**, `mo` means **months** — bare `m` matches
+/// what `format_age` prints in the survey table, so a backup
+/// shown as "5m" is pruneable as `--older-than 5m`. Months take
+/// the explicit `mo` form. (Caught in PR #51 review.)
 fn parse_human_duration(s: &str) -> Result<jiff::Span> {
     let s = s.trim();
     let split = s
@@ -1786,12 +1795,16 @@ fn parse_human_duration(s: &str) -> Result<jiff::Span> {
     let unit = s[split..].to_ascii_lowercase();
     let span = match unit.as_str() {
         "y" | "yr" | "year" | "years" => jiff::Span::new().years(n),
-        "mo" | "m" | "month" | "months" => jiff::Span::new().months(n),
+        "mo" | "month" | "months" => jiff::Span::new().months(n),
         "w" | "wk" | "week" | "weeks" => jiff::Span::new().weeks(n),
         "d" | "day" | "days" => jiff::Span::new().days(n),
         "h" | "hr" | "hour" | "hours" => jiff::Span::new().hours(n),
+        "m" | "min" | "minute" | "minutes" => jiff::Span::new().minutes(n),
         other => {
-            anyhow::bail!("invalid duration {s:?}: unknown unit {other:?} (use y / m / w / d / h)")
+            anyhow::bail!(
+                "invalid duration {s:?}: unknown unit {other:?} \
+                 (use y / mo / w / d / h / m)"
+            )
         }
     };
     Ok(span)
@@ -1851,7 +1864,7 @@ fn print_gc_table(
     _icons: Icons,
     color: bool,
 ) {
-    use owo_colors::OwoColorize;
+    use owo_colors::OwoColorize as _;
 
     let rows: Vec<(String, String, String)> = entries
         .iter()
@@ -4393,8 +4406,9 @@ dst = "{}"
         assert_eq!(s.get_weeks(), 2);
         let s = parse_human_duration("12h").unwrap();
         assert_eq!(s.get_hours(), 12);
-        let s = parse_human_duration("6m").unwrap();
-        assert_eq!(s.get_months(), 6);
+        // `m` is minutes (matches what `format_age` prints), `mo` is months.
+        let s = parse_human_duration("5m").unwrap();
+        assert_eq!(s.get_minutes(), 5);
         let s = parse_human_duration("6mo").unwrap();
         assert_eq!(s.get_months(), 6);
         let s = parse_human_duration("1y").unwrap();
