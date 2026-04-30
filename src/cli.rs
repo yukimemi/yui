@@ -106,7 +106,14 @@ pub enum Command {
     },
 
     /// Diagnose environment (symlink capability, source detection, etc)
-    Doctor,
+    Doctor {
+        /// Override [ui] icons mode for this invocation
+        #[arg(long, value_name = "MODE")]
+        icons: Option<IconsMode>,
+        /// Disable color output (also respected via NO_COLOR env)
+        #[arg(long)]
+        no_color: bool,
+    },
 
     /// Garbage-collect old backups
     GcBackup {
@@ -162,7 +169,7 @@ impl Cli {
                 no_color,
             } => cmd::list(source, all, icons, no_color),
             Command::Absorb { target, dry_run } => cmd::absorb(source, target, dry_run),
-            Command::Doctor => cmd::doctor(source),
+            Command::Doctor { icons, no_color } => cmd::doctor(source, icons, no_color),
             Command::GcBackup { older_than } => cmd::gc_backup(source, older_than),
             Command::Hooks { action } => match action {
                 HookAction::List { icons, no_color } => cmd::hooks_list(source, icons, no_color),
