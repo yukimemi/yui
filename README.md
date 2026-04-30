@@ -213,9 +213,11 @@ build/
 !build/result.toml
 ```
 
-Currently only the repo-root `.yuiignore` is honored — nested
-`.yuiignore` files inside subdirectories are not yet walked, so put
-all your rules at the top.
+Nested `.yuiignore` files inside subdirectories are honored too, with
+the same rule-scoping semantics as `.gitignore`: deeper layers override
+shallower ones, `!negation` re-includes paths, and rules apply only to
+the subtree below the file. Put repo-wide rules at `$DOTFILES/.yuiignore`
+and per-tree rules where they belong.
 
 ## Hooks — run scripts around `apply`
 
