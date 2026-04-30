@@ -314,7 +314,10 @@ pub fn load(source: &Utf8Path, yui: &YuiVars) -> Result<Config> {
         // the iteration budget — that catches genuine cycles).
         resolve_vars_refs(&mut vars_acc, yui, &mut engine)?;
 
-        let ctx = template::template_context(yui, &vars_acc);
+        // Use the config-flavoured context so hook-level placeholders
+        // (`{{ script_path }}` etc.) survive this pass intact. Dotfile
+        // rendering keeps the bare `template_context`.
+        let ctx = template::config_render_context(yui, &vars_acc);
         let rendered = engine.render(&raw, &ctx)?;
         let parsed: toml::Table =
             toml::from_str(&rendered).map_err(|e| Error::Config(format!("parse {file}: {e}")))?;
@@ -414,7 +417,11 @@ fn resolve_vars_refs(
     engine: &mut template::Engine,
 ) -> Result<()> {
     for _ in 0..MAX_VARS_RESOLVE_ITERATIONS {
-        let ctx = template::template_context(yui, vars);
+        // `config_render_context` for parity with the main config
+        // render pass — a vars value that happens to include
+        // `{{ script_path }}` should pass through here for the same
+        // reason it does at the file level.
+        let ctx = template::config_render_context(yui, vars);
         let mut changed = false;
         render_strings_in_table(vars, engine, &ctx, &mut changed)?;
         if !changed {
@@ -802,5 +809,40 @@ dst = "/anywhere"
         // section actually references them.
         let cfg = load(&r, &yui_vars(&r)).unwrap();
         assert_eq!(cfg.mount.entry[0].dst, "/anywhere");
+    }
+
+    /// Hook-level Tera tokens (`{{ script_path }}` etc.) must survive
+    /// the config-load render verbatim — otherwise every author would
+    /// have to wrap them in `{% raw %}{% endraw %}`. The placeholders
+    /// are seeded as self-references in `template_context` so Tera
+    /// just emits them back; the hook executor's
+    /// `build_hook_context` overrides them with real paths at run
+    /// time.
+    #[test]
+    fn hook_script_vars_survive_config_load_render_verbatim() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp,
+            "config.toml",
+            r#"
+[[mount.entry]]
+src = "home"
+dst = "/home/u"
+
+[[hook]]
+name = "deno-build"
+script = ".yui/bin/build.ts"
+command = "deno"
+args = ["run", "-A", "{{ script_path }}"]
+when_run = "onchange"
+"#,
+        );
+        let r = root(&tmp);
+        let cfg = load(&r, &yui_vars(&r)).unwrap();
+        assert_eq!(cfg.hook.len(), 1);
+        // The args literal made it through config-load untouched —
+        // the third arg is `{{ script_path }}`, ready for the hook
+        // executor to render with the real path.
+        assert_eq!(cfg.hook[0].args, vec!["run", "-A", "{{ script_path }}"]);
     }
 }
