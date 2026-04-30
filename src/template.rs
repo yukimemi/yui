@@ -79,17 +79,25 @@ pub fn template_context<V: Serialize>(yui: &YuiVars, vars: &V) -> Context {
     let mut ctx = Context::new();
     ctx.insert("yui", yui);
     ctx.insert("vars", vars);
-    // Hook-level placeholders that the *real* hook context fills in
-    // at execute time. Seeding them as self-referencing strings
-    // here means a `[[hook]] args = ["{{ script_path }}"]` survives
-    // the config-load Tera pass intact instead of erroring on
-    // "Variable `script_path` not found in context" — Tera looks
-    // them up, gets the literal `{{ script_path }}` back, and
-    // emits it verbatim. The hook executor then re-renders with
-    // the real path via `build_hook_context`, which `Context::insert`
-    // overrides cleanly. Without this, every reference would have
-    // to be wrapped in `{% raw %}{% endraw %}`, which is ugly UX
-    // for the very tokens hook authors reach for first.
+    ctx
+}
+
+/// `template_context` plus self-referencing placeholders for the
+/// hook script vars (`script_path` / `script_dir` / `script_name` /
+/// `script_stem` / `script_ext`). Use this *only* for the
+/// config-load Tera pass, where those tokens haven't been bound
+/// yet but should survive verbatim so the hook executor can
+/// resolve them at run time.
+///
+/// Why a separate builder rather than seeding the placeholders in
+/// `template_context` itself: dotfile (`*.tera`) rendering uses
+/// `template_context` too, and a typo'd `{{ script_path }}` in a
+/// dotfile should surface as "Variable not found in context"
+/// rather than silently rendering to the literal `{{ script_path }}`.
+/// Keeping the placeholders carve-out config-only preserves that
+/// loud failure for dotfiles.
+pub fn config_render_context<V: Serialize>(yui: &YuiVars, vars: &V) -> Context {
+    let mut ctx = template_context(yui, vars);
     for placeholder in [
         "script_path",
         "script_dir",
@@ -178,5 +186,34 @@ mod tests {
         assert_eq!(out, "hi u");
         // ensure the camino import isn't unused
         let _: &Utf8Path = Utf8Path::new(".");
+    }
+
+    /// Bare `template_context` (used by dotfile / status / list /
+    /// apply rendering) deliberately does NOT seed the hook
+    /// `script_*` placeholders — a typo'd `{{ script_path }}` in a
+    /// `*.tera` dotfile must error loudly so the user catches the
+    /// mistake instead of silently emitting a literal `{{ script_path }}`
+    /// into the rendered output.
+    #[test]
+    fn dotfile_render_errors_on_undefined_script_path() {
+        let mut e = Engine::new();
+        let user_vars = toml::Table::new();
+        let ctx = template_context(&vars(), &user_vars);
+        let err = e
+            .render("hello {{ script_path }}", &ctx)
+            .expect_err("dotfile render must reject undefined script_path");
+        assert!(format!("{err}").contains("script_path"), "{err}");
+    }
+
+    /// `config_render_context`, on the other hand, is used by the
+    /// config-load pass and seeds `script_*` as self-references so
+    /// `[[hook]] args = ["{{ script_path }}"]` survives Tera intact.
+    #[test]
+    fn config_render_context_preserves_script_path_placeholder() {
+        let mut e = Engine::new();
+        let user_vars = toml::Table::new();
+        let ctx = config_render_context(&vars(), &user_vars);
+        let out = e.render("hello {{ script_path }}", &ctx).unwrap();
+        assert_eq!(out, "hello {{ script_path }}");
     }
 }

@@ -314,7 +314,10 @@ pub fn load(source: &Utf8Path, yui: &YuiVars) -> Result<Config> {
         // the iteration budget — that catches genuine cycles).
         resolve_vars_refs(&mut vars_acc, yui, &mut engine)?;
 
-        let ctx = template::template_context(yui, &vars_acc);
+        // Use the config-flavoured context so hook-level placeholders
+        // (`{{ script_path }}` etc.) survive this pass intact. Dotfile
+        // rendering keeps the bare `template_context`.
+        let ctx = template::config_render_context(yui, &vars_acc);
         let rendered = engine.render(&raw, &ctx)?;
         let parsed: toml::Table =
             toml::from_str(&rendered).map_err(|e| Error::Config(format!("parse {file}: {e}")))?;
@@ -414,7 +417,11 @@ fn resolve_vars_refs(
     engine: &mut template::Engine,
 ) -> Result<()> {
     for _ in 0..MAX_VARS_RESOLVE_ITERATIONS {
-        let ctx = template::template_context(yui, vars);
+        // `config_render_context` for parity with the main config
+        // render pass — a vars value that happens to include
+        // `{{ script_path }}` should pass through here for the same
+        // reason it does at the file level.
+        let ctx = template::config_render_context(yui, vars);
         let mut changed = false;
         render_strings_in_table(vars, engine, &ctx, &mut changed)?;
         if !changed {
