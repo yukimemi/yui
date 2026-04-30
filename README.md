@@ -311,7 +311,7 @@ Need to absorb a single file regardless of policy? `yui absorb
 | `yui absorb <target> [--dry-run]` | manually pull a single target into source |
 | `yui unlink <path>...` | tear down a specific link |
 | `yui doctor` | environment sanity check |
-| `yui gc-backup [--older-than DUR]` | clean old backups (stub today — see [#46]) |
+| `yui gc-backup [--older-than DUR] [--dry-run]` | survey or prune `.yui/backup/` snapshots by suffix age |
 | `yui hooks list` | show configured `[[hook]]` entries + last-run state |
 | `yui hooks run [<name>] [--force]` | run hooks on demand (bypassing `when_run` with `--force`) |
 
@@ -325,11 +325,7 @@ Used in production for the author's own ~/dotfiles. Known gaps:
 
 - no built-in encryption (use `pass` / `1password-cli` from a Tera
   template instead)
-- `yui gc-backup` panics on call today (`todo!()`, tracked in [#46])
-  — prune `.yui/backup/` by hand for now
 
 ## License
 
 MIT
-
-[#46]: https://github.com/yukimemi/yui/issues/46
