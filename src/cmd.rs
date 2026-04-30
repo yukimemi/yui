@@ -27,7 +27,7 @@ use crate::{absorb, backup, paths};
 // `OwoColorize::hidden(&self)`). Each print function imports the trait
 // locally with `use owo_colors::OwoColorize as _;`.
 
-pub fn init(source: Option<Utf8PathBuf>, _git_hooks: bool) -> Result<()> {
+pub fn init(source: Option<Utf8PathBuf>, git_hooks: bool) -> Result<()> {
     let dir = match source {
         Some(s) => absolutize(&s)?,
         None => current_dir_utf8()?,
@@ -44,9 +44,81 @@ pub fn init(source: Option<Utf8PathBuf>, _git_hooks: bool) -> Result<()> {
     }
     info!("initialized yui source repo at {dir}");
     info!("created: {config_path}");
+    if git_hooks {
+        install_git_hooks(&dir)?;
+    }
     info!("next: edit config.toml, then run `yui apply`");
     Ok(())
 }
+
+/// Install yui's render-drift hooks into the source repo's
+/// `.git/hooks/`. Both pre-commit and pre-push run `yui render --check`
+/// — pre-commit catches the easy case (you forgot to `apply` before
+/// committing), pre-push is the safety net that catches anything a
+/// bypassed pre-commit (or a `git commit --no-verify`) let slip
+/// through.
+///
+/// Honors `git rev-parse --git-dir` so it works in worktrees as well
+/// as plain repos. Refuses to overwrite existing hooks — the user has
+/// to delete them first if they want yui to manage that slot.
+fn install_git_hooks(source: &Utf8Path) -> Result<()> {
+    // Resolve `.git` (or wherever the actual git dir lives in a
+    // worktree) by asking git directly. Hand-coding `source/.git` would
+    // miss worktrees + bare-repo + GIT_DIR env-override scenarios.
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(source.as_std_path())
+        .output()
+        .with_context(|| format!("git rev-parse --git-dir in {source}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "--git-hooks: {source} doesn't look like a git repo \
+             (run `git init` first). git: {}",
+            stderr.trim()
+        );
+    }
+    let raw = String::from_utf8(out.stdout)?;
+    let git_dir = {
+        let p = Utf8PathBuf::from(raw.trim());
+        if p.is_absolute() { p } else { source.join(p) }
+    };
+    let hooks_dir = git_dir.join("hooks");
+    std::fs::create_dir_all(&hooks_dir).with_context(|| format!("mkdir -p {hooks_dir}"))?;
+
+    for (name, body) in [("pre-commit", PRE_COMMIT_HOOK), ("pre-push", PRE_PUSH_HOOK)] {
+        let path = hooks_dir.join(name);
+        if path.exists() {
+            warn!("--git-hooks: {path} already exists — leaving it alone");
+            continue;
+        }
+        std::fs::write(&path, body).with_context(|| format!("write hook {path}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms)?;
+        }
+        info!("installed: {path}");
+    }
+    Ok(())
+}
+
+const PRE_COMMIT_HOOK: &str = r#"#!/bin/sh
+# Installed by `yui init --git-hooks`.
+# Reject the commit if any `*.tera` template would render to something
+# that diverges from the rendered output staged alongside it. Run
+# `yui apply` (or `yui render`) to refresh and re-commit.
+exec yui render --check
+"#;
+
+const PRE_PUSH_HOOK: &str = r#"#!/bin/sh
+# Installed by `yui init --git-hooks`.
+# Same render-drift check as pre-commit, mirrored on push so a
+# `--no-verify` commit doesn't sneak diverged state to the remote.
+exec yui render --check
+"#;
 
 pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     let source = resolve_source(source)?;
@@ -2720,6 +2792,90 @@ dst = "{}"
         std::fs::write(dir.join("config.toml"), "preexisting").unwrap();
         let err = init(Some(dir), false).unwrap_err();
         assert!(format!("{err}").contains("already exists"));
+    }
+
+    /// `init --git-hooks` writes pre-commit / pre-push that run the
+    /// render-drift check against `.git/hooks/`. We need a real git
+    /// repo for `git rev-parse --git-dir` to point at, so prepare one
+    /// before calling init.
+    #[test]
+    fn init_with_git_hooks_writes_pre_commit_and_pre_push() {
+        let tmp = TempDir::new().unwrap();
+        let dir = utf8(tmp.path().join("dotfiles"));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Bootstrap a git repo at `dir`.
+        let st = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.as_std_path())
+            .status()
+            .expect("git init");
+        if !st.success() {
+            // Skip if git isn't on PATH on this CI runner.
+            eprintln!("skipping: git not available");
+            return;
+        }
+        init(Some(dir.clone()), /* git_hooks */ true).unwrap();
+
+        let pre_commit = dir.join(".git/hooks/pre-commit");
+        let pre_push = dir.join(".git/hooks/pre-push");
+        assert!(pre_commit.is_file(), "pre-commit hook should be written");
+        assert!(pre_push.is_file(), "pre-push hook should be written");
+
+        let body = std::fs::read_to_string(&pre_commit).unwrap();
+        assert!(
+            body.contains("yui render --check"),
+            "pre-commit hook should call `yui render --check`, got: {body}"
+        );
+    }
+
+    /// `init --git-hooks` against a non-git directory must fail with a
+    /// clear message instead of silently doing nothing — the user
+    /// asked for hooks and we couldn't deliver.
+    #[test]
+    fn init_with_git_hooks_errors_outside_a_git_repo() {
+        let tmp = TempDir::new().unwrap();
+        let dir = utf8(tmp.path().join("not-a-repo"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = init(Some(dir), /* git_hooks */ true).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("git repo") || msg.contains("git rev-parse"),
+            "expected error to mention the git issue, got: {msg}"
+        );
+    }
+
+    /// Pre-existing hooks are not silently overwritten — yui leaves
+    /// the user's prior file alone (warns) and writes the missing one.
+    #[test]
+    fn init_with_git_hooks_does_not_clobber_existing_hooks() {
+        let tmp = TempDir::new().unwrap();
+        let dir = utf8(tmp.path().join("dotfiles"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.as_std_path())
+            .status()
+            .expect("git init");
+        if !st.success() {
+            return;
+        }
+        let hooks = dir.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("pre-commit"), "#! /bin/sh\nexit 0\n").unwrap();
+
+        init(Some(dir.clone()), true).unwrap();
+
+        // Existing pre-commit untouched, pre-push freshly written.
+        let pc = std::fs::read_to_string(hooks.join("pre-commit")).unwrap();
+        assert!(
+            !pc.contains("yui render --check"),
+            "existing pre-commit must not be overwritten"
+        );
+        let pp = std::fs::read_to_string(hooks.join("pre-push")).unwrap();
+        assert!(
+            pp.contains("yui render --check"),
+            "missing pre-push should be written: {pp}"
+        );
     }
 
     /// Build a minimal `apply`-able dotfiles tree for absorb tests.

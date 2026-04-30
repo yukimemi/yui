@@ -309,7 +309,7 @@ Need to absorb a single file regardless of policy? `yui absorb
 | `yui absorb <target> [--dry-run]` | manually pull a single target into source |
 | `yui unlink <path>...` | tear down a specific link |
 | `yui doctor` | environment sanity check |
-| `yui gc-backup [--older-than DUR]` | clean old backups (**not yet implemented** — calling it errors out) |
+| `yui gc-backup [--older-than DUR]` | clean old backups (stub today — see [#46]) |
 | `yui hooks list` | show configured `[[hook]]` entries + last-run state |
 | `yui hooks run [<name>] [--force]` | run hooks on demand (bypassing `when_run` with `--force`) |
 
@@ -319,20 +319,15 @@ globally.
 
 ## Status
 
-`v0.4.0` ships the absorb story end-to-end — chezmoi-replacement
-ready for simple repos. Known gaps:
+Used in production for the author's own ~/dotfiles. Known gaps:
 
 - no built-in encryption (use `pass` / `1password-cli` from a Tera
   template instead)
-- chezmoi name-prefix translation (`dot_zshrc` → `.zshrc`,
-  `run_once_*.sh.tmpl`) is **not** implemented — bring-your-own
-  rename when migrating
-
-Migration from chezmoi: rename files (`dot_X` → `.X`), convert
-`*.tmpl` → `*.tera` (Go template → Tera syntax), and pull the
-`run_*` scripts into a separate runner you trigger yourself. yui has
-no opinion on what runs them.
+- `yui gc-backup` is a stub today (tracked in [#46]) — prune
+  `.yui/backup/` by hand for now
 
 ## License
 
 MIT
+
+[#46]: https://github.com/yukimemi/yui/issues/46
