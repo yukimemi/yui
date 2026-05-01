@@ -679,23 +679,24 @@ pub fn unmanaged(
     let source = resolve_source(source)?;
     let yui = YuiVars::detect(&source);
     let config = config::load(&source, &yui)?;
-    let mut engine = template::Engine::new();
-    let tera_ctx = template::template_context(&yui, &config.vars);
-    let mounts = mount::resolve(
-        &config.mount.entry,
-        config.mount.default_strategy,
-        &mut engine,
-        &tera_ctx,
-    )?;
 
     let _icons = Icons::for_mode(icons_override.unwrap_or(config.ui.icons));
     let color = !no_color && supports_color_stdout();
 
     // Resolve every mount.src to an absolute path under source so a
     // simple `path.starts_with(&mount_src)` test can answer
-    // "claimed?". Includes inactive mounts too — a `when=false`
-    // mount on this host still owns the files on principle.
-    let mount_srcs: Vec<Utf8PathBuf> = mounts.iter().map(|m| source.join(&m.src)).collect();
+    // "claimed?". We use the *raw* config entries instead of
+    // `mount::resolve` because the latter filters by `when` —
+    // inactive mounts (e.g. an OS-specific mount for a different
+    // platform) still own their files on principle, and surfacing
+    // them as "unmanaged" would just be confusing. (Caught in
+    // PR #53 review.)
+    let mount_srcs: Vec<Utf8PathBuf> = config
+        .mount
+        .entry
+        .iter()
+        .map(|e| source.join(&e.src))
+        .collect();
 
     let mut items: Vec<Utf8PathBuf> = Vec::new();
     let walker = paths::source_walker(&source).build();
@@ -739,23 +740,37 @@ pub fn unmanaged(
 /// True for the dotfiles repo's own scaffold files — anything yui
 /// itself reads or writes during its own operation. Surfacing
 /// these in `yui unmanaged` would just bury the actual orphans.
+///
+/// Files keyed strictly by basename anywhere in the tree:
+///   - `.yuilink` (mount marker)
+///   - `.yuiignore` (yui's gitignore-style filter)
+///   - `*.tera` (template sources)
+///
+/// Files keyed at the repo root only:
+///   - `.gitignore` (yui manages the rendered-files section there;
+///     a nested `home/.config/foo/.gitignore` is a user dotfile)
+///   - `config.toml` / `config.local.toml` / `config.*.toml` /
+///     `config.*.example.toml` (yui's own config layering;
+///     a nested `home/.config/myapp/config.toml` is a user dotfile)
 fn is_repo_meta(path: &Utf8Path, source: &Utf8Path, marker_filename: &str) -> bool {
     let Some(name) = path.file_name() else {
         return false;
     };
     if name.ends_with(".tera") {
-        return true; // template sources are by definition managed
-    }
-    if name == marker_filename || name == ".yuiignore" || name == ".gitignore" {
         return true;
     }
-    // Repo-root config files only — `home/.config/foo/config.toml`
-    // could be a real unmanaged file the user just hasn't mounted.
+    if name == marker_filename || name == ".yuiignore" {
+        return true;
+    }
     let parent = path.parent().unwrap_or(Utf8Path::new(""));
-    if parent == source && (name == "config.toml" || name == "config.local.toml") {
+    let at_root = parent == source;
+    if at_root && name == ".gitignore" {
         return true;
     }
-    if parent == source
+    if at_root && (name == "config.toml" || name == "config.local.toml") {
+        return true;
+    }
+    if at_root
         && name.starts_with("config.")
         && (name.ends_with(".toml") || name.ends_with(".example.toml"))
     {
@@ -854,7 +869,15 @@ pub fn diff(
         if !diff_worth_printing(&item.state) {
             continue;
         }
-        print_unified_diff(&item.src, &item.dst, &item.state, color);
+        print_unified_diff(
+            &item.src,
+            &item.dst,
+            &item.state,
+            &source,
+            &config,
+            &yui,
+            color,
+        );
         printed += 1;
     }
 
@@ -881,7 +904,22 @@ fn diff_worth_printing(state: &StatusState) -> bool {
     }
 }
 
-fn print_unified_diff(src: &Utf8Path, dst: &Utf8Path, state: &StatusState, color: bool) {
+/// `src` is the .tera path for `RenderDrift` rows and the source
+/// file/dir for `Link(_)` rows. For RenderDrift we render the
+/// template to a string and diff that against the on-disk
+/// rendered file — diffing the raw .tera against the rendered
+/// output would surface Tera's `{{ }}` syntax as drift instead
+/// of the actual content delta. (Caught in PR #53 review by
+/// gemini-code-assist.)
+fn print_unified_diff(
+    src: &Utf8Path,
+    dst: &Utf8Path,
+    state: &StatusState,
+    source_root: &Utf8Path,
+    config: &Config,
+    yui: &YuiVars,
+    color: bool,
+) {
     use owo_colors::OwoColorize as _;
 
     let header = match state {
@@ -900,8 +938,43 @@ fn print_unified_diff(src: &Utf8Path, dst: &Utf8Path, state: &StatusState, color
         return;
     }
 
-    let src_content = std::fs::read_to_string(src).unwrap_or_default();
-    let dst_content = std::fs::read_to_string(dst).unwrap_or_default();
+    // Source side of the diff:
+    //   - RenderDrift → re-render the .tera in memory (otherwise
+    //     we'd surface raw Tera syntax as drift).
+    //   - Link(_)     → read the source file from disk.
+    let src_content = match state {
+        StatusState::RenderDrift => match render::render_to_string(src, source_root, config, yui) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                println!(
+                    "(template would be skipped on this host — drift will resolve on next render)"
+                );
+                println!();
+                return;
+            }
+            Err(e) => {
+                println!("(error rendering template: {e})");
+                println!();
+                return;
+            }
+        },
+        _ => match read_text_for_diff(src) {
+            DiffSide::Text(s) => s,
+            DiffSide::Binary => {
+                println!("(binary file or non-UTF-8 content — diff skipped)");
+                println!();
+                return;
+            }
+        },
+    };
+    let dst_content = match read_text_for_diff(dst) {
+        DiffSide::Text(s) => s,
+        DiffSide::Binary => {
+            println!("(binary file or non-UTF-8 content — diff skipped)");
+            println!();
+            return;
+        }
+    };
     let diff = similar::TextDiff::from_lines(&src_content, &dst_content);
     for change in diff.iter_all_changes() {
         match change.tag() {
@@ -925,6 +998,24 @@ fn print_unified_diff(src: &Utf8Path, dst: &Utf8Path, state: &StatusState, color
         }
     }
     println!();
+}
+
+/// One side of a textual diff. `Binary` means the bytes weren't
+/// valid UTF-8 (likely a binary file); the diff renderer surfaces
+/// a one-liner instead of dumping bytes through `similar`.
+/// Missing-file / permission errors collapse to `Text("")` so a
+/// race during the walk doesn't bail the whole flow.
+enum DiffSide {
+    Text(String),
+    Binary,
+}
+
+fn read_text_for_diff(p: &Utf8Path) -> DiffSide {
+    match std::fs::read_to_string(p) {
+        Ok(s) => DiffSide::Text(s),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => DiffSide::Binary,
+        Err(_) => DiffSide::Text(String::new()),
+    }
 }
 
 /// Show every src→dst pair's drift state against the current host.
@@ -1437,7 +1528,7 @@ pub fn absorb(
 /// Stderr-print a unified diff between `src` (file or dir) and `dst`
 /// using `similar`. Falls back to a one-line description when one
 /// side is a directory or content isn't valid UTF-8 — we'd rather
-/// say "binary file differs" than spew bytes.
+/// say "binary file differs" than spew bytes through `similar`.
 fn print_absorb_diff(src: &Utf8Path, dst: &Utf8Path) {
     eprintln!();
     eprintln!("--- diff (- source, + target) ---");
@@ -1449,8 +1540,22 @@ fn print_absorb_diff(src: &Utf8Path, dst: &Utf8Path) {
         eprintln!();
         return;
     }
-    let src_content = std::fs::read_to_string(src).unwrap_or_default();
-    let dst_content = std::fs::read_to_string(dst).unwrap_or_default();
+    let src_content = match read_text_for_diff(src) {
+        DiffSide::Text(s) => s,
+        DiffSide::Binary => {
+            eprintln!("(binary file or non-UTF-8 content — diff skipped)");
+            eprintln!();
+            return;
+        }
+    };
+    let dst_content = match read_text_for_diff(dst) {
+        DiffSide::Text(s) => s,
+        DiffSide::Binary => {
+            eprintln!("(binary file or non-UTF-8 content — diff skipped)");
+            eprintln!();
+            return;
+        }
+    };
     let diff = similar::TextDiff::from_lines(&src_content, &dst_content);
     for change in diff.iter_all_changes() {
         let sign = match change.tag() {
@@ -4730,11 +4835,12 @@ dst = "{}"
         // Verify the helper itself classifies correctly without printing.
         let yui = YuiVars::detect(&source);
         let cfg = config::load(&source, &yui).unwrap();
-        let mut e = template::Engine::new();
-        let ctx = template::template_context(&yui, &cfg.vars);
-        let mounts =
-            mount::resolve(&cfg.mount.entry, cfg.mount.default_strategy, &mut e, &ctx).unwrap();
-        let mount_srcs: Vec<Utf8PathBuf> = mounts.iter().map(|m| source.join(&m.src)).collect();
+        let mount_srcs: Vec<Utf8PathBuf> = cfg
+            .mount
+            .entry
+            .iter()
+            .map(|m| source.join(&m.src))
+            .collect();
         let walker = paths::source_walker(&source).build();
         let mut unmanaged_paths = Vec::new();
         for entry in walker.flatten() {
@@ -4766,6 +4872,7 @@ dst = "{}"
     #[test]
     fn is_repo_meta_recognises_yui_scaffold() {
         let source = Utf8Path::new("/dot");
+        // Repo-root config layering — yui-owned.
         assert!(is_repo_meta(
             Utf8Path::new("/dot/config.toml"),
             source,
@@ -4782,6 +4889,18 @@ dst = "{}"
             ".yuilink",
         ));
         assert!(is_repo_meta(
+            Utf8Path::new("/dot/config.local.example.toml"),
+            source,
+            ".yuilink",
+        ));
+        // Repo-root .gitignore — yui manages its rendered-files section.
+        assert!(is_repo_meta(
+            Utf8Path::new("/dot/.gitignore"),
+            source,
+            ".yuilink",
+        ));
+        // Marker / yuiignore / *.tera — anywhere in the tree.
+        assert!(is_repo_meta(
             Utf8Path::new("/dot/home/.config/foo/.yuilink"),
             source,
             ".yuilink",
@@ -4791,13 +4910,71 @@ dst = "{}"
             source,
             ".yuilink",
         ));
-        // Nested config.toml is NOT a repo meta — it could be the
-        // user's own dotfile they want to mount.
+        // Nested config.toml is a user dotfile, NOT yui's config.
         assert!(!is_repo_meta(
             Utf8Path::new("/dot/home/.config/myapp/config.toml"),
             source,
             ".yuilink",
         ));
+        // Nested .gitignore is a user dotfile too — only the
+        // repo-root one is yui-managed. (PR #53 review caught
+        // the original code marking every .gitignore as meta.)
+        assert!(!is_repo_meta(
+            Utf8Path::new("/dot/home/.config/git/.gitignore"),
+            source,
+            ".yuilink",
+        ));
+    }
+
+    /// `unmanaged` must NOT report files under a mount entry that's
+    /// inactive on the current host (e.g. `home_macos/foo` when on
+    /// Linux). The raw `config.mount.entry` list — not
+    /// `mount::resolve` which filters by `when` — claims those
+    /// files. (PR #53 review caught the original code using
+    /// `mount::resolve`.)
+    #[test]
+    fn unmanaged_respects_inactive_mount_entries() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let target = utf8(tmp.path().join("target"));
+        std::fs::create_dir_all(source.join("home_active")).unwrap();
+        std::fs::create_dir_all(source.join("home_other_os")).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(source.join("home_active/.bashrc"), "active").unwrap();
+        std::fs::write(source.join("home_other_os/.bashrc"), "inactive").unwrap();
+        // One mount active, one with a `when` that's always false.
+        let cfg = format!(
+            r#"
+[[mount.entry]]
+src = "home_active"
+dst = "{target}"
+
+[[mount.entry]]
+src = "home_other_os"
+dst = "{target}"
+when = "yui.os == 'definitely_not_a_real_os'"
+"#,
+            target = toml_path(&target)
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+        // Replicate unmanaged()'s classification logic and verify the
+        // `home_other_os/.bashrc` file is NOT listed (because the
+        // when=false mount entry still owns it on principle).
+        let yui = YuiVars::detect(&source);
+        let cfg = config::load(&source, &yui).unwrap();
+        let mount_srcs: Vec<Utf8PathBuf> = cfg
+            .mount
+            .entry
+            .iter()
+            .map(|m| source.join(&m.src))
+            .collect();
+        let inactive_file = source.join("home_other_os/.bashrc");
+        let claimed = mount_srcs.iter().any(|m| inactive_file.starts_with(m));
+        assert!(
+            claimed,
+            "raw config.mount.entry should claim files even under inactive mounts"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -4818,6 +4995,61 @@ dst = "{}"
         // diff() should run without bailing — the drift is what it
         // exists to surface.
         diff(Some(source.clone()), None, /* no_color */ true).unwrap();
+    }
+
+    /// `read_text_for_diff` distinguishes binary (invalid UTF-8)
+    /// from text and from missing — so `print_unified_diff` /
+    /// `print_absorb_diff` can short-circuit instead of dumping
+    /// bytes through `similar`. (PR #53 review.)
+    #[test]
+    fn read_text_for_diff_classifies_correctly() {
+        let tmp = TempDir::new().unwrap();
+        let root = utf8(tmp.path().to_path_buf());
+        // Plain UTF-8.
+        let txt = root.join("a.txt");
+        std::fs::write(&txt, "hello\n").unwrap();
+        match read_text_for_diff(&txt) {
+            DiffSide::Text(s) => assert_eq!(s, "hello\n"),
+            DiffSide::Binary => panic!("text file misclassified as binary"),
+        }
+        // Invalid UTF-8 bytes.
+        let bin = root.join("b.bin");
+        std::fs::write(&bin, [0xff, 0xfe, 0x00, 0xff]).unwrap();
+        assert!(matches!(read_text_for_diff(&bin), DiffSide::Binary));
+        // Missing file collapses to empty Text — graceful for races.
+        let missing = root.join("missing.txt");
+        match read_text_for_diff(&missing) {
+            DiffSide::Text(s) => assert!(s.is_empty()),
+            DiffSide::Binary => panic!("missing file misclassified as binary"),
+        }
+    }
+
+    /// `yui diff` for a render-drifted template must diff the
+    /// **rendered output** against the on-disk file, not the raw
+    /// `.tera` source — otherwise Tera's `{{ }}` syntax shows up
+    /// as drift. The fix exposes `render::render_to_string` for
+    /// `print_unified_diff` to compute the expected content.
+    /// (PR #53 review caught this.)
+    #[test]
+    fn diff_render_drift_uses_rendered_output_not_raw_template() {
+        let tmp = TempDir::new().unwrap();
+        let (source, _target) = setup_minimal_dotfiles(&tmp);
+        // Template renders `os = linux` (or whatever the host is);
+        // the on-disk rendered file is stale ("os = ancient").
+        std::fs::write(source.join("home/note.tera"), "os = {{ yui.os }}\n").unwrap();
+        std::fs::write(source.join("home/note"), "os = ancient\n").unwrap();
+        // The renderer should produce the expected new content.
+        let yui = YuiVars::detect(&source);
+        let cfg = config::load(&source, &yui).unwrap();
+        let rendered =
+            render::render_to_string(&source.join("home/note.tera"), &source, &cfg, &yui)
+                .unwrap()
+                .expect("template should render on this host");
+        assert!(rendered.starts_with("os = "));
+        assert!(
+            !rendered.contains("{{"),
+            "rendered output must not contain raw Tera tags"
+        );
     }
 
     #[test]
