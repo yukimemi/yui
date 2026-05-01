@@ -869,8 +869,9 @@ pub fn diff(
         if !diff_worth_printing(&item.state) {
             continue;
         }
+        let src_abs = resolve_diff_src(item, &source);
         print_unified_diff(
-            &item.src,
+            &src_abs,
             &item.dst,
             &item.state,
             &source,
@@ -891,6 +892,24 @@ pub fn diff(
         );
     }
     Ok(())
+}
+
+/// Resolve a `StatusItem.src` to an absolute path suitable for
+/// reading from disk during diff rendering.
+///
+/// `classify_walk` stores `StatusItem.src` via
+/// `relative_for_display(...)`, which strips the source-root prefix
+/// for table rendering. For `Link(_)` rows we have to re-absolutize
+/// before reading — otherwise the path resolves against the
+/// caller's cwd and we'd read an empty / wrong file. `RenderDrift`
+/// rows already carry an absolute `.tera` path (built from
+/// `render_report.diverged`, which the walker yields as absolute).
+/// (Caught in PR #53 review by coderabbitai.)
+fn resolve_diff_src(item: &StatusItem, source: &Utf8Path) -> Utf8PathBuf {
+    match item.state {
+        StatusState::RenderDrift => item.src.clone(),
+        StatusState::Link(_) => source.join(&item.src),
+    }
 }
 
 fn diff_worth_printing(state: &StatusState) -> bool {
@@ -975,29 +994,43 @@ fn print_unified_diff(
             return;
         }
     };
-    let diff = similar::TextDiff::from_lines(&src_content, &dst_content);
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            similar::ChangeTag::Delete => {
-                if color {
-                    print!("{}", format!("-{change}").red());
-                } else {
-                    print!("-{change}");
-                }
-            }
-            similar::ChangeTag::Insert => {
-                if color {
-                    print!("{}", format!("+{change}").green());
-                } else {
-                    print!("+{change}");
-                }
-            }
-            similar::ChangeTag::Equal => {
-                print!(" {change}");
-            }
+    print_unified_text_diff(
+        &src_content,
+        &dst_content,
+        src.as_str(),
+        dst.as_str(),
+        color,
+    );
+    println!();
+}
+
+/// Render a true unified diff (with `@@` hunk headers + 3-line
+/// context windows) via `similar::TextDiff::unified_diff` and
+/// route each line to stdout — colour the `+` / `-` / `@@` lines
+/// when the caller asked for it. Both `yui diff` and the absorb
+/// flow share this so the format is consistent regardless of
+/// entry point. (PR #53 review tightened the contract from the
+/// hand-rolled prefix loop to the standard `unified_diff`
+/// formatter.)
+fn print_unified_text_diff(src: &str, dst: &str, src_label: &str, dst_label: &str, color: bool) {
+    use owo_colors::OwoColorize as _;
+    let diff = similar::TextDiff::from_lines(src, dst);
+    let formatted = diff.unified_diff().header(src_label, dst_label).to_string();
+    for line in formatted.lines() {
+        if !color {
+            println!("{line}");
+        } else if line.starts_with("+++") || line.starts_with("---") {
+            println!("{}", line.dimmed());
+        } else if line.starts_with("@@") {
+            println!("{}", line.cyan());
+        } else if line.starts_with('+') {
+            println!("{}", line.green());
+        } else if line.starts_with('-') {
+            println!("{}", line.red());
+        } else {
+            println!("{line}");
         }
     }
-    println!();
 }
 
 /// One side of a textual diff. `Binary` means the bytes weren't
@@ -1557,14 +1590,11 @@ fn print_absorb_diff(src: &Utf8Path, dst: &Utf8Path) {
         }
     };
     let diff = similar::TextDiff::from_lines(&src_content, &dst_content);
-    for change in diff.iter_all_changes() {
-        let sign = match change.tag() {
-            similar::ChangeTag::Delete => "-",
-            similar::ChangeTag::Insert => "+",
-            similar::ChangeTag::Equal => " ",
-        };
-        eprint!("{sign}{change}");
-    }
+    let formatted = diff
+        .unified_diff()
+        .header(src.as_str(), dst.as_str())
+        .to_string();
+    eprint!("{formatted}");
     eprintln!();
 }
 
@@ -2917,35 +2947,10 @@ fn handle_anomaly(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>, reason: &s
 }
 
 fn prompt_absorb_with_diff(src: &Utf8Path, dst: &Utf8Path, reason: &str) -> Result<bool> {
-    use std::io::Write as _;
-    let src_content = std::fs::read_to_string(src).unwrap_or_default();
-    let dst_content = std::fs::read_to_string(dst).unwrap_or_default();
     eprintln!();
     eprintln!("anomaly: {reason}");
-    eprintln!("  src: {src}");
-    eprintln!("  dst: {dst}");
-    eprintln!();
-    eprintln!("--- diff (- source, + target) ---");
-    let diff = similar::TextDiff::from_lines(&src_content, &dst_content);
-    for change in diff.iter_all_changes() {
-        let sign = match change.tag() {
-            similar::ChangeTag::Delete => "-",
-            similar::ChangeTag::Insert => "+",
-            similar::ChangeTag::Equal => " ",
-        };
-        eprint!("{sign}{change}");
-    }
-    eprintln!();
-    eprint!("absorb target into source? [y/N]: ");
-    // Flush stderr (where the prompt was written) — flushing stdout was a
-    // bug; on a buffered stderr (rare but possible) the prompt would be
-    // hidden until after the user typed something. Caught in PR #15
-    // review (gemini-code-assist).
-    std::io::stderr().flush().ok();
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    let answer = input.trim();
-    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
+    print_absorb_diff(src, dst);
+    prompt_yes_no("absorb target into source?")
 }
 
 /// Resilient git-clean check: if `git` isn't available or `source` isn't
@@ -5049,6 +5054,36 @@ when = "yui.os == 'definitely_not_a_real_os'"
         assert!(
             !rendered.contains("{{"),
             "rendered output must not contain raw Tera tags"
+        );
+    }
+
+    /// Regression for the path-resolution bug coderabbitai flagged
+    /// on PR #53: `StatusItem.src` is a *relative-for-display*
+    /// path, so reading it directly during diff rendering would
+    /// resolve against the caller's cwd — empty file, wrong file,
+    /// or NotFound. `resolve_diff_src` re-absolutizes against the
+    /// source root for `Link(_)` rows, leaves `RenderDrift` rows
+    /// alone (those already carry absolute `.tera` paths).
+    #[test]
+    fn resolve_diff_src_absolutizes_link_rows() {
+        let source = Utf8Path::new("/dot");
+        let link_item = StatusItem {
+            src: Utf8PathBuf::from("home/.bashrc"),
+            dst: Utf8PathBuf::from("/h/u/.bashrc"),
+            state: StatusState::Link(absorb::AbsorbDecision::AutoAbsorb),
+        };
+        assert_eq!(
+            resolve_diff_src(&link_item, source),
+            Utf8PathBuf::from("/dot/home/.bashrc"),
+        );
+        let render_item = StatusItem {
+            src: Utf8PathBuf::from("/dot/home/foo.tera"),
+            dst: Utf8PathBuf::from("/dot/home/foo"),
+            state: StatusState::RenderDrift,
+        };
+        assert_eq!(
+            resolve_diff_src(&render_item, source),
+            Utf8PathBuf::from("/dot/home/foo.tera"),
         );
     }
 
