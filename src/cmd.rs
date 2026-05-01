@@ -627,6 +627,306 @@ pub fn unlink(source: Option<Utf8PathBuf>, paths_arg: Vec<Utf8PathBuf>) -> Resul
     Ok(())
 }
 
+/// `yui update [--dry-run]` — pull source repo and re-apply.
+///
+/// Equivalent to `git -C $DOTFILES pull --ff-only && yui apply`,
+/// but with the safety check that the source tree is clean first
+/// (otherwise the pull could mix upstream commits with the user's
+/// in-progress edits in surprising ways). Bails on a dirty source
+/// rather than stashing — the user should commit consciously.
+///
+/// `--dry-run` only forwards to `apply --dry-run`; the pull itself
+/// always runs (it's a read+merge operation, no half-state).
+pub fn update(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
+    let source = resolve_source(source)?;
+    if !crate::git::is_clean(&source)? {
+        anyhow::bail!(
+            "source repo {source} has uncommitted changes — \
+             commit or stash before `yui update` (or run \
+             `git pull` + `yui apply` manually if you know what \
+             you're doing)"
+        );
+    }
+    info!("git pull --ff-only at {source}");
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(source.as_str())
+        .arg("pull")
+        .arg("--ff-only")
+        .status()
+        .map_err(|e| anyhow::anyhow!("invoking git: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("git pull --ff-only failed at {source}");
+    }
+    apply(Some(source), dry_run)
+}
+
+/// `yui unmanaged [--icons MODE] [--no-color]` — list source files
+/// that no `[[mount.entry]]` claims.
+///
+/// Useful for spotting orphans: files committed to the dotfiles
+/// repo that yui never propagates anywhere. The walk goes through
+/// `paths::source_walker`, which already honours nested
+/// `.yuiignore` and skips `.yui/`. We additionally skip the repo's
+/// own meta files (`config*.toml`, `.gitignore`, `.yuilink`,
+/// `.yuiignore`, `*.tera` template sources) since "expected
+/// unmanaged" entries would just bury the long tail.
+pub fn unmanaged(
+    source: Option<Utf8PathBuf>,
+    icons_override: Option<IconsMode>,
+    no_color: bool,
+) -> Result<()> {
+    let source = resolve_source(source)?;
+    let yui = YuiVars::detect(&source);
+    let config = config::load(&source, &yui)?;
+    let mut engine = template::Engine::new();
+    let tera_ctx = template::template_context(&yui, &config.vars);
+    let mounts = mount::resolve(
+        &config.mount.entry,
+        config.mount.default_strategy,
+        &mut engine,
+        &tera_ctx,
+    )?;
+
+    let _icons = Icons::for_mode(icons_override.unwrap_or(config.ui.icons));
+    let color = !no_color && supports_color_stdout();
+
+    // Resolve every mount.src to an absolute path under source so a
+    // simple `path.starts_with(&mount_src)` test can answer
+    // "claimed?". Includes inactive mounts too — a `when=false`
+    // mount on this host still owns the files on principle.
+    let mount_srcs: Vec<Utf8PathBuf> = mounts.iter().map(|m| source.join(&m.src)).collect();
+
+    let mut items: Vec<Utf8PathBuf> = Vec::new();
+    let walker = paths::source_walker(&source).build();
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let std_path = entry.path();
+        let path = match Utf8PathBuf::from_path_buf(std_path.to_path_buf()) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Filter out the repo's own meta files. These are "managed
+        // by yui itself" rather than "unmanaged orphans", so
+        // surfacing them in the report is just noise.
+        if is_repo_meta(&path, &source, &config.mount.marker_filename) {
+            continue;
+        }
+        if mount_srcs.iter().any(|m| path.starts_with(m)) {
+            continue;
+        }
+        items.push(path);
+    }
+    items.sort();
+
+    if items.is_empty() {
+        println!("  no unmanaged files under {source}");
+        return Ok(());
+    }
+
+    print_unmanaged_table(&items, &source, color);
+    println!();
+    println!("  {} unmanaged file(s)", items.len());
+    Ok(())
+}
+
+/// True for the dotfiles repo's own scaffold files — anything yui
+/// itself reads or writes during its own operation. Surfacing
+/// these in `yui unmanaged` would just bury the actual orphans.
+fn is_repo_meta(path: &Utf8Path, source: &Utf8Path, marker_filename: &str) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    if name.ends_with(".tera") {
+        return true; // template sources are by definition managed
+    }
+    if name == marker_filename || name == ".yuiignore" || name == ".gitignore" {
+        return true;
+    }
+    // Repo-root config files only — `home/.config/foo/config.toml`
+    // could be a real unmanaged file the user just hasn't mounted.
+    let parent = path.parent().unwrap_or(Utf8Path::new(""));
+    if parent == source && (name == "config.toml" || name == "config.local.toml") {
+        return true;
+    }
+    if parent == source
+        && name.starts_with("config.")
+        && (name.ends_with(".toml") || name.ends_with(".example.toml"))
+    {
+        return true;
+    }
+    false
+}
+
+fn print_unmanaged_table(items: &[Utf8PathBuf], source: &Utf8Path, color: bool) {
+    use owo_colors::OwoColorize as _;
+    if color {
+        println!("  {}", "PATH (relative to source)".dimmed());
+    } else {
+        println!("  PATH (relative to source)");
+    }
+    for p in items {
+        let rel = p
+            .strip_prefix(source)
+            .map(Utf8PathBuf::from)
+            .unwrap_or_else(|_| p.clone());
+        if color {
+            println!("  {}", rel.cyan());
+        } else {
+            println!("  {rel}");
+        }
+    }
+}
+
+/// `yui diff [--icons MODE] [--no-color]` — for every drifted entry
+/// (link or render), print a unified diff to stdout.
+///
+/// Layered on top of the same drift detection `yui status` uses
+/// (`absorb::classify` + render dry-run), but actually emits the
+/// content delta. InSync / Restore / RelinkOnly entries are
+/// suppressed — they're not "drift the user can read".
+pub fn diff(
+    source: Option<Utf8PathBuf>,
+    icons_override: Option<IconsMode>,
+    no_color: bool,
+) -> Result<()> {
+    let source = resolve_source(source)?;
+    let yui = YuiVars::detect(&source);
+    let config = config::load(&source, &yui)?;
+    let mut engine = template::Engine::new();
+    let tera_ctx = template::template_context(&yui, &config.vars);
+    let mounts = mount::resolve(
+        &config.mount.entry,
+        config.mount.default_strategy,
+        &mut engine,
+        &tera_ctx,
+    )?;
+
+    let _icons = Icons::for_mode(icons_override.unwrap_or(config.ui.icons));
+    let color = !no_color && supports_color_stdout();
+
+    // Reuse classify_walk to enumerate every src→dst pair.
+    let mut report: Vec<StatusItem> = Vec::new();
+    let mut yuiignore = paths::YuiIgnoreStack::new();
+    yuiignore.push_dir(&source)?;
+    let walk_result = (|| -> Result<()> {
+        for m in &mounts {
+            let src_root = source.join(&m.src);
+            if !src_root.is_dir() {
+                continue;
+            }
+            classify_walk(
+                &src_root,
+                &m.dst,
+                &config,
+                m.strategy,
+                &mut engine,
+                &tera_ctx,
+                &source,
+                &mut yuiignore,
+                &mut report,
+            )?;
+        }
+        Ok(())
+    })();
+    yuiignore.pop_dir(&source);
+    walk_result?;
+
+    // Render-drift surfaces too — same as cmd::status.
+    let render_report = render::render_all(&source, &config, &yui, /* dry_run */ true)?;
+    for rendered in &render_report.diverged {
+        let tera_path = Utf8PathBuf::from(format!("{rendered}.tera"));
+        report.push(StatusItem {
+            src: tera_path,
+            dst: rendered.clone(),
+            state: StatusState::RenderDrift,
+        });
+    }
+
+    let mut printed = 0usize;
+    for item in &report {
+        if !diff_worth_printing(&item.state) {
+            continue;
+        }
+        print_unified_diff(&item.src, &item.dst, &item.state, color);
+        printed += 1;
+    }
+
+    if printed == 0 {
+        println!("  no diff — every entry is in sync (or only needs a relink)");
+    } else {
+        println!();
+        println!(
+            "  {printed} entr{} with content drift",
+            if printed == 1 { "y" } else { "ies" }
+        );
+    }
+    Ok(())
+}
+
+fn diff_worth_printing(state: &StatusState) -> bool {
+    use absorb::AbsorbDecision::*;
+    match state {
+        StatusState::Link(InSync) => false,
+        StatusState::Link(Restore) => false, // target missing — nothing to diff
+        StatusState::Link(RelinkOnly) => false, // content identical, only metadata drift
+        StatusState::Link(_) => true,
+        StatusState::RenderDrift => true,
+    }
+}
+
+fn print_unified_diff(src: &Utf8Path, dst: &Utf8Path, state: &StatusState, color: bool) {
+    use owo_colors::OwoColorize as _;
+
+    let header = match state {
+        StatusState::RenderDrift => format!("--- render drift: {src} (template) vs {dst}"),
+        _ => format!("--- {src} → {dst}"),
+    };
+    if color {
+        println!("{}", header.bold());
+    } else {
+        println!("{header}");
+    }
+
+    if src.is_dir() || dst.is_dir() {
+        println!("(directory entry — content listing skipped)");
+        println!();
+        return;
+    }
+
+    let src_content = std::fs::read_to_string(src).unwrap_or_default();
+    let dst_content = std::fs::read_to_string(dst).unwrap_or_default();
+    let diff = similar::TextDiff::from_lines(&src_content, &dst_content);
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Delete => {
+                if color {
+                    print!("{}", format!("-{change}").red());
+                } else {
+                    print!("-{change}");
+                }
+            }
+            similar::ChangeTag::Insert => {
+                if color {
+                    print!("{}", format!("+{change}").green());
+                } else {
+                    print!("+{change}");
+                }
+            }
+            similar::ChangeTag::Equal => {
+                print!(" {change}");
+            }
+        }
+    }
+    println!();
+}
+
 /// Show every src→dst pair's drift state against the current host.
 ///
 /// Walks each `[[mount.entry]]`'s source tree, honoring `.yuilink`
@@ -1062,9 +1362,19 @@ fn print_status_row(
 /// or non-TTY ask) but the user has decided that target is right. Bypasses
 /// policy + git-clean checks: this is an explicit user request.
 ///
+/// Always prints a unified diff (source vs target) to stderr first.
+/// Without `--yes`, requires interactive y/N confirmation on a TTY,
+/// and refuses to act off-TTY (so a CI script can't silently
+/// rewrite source). `--dry-run` shows the diff and exits.
+///
 /// Walks `[[mount.entry]]` and `.yuilink` overrides to find which source
 /// path "owns" the given target. Errors loudly if no mount claims it.
-pub fn absorb(source: Option<Utf8PathBuf>, target: Utf8PathBuf, dry_run: bool) -> Result<()> {
+pub fn absorb(
+    source: Option<Utf8PathBuf>,
+    target: Utf8PathBuf,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
     let source = resolve_source(source)?;
     let target = absolutize(&target)?;
     let yui = YuiVars::detect(&source);
@@ -1084,9 +1394,29 @@ pub fn absorb(source: Option<Utf8PathBuf>, target: Utf8PathBuf, dry_run: bool) -
 
     info!("source for {target}: {src_path}");
 
+    // Show the diff before *any* action. For text files we render a
+    // unified diff against `similar`; for dirs / binaries we just
+    // surface a one-liner so the user knows what they're about to
+    // overwrite without dumping garbage to the terminal.
+    print_absorb_diff(&src_path, &target);
+
     if dry_run {
         info!("[dry-run] would absorb {target} → {src_path}");
         return Ok(());
+    }
+
+    if !yes {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "manual absorb refuses to run off-TTY without --yes \
+                 (would silently overwrite {src_path})"
+            );
+        }
+        if !prompt_yes_no("absorb target into source?")? {
+            warn!("manual absorb cancelled by user: {target}");
+            return Ok(());
+        }
     }
 
     let backup_root = source.join(&config.backup.dir);
@@ -1102,6 +1432,45 @@ pub fn absorb(source: Option<Utf8PathBuf>, target: Utf8PathBuf, dry_run: bool) -
     // Manual absorb is an explicit user request — bypass `auto`,
     // `require_clean_git`, and `on_anomaly` policy entirely.
     absorb_target_into_source(&src_path, &target, &ctx)
+}
+
+/// Stderr-print a unified diff between `src` (file or dir) and `dst`
+/// using `similar`. Falls back to a one-line description when one
+/// side is a directory or content isn't valid UTF-8 — we'd rather
+/// say "binary file differs" than spew bytes.
+fn print_absorb_diff(src: &Utf8Path, dst: &Utf8Path) {
+    eprintln!();
+    eprintln!("--- diff (- source, + target) ---");
+    eprintln!("  src: {src}");
+    eprintln!("  dst: {dst}");
+    eprintln!();
+    if src.is_dir() || dst.is_dir() {
+        eprintln!("(directory absorb — content listing skipped)");
+        eprintln!();
+        return;
+    }
+    let src_content = std::fs::read_to_string(src).unwrap_or_default();
+    let dst_content = std::fs::read_to_string(dst).unwrap_or_default();
+    let diff = similar::TextDiff::from_lines(&src_content, &dst_content);
+    for change in diff.iter_all_changes() {
+        let sign = match change.tag() {
+            similar::ChangeTag::Delete => "-",
+            similar::ChangeTag::Insert => "+",
+            similar::ChangeTag::Equal => " ",
+        };
+        eprint!("{sign}{change}");
+    }
+    eprintln!();
+}
+
+fn prompt_yes_no(question: &str) -> Result<bool> {
+    use std::io::Write as _;
+    eprint!("{question} [y/N]: ");
+    std::io::stderr().flush().ok();
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let answer = input.trim();
+    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
 /// Walk mount entries + `.yuilink` Override markers to find the source
@@ -4004,11 +4373,13 @@ dst = "{}"
         std::fs::write(target.join(".bashrc"), "user picked this").unwrap();
         std::fs::write(source.join("home/.bashrc"), "default").unwrap();
 
-        // Run absorb directly on the target.
+        // Run absorb directly on the target — `--yes` skips the
+        // interactive prompt the manual flow normally requires.
         absorb(
             Some(source.clone()),
             target.join(".bashrc"),
             /* dry_run */ false,
+            /* yes */ true,
         )
         .unwrap();
 
@@ -4027,7 +4398,7 @@ dst = "{}"
         let stranger = utf8(tmp.path().join("not-managed/foo"));
         std::fs::create_dir_all(stranger.parent().unwrap()).unwrap();
         std::fs::write(&stranger, "not yui's").unwrap();
-        let err = absorb(Some(source), stranger, false).unwrap_err();
+        let err = absorb(Some(source), stranger, false, /* yes */ true).unwrap_err();
         assert!(format!("{err}").contains("no mount entry"));
     }
 
@@ -4332,6 +4703,161 @@ dst = "{}"
 
         let err = apply(Some(source.clone()), false).unwrap_err();
         assert!(format!("{err:#}").contains("missing.ps1"));
+    }
+
+    // -----------------------------------------------------------------
+    // unmanaged
+    // -----------------------------------------------------------------
+
+    /// `yui unmanaged` lists files in the source tree that no
+    /// `[[mount.entry]]` claims. Should NOT include the repo's own
+    /// scaffold (`config.toml`, `.gitignore`, `.yuilink`, `.tera`
+    /// templates) — those are managed-by-yui-itself.
+    #[test]
+    fn unmanaged_finds_files_outside_any_mount() {
+        let tmp = TempDir::new().unwrap();
+        let (source, _target) = setup_minimal_dotfiles(&tmp);
+        // Mount-claimed file (under `home/` per setup_minimal_dotfiles).
+        std::fs::write(source.join("home/.bashrc"), "x").unwrap();
+        // Truly unmanaged file at repo root.
+        std::fs::write(source.join("orphan.txt"), "y").unwrap();
+        std::fs::create_dir_all(source.join("notes")).unwrap();
+        std::fs::write(source.join("notes/scratch.md"), "z").unwrap();
+
+        // unmanaged() should succeed and not touch anything.
+        unmanaged(Some(source.clone()), None, /* no_color */ true).unwrap();
+
+        // Verify the helper itself classifies correctly without printing.
+        let yui = YuiVars::detect(&source);
+        let cfg = config::load(&source, &yui).unwrap();
+        let mut e = template::Engine::new();
+        let ctx = template::template_context(&yui, &cfg.vars);
+        let mounts =
+            mount::resolve(&cfg.mount.entry, cfg.mount.default_strategy, &mut e, &ctx).unwrap();
+        let mount_srcs: Vec<Utf8PathBuf> = mounts.iter().map(|m| source.join(&m.src)).collect();
+        let walker = paths::source_walker(&source).build();
+        let mut unmanaged_paths = Vec::new();
+        for entry in walker.flatten() {
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let p = match Utf8PathBuf::from_path_buf(entry.path().to_path_buf()) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if is_repo_meta(&p, &source, &cfg.mount.marker_filename) {
+                continue;
+            }
+            if mount_srcs.iter().any(|m| p.starts_with(m)) {
+                continue;
+            }
+            unmanaged_paths.push(p);
+        }
+        let names: Vec<String> = unmanaged_paths
+            .iter()
+            .filter_map(|p| p.file_name().map(String::from))
+            .collect();
+        assert!(names.contains(&"orphan.txt".into()));
+        assert!(names.contains(&"scratch.md".into()));
+        assert!(!names.contains(&".bashrc".into()), "mount-claimed file");
+        assert!(!names.contains(&"config.toml".into()), "repo meta");
+    }
+
+    #[test]
+    fn is_repo_meta_recognises_yui_scaffold() {
+        let source = Utf8Path::new("/dot");
+        assert!(is_repo_meta(
+            Utf8Path::new("/dot/config.toml"),
+            source,
+            ".yuilink",
+        ));
+        assert!(is_repo_meta(
+            Utf8Path::new("/dot/config.local.toml"),
+            source,
+            ".yuilink",
+        ));
+        assert!(is_repo_meta(
+            Utf8Path::new("/dot/config.linux.toml"),
+            source,
+            ".yuilink",
+        ));
+        assert!(is_repo_meta(
+            Utf8Path::new("/dot/home/.config/foo/.yuilink"),
+            source,
+            ".yuilink",
+        ));
+        assert!(is_repo_meta(
+            Utf8Path::new("/dot/home/.gitconfig.tera"),
+            source,
+            ".yuilink",
+        ));
+        // Nested config.toml is NOT a repo meta — it could be the
+        // user's own dotfile they want to mount.
+        assert!(!is_repo_meta(
+            Utf8Path::new("/dot/home/.config/myapp/config.toml"),
+            source,
+            ".yuilink",
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // diff
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn diff_shows_drift_skips_in_sync() {
+        let tmp = TempDir::new().unwrap();
+        let (source, target) = setup_minimal_dotfiles(&tmp);
+        std::fs::write(source.join("home/.bashrc"), "first\nsecond\n").unwrap();
+        // Sync once.
+        apply(Some(source.clone()), false).unwrap();
+        // Edit target — break the link, create content drift.
+        std::fs::remove_file(target.join(".bashrc")).unwrap();
+        std::fs::write(target.join(".bashrc"), "first\nEDITED\n").unwrap();
+
+        // diff() should run without bailing — the drift is what it
+        // exists to surface.
+        diff(Some(source.clone()), None, /* no_color */ true).unwrap();
+    }
+
+    #[test]
+    fn diff_classifier_skips_uninteresting_states() {
+        use absorb::AbsorbDecision::*;
+        // Neither InSync nor Restore nor RelinkOnly is worth diffing.
+        assert!(!diff_worth_printing(&StatusState::Link(InSync)));
+        assert!(!diff_worth_printing(&StatusState::Link(Restore)));
+        assert!(!diff_worth_printing(&StatusState::Link(RelinkOnly)));
+        // Anything content-divergent is.
+        assert!(diff_worth_printing(&StatusState::Link(AutoAbsorb)));
+        assert!(diff_worth_printing(&StatusState::Link(NeedsConfirm)));
+        assert!(diff_worth_printing(&StatusState::RenderDrift));
+    }
+
+    // -----------------------------------------------------------------
+    // update
+    // -----------------------------------------------------------------
+
+    /// `yui update` bails out early on a dirty source tree before
+    /// even shelling out to `git pull`. Easiest way to provoke that
+    /// is on a fresh untracked file in a git repo, but git itself
+    /// isn't always available in the test sandbox — fall back to
+    /// only asserting the path that DOES run cleanly: a non-repo
+    /// directory yields a clear `git: ...` error from is_clean.
+    #[test]
+    fn update_errors_when_source_is_not_a_git_repo() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("config.toml"), "").unwrap();
+        // No `.git` here — is_clean should bail.
+        let err = update(Some(source), false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not a git repository")
+                || msg.contains("uncommitted")
+                || msg.contains("git"),
+            "unexpected error: {msg}",
+        );
     }
 
     fn walkdir(root: &Utf8Path) -> Vec<Utf8PathBuf> {

@@ -83,25 +83,31 @@ pub fn is_ignored_at(source: &Utf8Path, path: &Utf8Path, is_dir: bool) -> crate:
     Ok(stack.is_ignored(path, is_dir))
 }
 
-/// Build a source-tree walker that skips yui's internal `.yui/` directory.
+/// Build a source-tree walker that skips repo plumbing.
 ///
-/// `.yui/backup/` can grow huge over time, and `.yui/rendered/` (future)
-/// would also live here — neither is part of the user's dotfiles, and
-/// walking them slows render / list / absorb-find by a lot. We also keep
-/// `.gitignore` / `.ignore` filtering disabled (`git_ignore(false)`,
-/// `ignore(false)`) so a user's unrelated ignore rules don't swallow
-/// legitimate `.tera` / `.yuilink` files deeper in the tree.
+/// Excluded directory names anywhere in the tree:
+///   - `.yui/` — yui's own state and backup mirror; can grow huge.
+///   - `.git/` — git plumbing of the dotfiles repo itself. The
+///     check is on the basename, so a `home/.config/git/` (note:
+///     no leading dot) inside the dotfiles is NOT excluded — only
+///     the literal `.git`.
 ///
-/// `.yuiignore` is registered as a custom ignore filename so the
-/// walker honours nested rules (every subdir that has a `.yuiignore`
-/// adds its patterns scoped to that subtree, like git does with
-/// `.gitignore`). The manual recursive walks in `cmd.rs` use the
-/// `YuiIgnoreStack` companion type to get the same behaviour.
+/// `git_ignore(false)` / `ignore(false)` keep `.gitignore` /
+/// `.ignore` rules from swallowing legitimate `.tera` / `.yuilink`
+/// files deeper in the tree. `.yuiignore` is registered as a
+/// custom ignore filename so the walker honours nested rules
+/// (every subdir that has a `.yuiignore` adds its patterns scoped
+/// to that subtree, like git does with `.gitignore`). The manual
+/// recursive walks in `cmd.rs` use the `YuiIgnoreStack` companion
+/// type to get the same behaviour.
 pub fn source_walker(source: &Utf8Path) -> ignore::WalkBuilder {
     let mut b = ignore::WalkBuilder::new(source);
     b.hidden(false).git_ignore(false).ignore(false);
     b.add_custom_ignore_filename(".yuiignore");
-    b.filter_entry(|entry| entry.file_name() != ".yui");
+    b.filter_entry(|entry| {
+        let name = entry.file_name();
+        name != ".yui" && name != ".git"
+    });
     b
 }
 
