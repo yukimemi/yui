@@ -48,7 +48,7 @@ thiserror = "2.0.18"
 toml = "1.1.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-whoami = "1.6.1"
+whoami = "2.1.2"
 
 [target.'cfg(windows)'.dependencies]
 junction = "1.4.2"
