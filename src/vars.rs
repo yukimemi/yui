@@ -22,8 +22,8 @@ impl YuiVars {
         Self {
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
-            host: whoami::fallible::hostname().unwrap_or_else(|_| "unknown".to_string()),
-            user: whoami::username(),
+            host: whoami::hostname().unwrap_or_else(|_| "unknown".to_string()),
+            user: whoami::username().unwrap_or_else(|_| "unknown".to_string()),
             source: source.to_string(),
         }
     }

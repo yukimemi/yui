@@ -103,8 +103,17 @@ pub enum HookOutcome {
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
     let digest = Sha256::digest(bytes);
-    format!("sha256:{digest:x}")
+    // sha2 0.11 returns a `hybrid_array::Array` that no longer
+    // implements `LowerHex`, so the `{:x}` shorthand the older
+    // crate version supported is gone — format byte-by-byte.
+    let mut out = String::with_capacity(7 + digest.len() * 2);
+    out.push_str("sha256:");
+    for b in digest.iter() {
+        write!(out, "{b:02x}").expect("writing to String never fails");
+    }
+    out
 }
 
 fn now_iso8601() -> String {
