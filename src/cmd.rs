@@ -1,7 +1,6 @@
 //! Command implementations.
 //!
-//! Each `Command` variant in `cli.rs` calls one of these. Currently
-//! implemented: `apply`, `init`, `doctor`. The rest are `todo!()`.
+//! Each `Command` variant in `cli.rs` calls one of these.
 
 use std::fmt::Write as _;
 

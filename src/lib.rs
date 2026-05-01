@@ -12,7 +12,6 @@ pub mod marker;
 pub mod mount;
 pub mod paths;
 pub mod render;
-pub mod status;
 pub mod template;
 pub mod vars;
 
