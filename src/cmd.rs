@@ -238,19 +238,16 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
         );
     }
 
-    // 1c. Both pipelines write sibling files; their union goes in
-    //     the `.gitignore` managed section. `render::render_all`
-    //     already wrote the section once with its own paths;
-    //     re-write with the combined set so age plaintext files
-    //     are also covered.
+    // 1c. Single deterministic write of the `.gitignore` managed
+    //     section, covering both `*.tera` outputs and `*.age`
+    //     plaintext siblings. (Earlier this was two writes — once
+    //     inside `render_all`, once here — which made the managed
+    //     section flicker if a reader read between them. PR #57
+    //     review caught it; render_all no longer touches gitignore.)
     if !dry_run && config.render.manage_gitignore {
-        let mut managed: Vec<Utf8PathBuf> = render_report
-            .written
-            .iter()
-            .chain(render_report.unchanged.iter())
-            .chain(render_report.diverged.iter())
-            .chain(secret_report.managed_paths())
-            .cloned()
+        let mut managed: Vec<Utf8PathBuf> = render::report_managed_paths(&render_report)
+            .into_iter()
+            .chain(secret_report.managed_paths().cloned())
             .collect();
         managed.sort();
         managed.dedup();
@@ -650,8 +647,17 @@ pub fn render(source: Option<Utf8PathBuf>, check: bool, dry_run: bool) -> Result
     let yui = YuiVars::detect(&source);
     let config = config::load(&source, &yui)?;
     // --check is a stricter dry-run: never writes, exits non-zero on drift.
-    let report = render::render_all(&source, &config, &yui, dry_run || check)?;
+    let effective_dry_run = dry_run || check;
+    let report = render::render_all(&source, &config, &yui, effective_dry_run)?;
     log_render_report(&report);
+    // Stand-alone `yui render` has no secrets pipeline running
+    // alongside, so the managed section here just covers `*.tera`
+    // outputs. (Use `yui apply` if you need both rendered AND
+    // decrypted siblings to land in the same write.)
+    if !effective_dry_run && config.render.manage_gitignore {
+        let managed = render::report_managed_paths(&report);
+        render::write_managed_section(&source, &managed)?;
+    }
     if check && report.has_drift() {
         anyhow::bail!("render drift detected ({} file(s))", report.diverged.len());
     }
@@ -723,13 +729,13 @@ pub fn secret_init(source: Option<Utf8PathBuf>, comment: Option<String>) -> Resu
     //    is the per-machine layer the user explicitly owns.
     let local_path = source.join("config.local.toml");
     let comment = comment.unwrap_or_else(|| format!("{} {}", yui.host, yui.user));
-    let entry = format!("\n# {comment}\n# (added by `yui secret init` on {now})\n");
+    let entry_comment = format!("{comment} — added by `yui secret init` on {now}");
     let local_existing = match std::fs::read_to_string(&local_path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => anyhow::bail!("read {local_path}: {e}"),
     };
-    let updated_local = append_recipient_to_local(&local_existing, &entry, &public);
+    let updated_local = append_recipient_to_local(&local_existing, &entry_comment, &public)?;
     std::fs::write(&local_path, updated_local)?;
     info!("appended public key to {local_path}");
     println!();
@@ -743,47 +749,68 @@ pub fn secret_init(source: Option<Utf8PathBuf>, comment: Option<String>) -> Resu
     Ok(())
 }
 
-/// Append a `recipient = "..."` entry to the user's
-/// `config.local.toml`, creating a `[secrets]` table header on
-/// the way if it isn't there yet. Idempotent in the sense of
-/// "doesn't double-write the same key" — but only when called
-/// with the same `public` string twice. The caller (`secret_init`)
-/// generates a fresh keypair every time, so this isn't load-
-/// bearing in normal use.
-fn append_recipient_to_local(existing: &str, comment_block: &str, public: &str) -> String {
-    if existing.contains(public) {
-        return existing.to_string();
-    }
-    let mut out = existing.to_string();
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    if !out.contains("[secrets]") {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str("[secrets]\n");
-        out.push_str("recipients = [\n");
-        out.push_str(comment_block);
-        out.push_str(&format!("  \"{public}\",\n"));
-        out.push_str("]\n");
+/// Append a recipient entry to the user's `config.local.toml`.
+///
+/// Uses `toml_edit` to parse the file into an in-memory document
+/// tree, modify the `[secrets].recipients` array, then serialise
+/// back. This preserves user comments / spacing / table ordering,
+/// and survives quirky inputs (other tables after `[secrets]`,
+/// trailing comments, multi-line arrays, etc.) — string-pasting
+/// the same shape used to land tokens in the wrong place when the
+/// file's layout deviated from the most common case. (Caught in
+/// PR #57 review by gemini-code-assist.)
+///
+/// Returns the file unchanged when the public key is already in
+/// the recipients list (idempotent re-init).
+fn append_recipient_to_local(existing: &str, comment: &str, public: &str) -> Result<String> {
+    use toml_edit::{Array, DocumentMut, Item, Table, Value};
+
+    let mut doc: DocumentMut = if existing.trim().is_empty() {
+        DocumentMut::new()
     } else {
-        // Crude but adequate: the user's config.local.toml usually
-        // has only the `[secrets]` table near the bottom. Insert
-        // a new entry right after the line that opens the array.
-        let needle = "recipients = [";
-        if let Some(idx) = out.find(needle) {
-            let insertion = idx + needle.len();
-            let before = &out[..insertion];
-            let after = &out[insertion..];
-            out = format!("{before}{comment_block}  \"{public}\",\n{after}");
-        } else {
-            // `[secrets]` exists but no `recipients = [...]` array yet.
-            out.push_str(comment_block);
-            out.push_str(&format!("recipients = [\"{public}\"]\n"));
-        }
+        existing
+            .parse()
+            .map_err(|e| anyhow::anyhow!("config.local.toml is not valid TOML: {e}"))?
+    };
+
+    // Make sure `[secrets]` exists as a table.
+    if !doc.contains_key("secrets") {
+        let mut t = Table::new();
+        t.set_implicit(false);
+        doc.insert("secrets", Item::Table(t));
     }
-    out
+    let secrets = doc["secrets"].as_table_mut().ok_or_else(|| {
+        anyhow::anyhow!("[secrets] in config.local.toml is not a table — refusing to clobber")
+    })?;
+
+    // Make sure `recipients` is an array.
+    if !secrets.contains_key("recipients") {
+        secrets.insert("recipients", Item::Value(Value::Array(Array::new())));
+    }
+    let recipients = secrets["recipients"]
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("[secrets].recipients is not an array"))?;
+
+    // Idempotent: if the public key already appears, we're done.
+    let already_present = recipients.iter().any(|v| v.as_str() == Some(public));
+    if already_present {
+        return Ok(doc.to_string());
+    }
+
+    // Append the new entry with a leading-comment decor block so
+    // the user can tell which key belongs to which machine just by
+    // reading the file.
+    let mut value = Value::from(public);
+    let prefix = format!("\n  # {comment}\n  ");
+    *value.decor_mut() = toml_edit::Decor::new(prefix, "");
+    recipients.push_formatted(value);
+    // Force the array onto multiple lines so the comments above
+    // entries actually have a place to live (a single-line array
+    // can't carry per-element comments).
+    recipients.set_trailing("\n");
+    recipients.set_trailing_comma(true);
+
+    Ok(doc.to_string())
 }
 
 /// `yui secret encrypt <path> [--force] [--rm-plaintext]` — encrypt
@@ -4994,6 +5021,83 @@ recipients = ["{}"]
             format!("{err:#}").contains("secret drift"),
             "expected secret drift error, got: {err:#}"
         );
+    }
+
+    // -- append_recipient_to_local (PR #57 review: toml_edit) --
+
+    #[test]
+    fn append_recipient_creates_secrets_table_when_missing() {
+        let result =
+            append_recipient_to_local("", "host alice", "age1abcrecipientpublickey").unwrap();
+        // Round-trip parse — must be valid TOML.
+        let parsed: toml::Table = toml::from_str(&result).unwrap();
+        let secrets = parsed.get("secrets").and_then(|v| v.as_table()).unwrap();
+        let recipients = secrets
+            .get("recipients")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(recipients[0].as_str(), Some("age1abcrecipientpublickey"));
+    }
+
+    #[test]
+    fn append_recipient_preserves_existing_other_tables() {
+        // Crude string-pasting used to put a new recipient in the
+        // wrong place when other tables followed `[secrets]`.
+        // toml_edit handles arbitrary table ordering.
+        let existing = r#"
+[vars]
+greet = "hi"
+
+[secrets]
+recipients = ["age1machine_a"]
+
+[ui]
+icons = "ascii"
+"#;
+        let result = append_recipient_to_local(existing, "host b", "age1machine_b").unwrap();
+        let parsed: toml::Table = toml::from_str(&result).unwrap();
+        // All three tables still there.
+        assert!(parsed.get("vars").is_some());
+        assert!(parsed.get("secrets").is_some());
+        assert!(parsed.get("ui").is_some());
+        // Both recipients in the array.
+        let recipients = parsed["secrets"]["recipients"].as_array().unwrap();
+        assert_eq!(recipients.len(), 2);
+        let pubs: Vec<&str> = recipients.iter().filter_map(|v| v.as_str()).collect();
+        assert!(pubs.contains(&"age1machine_a"));
+        assert!(pubs.contains(&"age1machine_b"));
+    }
+
+    #[test]
+    fn append_recipient_is_idempotent_on_duplicate() {
+        let existing = r#"[secrets]
+recipients = ["age1same"]
+"#;
+        let result = append_recipient_to_local(existing, "anyone", "age1same").unwrap();
+        let parsed: toml::Table = toml::from_str(&result).unwrap();
+        let recipients = parsed["secrets"]["recipients"].as_array().unwrap();
+        assert_eq!(recipients.len(), 1, "duplicate must not be appended twice");
+    }
+
+    #[test]
+    fn append_recipient_creates_recipients_array_when_secrets_table_empty() {
+        // `[secrets]` exists but no recipients yet (e.g. user hand-
+        // initialised a different field first).
+        let existing = r#"[secrets]
+identity = "~/.config/yui/age.txt"
+"#;
+        let result = append_recipient_to_local(existing, "h", "age1new").unwrap();
+        let parsed: toml::Table = toml::from_str(&result).unwrap();
+        let secrets = parsed["secrets"].as_table().unwrap();
+        assert_eq!(
+            secrets["identity"].as_str(),
+            Some("~/.config/yui/age.txt"),
+            "existing identity field must survive"
+        );
+        let recipients = secrets["recipients"].as_array().unwrap();
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(recipients[0].as_str(), Some("age1new"));
     }
 
     /// Secrets feature is opt-in: an empty `[secrets] recipients`
