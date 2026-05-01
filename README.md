@@ -308,12 +308,16 @@ Need to absorb a single file regardless of policy? `yui absorb
 | `yui link [--dry-run]` | alias for apply (kept for muscle memory) |
 | `yui list [--all] [--icons MODE] [--no-color]` | every src→dst mapping |
 | `yui status [--icons MODE] [--no-color]` | drift overview, exits non-zero on any divergence |
-| `yui absorb <target> [--dry-run]` | manually pull a single target into source |
+| `yui diff [--icons MODE] [--no-color]` | unified diff of every drifted entry (link or render) |
+| `yui absorb <target> [--dry-run] [--yes]` | pull one target into source — prints diff, confirms (`--yes` to skip) |
 | `yui unlink <path>...` | tear down a specific link |
+| `yui update [--dry-run]` | `git pull --ff-only` source repo, then re-apply |
+| `yui unmanaged [--icons MODE] [--no-color]` | list source files no `[[mount.entry]]` claims |
 | `yui doctor` | environment sanity check |
 | `yui gc-backup [--older-than DUR] [--dry-run]` | survey or prune `.yui/backup/` snapshots by suffix age |
 | `yui hooks list` | show configured `[[hook]]` entries + last-run state |
 | `yui hooks run [<name>] [--force]` | run hooks on demand (bypassing `when_run` with `--force`) |
+| `yui completion <shell>` | print shell completion (bash / zsh / fish / powershell / elvish) |
 
 `--icons` accepts `unicode` (default), `nerd` (Nerd-Font glyphs),
 `ascii` (CI-log-safe). The `[ui] icons = "..."` config key sets it

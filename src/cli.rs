@@ -1,7 +1,8 @@
 use anyhow::Result;
 use camino::Utf8PathBuf;
 use clap::builder::styling::{AnsiColor, Effects, Styles};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 
 use crate::cmd;
 use crate::config::IconsMode;
@@ -98,11 +99,19 @@ pub enum Command {
         no_color: bool,
     },
 
-    /// Manually absorb a target into source (when auto-absorb skipped)
+    /// Manually absorb a target into source (when auto-absorb skipped).
+    ///
+    /// Prints a unified diff (source vs target) on stderr. Without
+    /// `--yes`, prompts on a TTY before writing; off a TTY refuses
+    /// to act unless `--yes` is given. `--dry-run` only shows the
+    /// diff and exits.
     Absorb {
         target: Utf8PathBuf,
         #[arg(long)]
         dry_run: bool,
+        /// Skip the y/N prompt (still prints the diff).
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Diagnose environment (symlink capability, source detection, etc)
@@ -146,6 +155,56 @@ pub enum Command {
         #[command(subcommand)]
         action: HookAction,
     },
+
+    /// Pull source repo and re-apply (`git pull --ff-only` + `apply`).
+    ///
+    /// Refuses to run with a dirty source tree — pulling on top of
+    /// uncommitted changes mixes upstream work with the user's
+    /// in-progress edits in ways that are easy to get wrong. Commit
+    /// (or stash) first.
+    Update {
+        /// Render templates / link targets in dry-run after the pull.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// List source files NOT claimed by any `[[mount.entry]]` — yui's
+    /// "what's just sitting in the repo unused?" report. Skips
+    /// `.yui/`, `.git/`, anything matched by `.yuiignore`, and the
+    /// repo's own meta files (`config*.toml`, `.yuilink`, `.gitignore`,
+    /// `.yuiignore`, `*.tera` template sources).
+    Unmanaged {
+        /// Override [ui] icons mode for this invocation
+        #[arg(long, value_name = "MODE")]
+        icons: Option<IconsMode>,
+        /// Disable color output (also respected via NO_COLOR env)
+        #[arg(long)]
+        no_color: bool,
+    },
+
+    /// Print a unified diff for every entry that's drifted from
+    /// source — like `status` but with full content. Render-drift
+    /// rows show the rendered file vs what the template would
+    /// produce now; link-drift rows show source vs target.
+    Diff {
+        /// Override [ui] icons mode for this invocation
+        #[arg(long, value_name = "MODE")]
+        icons: Option<IconsMode>,
+        /// Disable color output (also respected via NO_COLOR env)
+        #[arg(long)]
+        no_color: bool,
+    },
+
+    /// Generate shell completion script for `<shell>` to stdout.
+    ///
+    /// Pipe into the right place for your shell, e.g.
+    /// `yui completion bash > ~/.local/share/bash-completion/completions/yui`,
+    /// `yui completion zsh   > "${fpath[1]}/_yui"`,
+    /// `yui completion pwsh  | Out-String | Invoke-Expression`.
+    Completion {
+        /// Target shell (bash / zsh / fish / powershell / elvish).
+        shell: Shell,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -187,7 +246,11 @@ impl Cli {
                 icons,
                 no_color,
             } => cmd::list(source, all, icons, no_color),
-            Command::Absorb { target, dry_run } => cmd::absorb(source, target, dry_run),
+            Command::Absorb {
+                target,
+                dry_run,
+                yes,
+            } => cmd::absorb(source, target, dry_run, yes),
             Command::Doctor { icons, no_color } => cmd::doctor(source, icons, no_color),
             Command::GcBackup {
                 older_than,
@@ -199,6 +262,14 @@ impl Cli {
                 HookAction::List { icons, no_color } => cmd::hooks_list(source, icons, no_color),
                 HookAction::Run { name, force } => cmd::hooks_run(source, name, force),
             },
+            Command::Update { dry_run } => cmd::update(source, dry_run),
+            Command::Unmanaged { icons, no_color } => cmd::unmanaged(source, icons, no_color),
+            Command::Diff { icons, no_color } => cmd::diff(source, icons, no_color),
+            Command::Completion { shell } => {
+                let mut cmd = Cli::command();
+                clap_complete::generate(shell, &mut cmd, "yui", &mut std::io::stdout());
+                Ok(())
+            }
         }
     }
 }

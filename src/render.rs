@@ -104,6 +104,52 @@ pub fn render_all(
     Ok(report)
 }
 
+/// Render a single template and return the body it would produce
+/// right now, or `Ok(None)` if `{# yui:when … #}` / a config rule
+/// `when` would skip it for the current host. Used by `yui diff`
+/// to compute what the rendered file *should* contain so the
+/// drift can be diffed against what's actually on disk.
+///
+/// Mirrors `process_template`'s skip / render decisions exactly,
+/// but doesn't touch the report or the on-disk rendered output.
+pub fn render_to_string(
+    template_path: &Utf8Path,
+    source: &Utf8Path,
+    config: &Config,
+    yui: &YuiVars,
+) -> Result<Option<String>> {
+    let raw = std::fs::read_to_string(template_path)
+        .map_err(|e| Error::Template(format!("read {template_path}: {e}")))?;
+    let mut engine = Engine::new();
+    let ctx = template::template_context(yui, &config.vars);
+    let rules = compile_rules(&config.render.rule)?;
+
+    let body_input = if let Some((expr, body)) = split_yui_when(&raw) {
+        if !eval_when(expr, &mut engine, &ctx)? {
+            return Ok(None);
+        }
+        body.to_string()
+    } else {
+        raw
+    };
+
+    let rel = relative_to(source, template_path);
+    let rel_for_match = rel.as_str().replace('\\', "/");
+    for rule in &rules {
+        // Nested ifs (not let-chains) so the crate's MSRV
+        // (rust-version = "1.85") stays buildable.
+        if rule.matcher.is_match(&rel_for_match) {
+            if let Some(w) = &rule.when {
+                if !eval_when(w, &mut engine, &ctx)? {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    Ok(Some(engine.render(&body_input, &ctx)?))
+}
+
 struct CompiledRule {
     matcher: GlobSet,
     when: Option<String>,
