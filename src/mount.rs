@@ -1,7 +1,7 @@
-//! Resolve `[[mount.entry]]` definitions: render `dst` via Tera, evaluate
-//! `when`, drop disabled entries.
+//! Resolve `[[mount.entry]]` definitions: render `src` and `dst` via
+//! Tera, evaluate `when`, drop disabled entries.
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use tera::Context;
 
 use crate::Result;
@@ -9,15 +9,23 @@ use crate::config::{MountEntry, MountStrategy};
 use crate::paths;
 use crate::template::{self, Engine};
 
-/// A mount entry after Tera rendering of `dst` and `when`-filtering.
+/// A mount entry after Tera rendering, tilde expansion, and
+/// `when`-filtering. Both `src` and `dst` are absolute paths.
 #[derive(Debug, Clone)]
 pub struct ResolvedMount {
+    /// Absolute path to the source subtree. For relative inputs this
+    /// is `<source>/<entry.src>`; absolute / `~`-relative inputs land
+    /// where the user pointed. Letting `src` escape the dotfiles repo
+    /// is intentional — it's how a separate private clone (e.g.
+    /// `~/.dotfiles-private/home`) participates as a mount without
+    /// having to live under `$DOTFILES`.
     pub src: Utf8PathBuf,
     pub dst: Utf8PathBuf,
     pub strategy: MountStrategy,
 }
 
 pub fn resolve(
+    source: &Utf8Path,
     entries: &[MountEntry],
     default_strategy: MountStrategy,
     engine: &mut Engine,
@@ -36,10 +44,12 @@ pub fn resolve(
                 continue;
             }
         }
+        let src_str = engine.render(e.src.as_str(), ctx)?;
+        let src = paths::resolve_mount_src(source, src_str.trim());
         let dst_str = engine.render(&e.dst, ctx)?;
         let dst = paths::expand_tilde(dst_str.trim());
         out.push(ResolvedMount {
-            src: e.src.clone(),
+            src,
             dst,
             strategy: e.strategy.unwrap_or(default_strategy),
         });
@@ -63,6 +73,10 @@ mod tests {
         }
     }
 
+    fn source() -> Utf8PathBuf {
+        Utf8PathBuf::from("/dotfiles")
+    }
+
     #[test]
     fn renders_dst_and_filters_when_false() {
         let entries = vec![
@@ -81,9 +95,11 @@ mod tests {
         ];
         let mut e = Engine::new();
         let ctx = template::config_context(&vars());
-        let resolved = resolve(&entries, MountStrategy::Marker, &mut e, &ctx).unwrap();
+        let s = source();
+        let resolved = resolve(&s, &entries, MountStrategy::Marker, &mut e, &ctx).unwrap();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].src, Utf8PathBuf::from("home"));
+        // Relative `src` is resolved against the source root.
+        assert_eq!(resolved[0].src, Utf8PathBuf::from("/dotfiles/home"));
         assert_eq!(resolved[0].dst, Utf8PathBuf::from("/linux/u"));
         assert_eq!(resolved[0].strategy, MountStrategy::Marker);
     }
@@ -98,7 +114,8 @@ mod tests {
         }];
         let mut e = Engine::new();
         let ctx = template::config_context(&vars());
-        let resolved = resolve(&entries, MountStrategy::Marker, &mut e, &ctx).unwrap();
+        let s = source();
+        let resolved = resolve(&s, &entries, MountStrategy::Marker, &mut e, &ctx).unwrap();
         assert_eq!(resolved.len(), 1);
     }
 
@@ -116,7 +133,8 @@ mod tests {
         }];
         let mut e = Engine::new();
         let ctx = template::config_context(&vars());
-        let resolved = resolve(&entries, MountStrategy::Marker, &mut e, &ctx).unwrap();
+        let s = source();
+        let resolved = resolve(&s, &entries, MountStrategy::Marker, &mut e, &ctx).unwrap();
         assert_eq!(resolved.len(), 1);
     }
 
@@ -130,7 +148,8 @@ mod tests {
         }];
         let mut e = Engine::new();
         let ctx = template::config_context(&vars());
-        let resolved = resolve(&entries, MountStrategy::Marker, &mut e, &ctx).unwrap();
+        let s = source();
+        let resolved = resolve(&s, &entries, MountStrategy::Marker, &mut e, &ctx).unwrap();
         assert!(resolved.is_empty());
     }
 
@@ -144,7 +163,48 @@ mod tests {
         }];
         let mut e = Engine::new();
         let ctx = template::config_context(&vars());
-        let resolved = resolve(&entries, MountStrategy::Marker, &mut e, &ctx).unwrap();
+        let s = source();
+        let resolved = resolve(&s, &entries, MountStrategy::Marker, &mut e, &ctx).unwrap();
         assert_eq!(resolved[0].strategy, MountStrategy::PerFile);
+    }
+
+    /// Absolute `src` lets a separate (e.g. private) clone outside
+    /// `$DOTFILES` participate as a mount without symlinking. The
+    /// resolver returns the absolute path verbatim.
+    #[test]
+    fn absolute_src_is_returned_verbatim() {
+        let entries = vec![MountEntry {
+            src: "/abs/private/home".into(),
+            dst: "/h".into(),
+            when: None,
+            strategy: None,
+        }];
+        let mut e = Engine::new();
+        let ctx = template::config_context(&vars());
+        let s = source();
+        let resolved = resolve(&s, &entries, MountStrategy::Marker, &mut e, &ctx).unwrap();
+        assert_eq!(resolved[0].src, Utf8PathBuf::from("/abs/private/home"));
+    }
+
+    /// Tera renders against the same context the call site builds
+    /// (yui.* + vars.*). Letting `src` use `{{ yui.host }}` etc.
+    /// makes per-machine source dirs trivial.
+    #[test]
+    fn src_renders_via_tera() {
+        let entries = vec![MountEntry {
+            src: "private/{{ yui.host }}/home".into(),
+            dst: "/h".into(),
+            when: None,
+            strategy: None,
+        }];
+        let mut e = Engine::new();
+        let ctx = template::config_context(&vars());
+        let s = source();
+        let resolved = resolve(&s, &entries, MountStrategy::Marker, &mut e, &ctx).unwrap();
+        // vars().host is "test"
+        assert_eq!(
+            resolved[0].src,
+            Utf8PathBuf::from("/dotfiles/private/test/home")
+        );
     }
 }

@@ -40,6 +40,21 @@ pub fn home_dir() -> Option<Utf8PathBuf> {
         .map(Utf8PathBuf::from)
 }
 
+/// Resolve a `[[mount.entry]] src = "..."` value to an absolute
+/// path. `~` and `~/...` expand to the home directory; absolute
+/// inputs are returned verbatim (so a private clone at
+/// `~/.dotfiles-private/home` mounts directly without symlinking).
+/// Anything else is treated as relative to `source` (the dotfiles
+/// repo root) — the historical default.
+///
+/// Implementation detail: `Utf8PathBuf::join` already replaces the
+/// base with absolute arguments, so we just need `expand_tilde`
+/// first to handle the `~` form.
+pub fn resolve_mount_src(source: &Utf8Path, src: &str) -> Utf8PathBuf {
+    let expanded = expand_tilde(src);
+    source.join(expanded)
+}
+
 /// One-shot `.yuiignore` test for a single path under `source`.
 ///
 /// Builds a fresh `YuiIgnoreStack`, pushes every directory between

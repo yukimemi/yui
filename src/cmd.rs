@@ -223,6 +223,7 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
 
     // 2. Resolve mounts and link.
     let mounts = mount::resolve(
+        &source,
         &config.mount.entry,
         config.mount.default_strategy,
         &mut engine,
@@ -253,7 +254,7 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     let walk_result = (|| -> Result<()> {
         for m in &mounts {
             info!("mount: {} → {}", m.src, m.dst);
-            process_mount(&source, m, &ctx, &mut engine, &tera_ctx, &mut yuiignore)?;
+            process_mount(m, &ctx, &mut engine, &tera_ctx, &mut yuiignore)?;
         }
         Ok(())
     })();
@@ -691,11 +692,15 @@ pub fn unmanaged(
     // platform) still own their files on principle, and surfacing
     // them as "unmanaged" would just be confusing. (Caught in
     // PR #53 review.)
+    // Raw `config.mount.entry` (not `mount::resolve`) so inactive
+    // mounts still claim their files; `paths::resolve_mount_src`
+    // applies `~`/absolute handling so private clones outside
+    // `$DOTFILES` participate too.
     let mount_srcs: Vec<Utf8PathBuf> = config
         .mount
         .entry
         .iter()
-        .map(|e| source.join(&e.src))
+        .map(|e| paths::resolve_mount_src(&source, e.src.as_str()))
         .collect();
 
     let mut items: Vec<Utf8PathBuf> = Vec::new();
@@ -817,6 +822,7 @@ pub fn diff(
     let mut engine = template::Engine::new();
     let tera_ctx = template::template_context(&yui, &config.vars);
     let mounts = mount::resolve(
+        &source,
         &config.mount.entry,
         config.mount.default_strategy,
         &mut engine,
@@ -832,7 +838,7 @@ pub fn diff(
     yuiignore.push_dir(&source)?;
     let walk_result = (|| -> Result<()> {
         for m in &mounts {
-            let src_root = source.join(&m.src);
+            let src_root = m.src.clone();
             if !src_root.is_dir() {
                 continue;
             }
@@ -1075,6 +1081,7 @@ pub fn status(
     let mut engine = template::Engine::new();
     let tera_ctx = template::template_context(&yui, &config.vars);
     let mounts = mount::resolve(
+        &source,
         &config.mount.entry,
         config.mount.default_strategy,
         &mut engine,
@@ -1109,7 +1116,7 @@ pub fn status(
     yuiignore.push_dir(&source)?;
     let walk_result = (|| -> Result<()> {
         for m in &mounts {
-            let src_root = source.join(&m.src);
+            let src_root = m.src.clone();
             if !src_root.is_dir() {
                 warn!("mount src missing: {src_root}");
                 continue;
@@ -1628,7 +1635,8 @@ fn find_source_for_target(
         let dst_str = engine.render(&entry.dst, tera_ctx)?;
         let dst_root = paths::expand_tilde(dst_str.trim());
         if let Ok(rel) = target.strip_prefix(&dst_root) {
-            let candidate = source.join(&entry.src).join(rel);
+            let src_str = engine.render(entry.src.as_str(), tera_ctx)?;
+            let candidate = paths::resolve_mount_src(source, src_str.trim()).join(rel);
             // Honor `.yuiignore` even on manual absorb — if you've
             // ignored a path, you've explicitly opted out of yui's
             // managing it. One-shot stack walk along the candidate's
@@ -2685,14 +2693,15 @@ pub fn hooks_run(source: Option<Utf8PathBuf>, name: Option<String>, force: bool)
 
 #[allow(clippy::too_many_arguments)]
 fn process_mount(
-    source: &Utf8Path,
     m: &ResolvedMount,
     ctx: &ApplyCtx<'_>,
     engine: &mut template::Engine,
     tera_ctx: &TeraContext,
     yuiignore: &mut paths::YuiIgnoreStack,
 ) -> Result<()> {
-    let src_root = source.join(&m.src);
+    // `m.src` is already absolute (resolved by `mount::resolve`),
+    // so we don't need the source-root anymore.
+    let src_root = m.src.clone();
     if !src_root.is_dir() {
         warn!("mount src missing: {src_root}");
         return Ok(());
