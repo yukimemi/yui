@@ -684,24 +684,31 @@ pub fn unmanaged(
     let _icons = Icons::for_mode(icons_override.unwrap_or(config.ui.icons));
     let color = !no_color && supports_color_stdout();
 
-    // Resolve every mount.src to an absolute path under source so a
-    // simple `path.starts_with(&mount_src)` test can answer
-    // "claimed?". We use the *raw* config entries instead of
-    // `mount::resolve` because the latter filters by `when` —
-    // inactive mounts (e.g. an OS-specific mount for a different
-    // platform) still own their files on principle, and surfacing
-    // them as "unmanaged" would just be confusing. (Caught in
-    // PR #53 review.)
-    // Raw `config.mount.entry` (not `mount::resolve`) so inactive
-    // mounts still claim their files; `paths::resolve_mount_src`
-    // applies `~`/absolute handling so private clones outside
-    // `$DOTFILES` participate too.
+    // Resolve every mount.src to an absolute path so a simple
+    // `path.starts_with(&mount_src)` test can answer "claimed?".
+    //
+    //   - Iterate raw `config.mount.entry` (NOT `mount::resolve`)
+    //     so a `when=false` mount still claims its files — surfacing
+    //     them as "unmanaged" because they're inactive on this host
+    //     would be confusing. (PR #53 review.)
+    //   - Tera-render `entry.src` first so a templated path like
+    //     `"private/{{ yui.host }}/home"` claims its files on
+    //     this host rather than landing in `mount_srcs` as the
+    //     literal raw string. (PR #56 review.)
+    //   - `paths::resolve_mount_src` then applies tilde / absolute
+    //     handling so private clones outside `$DOTFILES`
+    //     participate too.
+    let mut engine = template::Engine::new();
+    let tera_ctx = template::template_context(&yui, &config.vars);
     let mount_srcs: Vec<Utf8PathBuf> = config
         .mount
         .entry
         .iter()
-        .map(|e| paths::resolve_mount_src(&source, e.src.as_str()))
-        .collect();
+        .map(|e| -> Result<Utf8PathBuf> {
+            let rendered = engine.render(e.src.as_str(), &tera_ctx)?;
+            Ok(paths::resolve_mount_src(&source, rendered.trim()))
+        })
+        .collect::<Result<_>>()?;
 
     let mut items: Vec<Utf8PathBuf> = Vec::new();
     let walker = paths::source_walker(&source).build();
