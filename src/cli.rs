@@ -195,6 +195,12 @@ pub enum Command {
         no_color: bool,
     },
 
+    /// Manage secret files (`*.age`, encrypted with age).
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
+
     /// Generate shell completion script for `<shell>` to stdout.
     ///
     /// Pipe into the right place for your shell, e.g.
@@ -204,6 +210,36 @@ pub enum Command {
     Completion {
         /// Target shell (bash / zsh / fish / powershell / elvish).
         shell: Shell,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SecretAction {
+    /// Generate an X25519 keypair, write the secret to
+    /// `[secrets] identity` (`~/.config/yui/age.txt` by default),
+    /// and append the public key to `[secrets] recipients` in
+    /// `$DOTFILES/config.local.toml`. Idempotent — refuses to
+    /// overwrite an existing identity file.
+    Init {
+        /// Append a comment block above the new recipient entry
+        /// (defaults to "<host> <user>" — yui.host / yui.user).
+        #[arg(long, value_name = "TEXT")]
+        comment: Option<String>,
+    },
+    /// Read `<path>` (absolute or relative to `$DOTFILES`) as
+    /// plaintext, encrypt it to every recipient in
+    /// `[secrets] recipients`, and write the ciphertext as
+    /// `<path>.age` next to it. Refuses to clobber an existing
+    /// `.age` without `--force`.
+    Encrypt {
+        path: Utf8PathBuf,
+        /// Replace an existing `<path>.age`.
+        #[arg(long)]
+        force: bool,
+        /// Delete the plaintext after a successful encryption
+        /// (only works when the plaintext lives under `$DOTFILES`).
+        #[arg(long)]
+        rm_plaintext: bool,
     },
 }
 
@@ -265,6 +301,14 @@ impl Cli {
             Command::Update { dry_run } => cmd::update(source, dry_run),
             Command::Unmanaged { icons, no_color } => cmd::unmanaged(source, icons, no_color),
             Command::Diff { icons, no_color } => cmd::diff(source, icons, no_color),
+            Command::Secret { action } => match action {
+                SecretAction::Init { comment } => cmd::secret_init(source, comment),
+                SecretAction::Encrypt {
+                    path,
+                    force,
+                    rm_plaintext,
+                } => cmd::secret_encrypt(source, path, force, rm_plaintext),
+            },
             Command::Completion { shell } => {
                 let mut cmd = Cli::command();
                 clap_complete::generate(shell, &mut cmd, "yui", &mut std::io::stdout());

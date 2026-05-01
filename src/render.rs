@@ -303,6 +303,18 @@ fn collect_managed_paths(report: &RenderReport) -> Vec<Utf8PathBuf> {
     all
 }
 
+/// Write or replace yui's managed `.gitignore` section in the
+/// repo root, listing every absolute path the apply pipeline
+/// produced as a sibling-without-suffix (rendered `.tera` outputs
+/// AND decrypted `.age` outputs share this section). The block is
+/// delimited by `# >>> yui rendered (auto-managed) >>>` /
+/// `# <<< yui rendered (auto-managed) <<<` so successive runs
+/// idempotently rewrite it without disturbing user content above
+/// or below.
+pub fn write_managed_section(source: &Utf8Path, managed_abs_paths: &[Utf8PathBuf]) -> Result<()> {
+    update_gitignore(source, managed_abs_paths)
+}
+
 fn update_gitignore(source: &Utf8Path, rendered_abs_paths: &[Utf8PathBuf]) -> Result<()> {
     let gi_path = source.join(".gitignore");
     let existing = match std::fs::read_to_string(&gi_path) {
