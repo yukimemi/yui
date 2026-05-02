@@ -2,6 +2,7 @@
 //!
 //! Each `Command` variant in `cli.rs` calls one of these.
 
+use std::cell::Cell;
 use std::fmt::Write as _;
 
 use anyhow::{Context as _, Result};
@@ -272,6 +273,8 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
         dir_mode: resolve_dir_mode(config.link.dir_mode),
         backup_root: &backup_root,
         dry_run,
+        sticky_anomaly: Cell::new(None),
+        quit_requested: Cell::new(false),
     };
 
     info!("source: {source}");
@@ -344,6 +347,23 @@ fn log_secret_report(r: &secret::SecretReport) {
 /// (push on dir entry, pop on dir exit) which doesn't compose with
 /// `ApplyCtx` being shared by `&`. The stack is plumbed through
 /// `walk_and_link` as its own parameter instead.
+/// User-chosen direction for an `[absorb] on_anomaly = "ask"` prompt.
+///
+/// "Absorb" matches yui's default flow (target wins, content lands in
+/// source). "Overwrite" is the inverse for cases where the user just
+/// edited source intentionally and wants target updated to match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnomalyChoice {
+    /// target → source (yui's default, "target is truth").
+    Absorb,
+    /// source → target (user-edited source wins, target updated).
+    Overwrite,
+    /// Leave both as-is for now.
+    Skip,
+    /// Skip this entry and stop walking remaining entries.
+    Quit,
+}
+
 struct ApplyCtx<'a> {
     config: &'a Config,
     /// Source repo root — needed for git-clean checks during absorb.
@@ -352,6 +372,13 @@ struct ApplyCtx<'a> {
     dir_mode: EffectiveDirMode,
     backup_root: &'a Utf8Path,
     dry_run: bool,
+    /// Sticky decision from a previous "all" prompt. When set, every
+    /// subsequent anomaly applies this choice without prompting.
+    sticky_anomaly: Cell<Option<AnomalyChoice>>,
+    /// Set by the `[q]uit` choice. The walker checks this at the top
+    /// of every link op and short-circuits to a no-op so apply exits
+    /// cleanly without further prompts.
+    quit_requested: Cell<bool>,
 }
 
 /// Show the resolved src→dst mappings for the current source repo.
@@ -1943,6 +1970,8 @@ pub fn absorb(
         dir_mode: resolve_dir_mode(config.link.dir_mode),
         backup_root: &backup_root,
         dry_run: false,
+        sticky_anomaly: Cell::new(None),
+        quit_requested: Cell::new(false),
     };
 
     // Manual absorb is an explicit user request — bypass `auto`,
@@ -1955,11 +1984,28 @@ pub fn absorb(
 /// side is a directory or content isn't valid UTF-8 — we'd rather
 /// say "binary file differs" than spew bytes through `similar`.
 fn print_absorb_diff(src: &Utf8Path, dst: &Utf8Path) {
+    use owo_colors::OwoColorize as _;
+    use std::io::IsTerminal;
+
+    let color = std::io::stderr().is_terminal();
+
     eprintln!();
-    eprintln!("--- diff (- source, + target) ---");
-    eprintln!("  src: {src}");
-    eprintln!("  dst: {dst}");
+    if color {
+        eprintln!(
+            "{}  {}  {}",
+            "── unified diff ──".bold(),
+            "[-] src".red().bold(),
+            "[+] dst".green().bold()
+        );
+        eprintln!("  {} {}", "[-] src:".red(), src);
+        eprintln!("  {} {}", "[+] dst:".green(), dst);
+    } else {
+        eprintln!("── unified diff ──  [-] src   [+] dst");
+        eprintln!("  [-] src: {src}");
+        eprintln!("  [+] dst: {dst}");
+    }
     eprintln!();
+
     if src.is_dir() || dst.is_dir() {
         eprintln!("(directory absorb — content listing skipped)");
         eprintln!();
@@ -1981,12 +2027,46 @@ fn print_absorb_diff(src: &Utf8Path, dst: &Utf8Path) {
             return;
         }
     };
+
     let diff = similar::TextDiff::from_lines(&src_content, &dst_content);
-    let formatted = diff
-        .unified_diff()
-        .header(src.as_str(), dst.as_str())
-        .to_string();
-    eprint!("{formatted}");
+    // Walk hunks ourselves so we can colorize each line by tag — the
+    // built-in `unified_diff().to_string()` returns one flat string
+    // with no ANSI escapes.
+    for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
+        let header = hunk.header().to_string();
+        if color {
+            eprintln!("{}", header.cyan());
+        } else {
+            eprintln!("{header}");
+        }
+        for change in hunk.iter_changes() {
+            let line = change.value();
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            match change.tag() {
+                similar::ChangeTag::Delete => {
+                    if color {
+                        eprintln!("{} {}", "-".red().bold(), line.red());
+                    } else {
+                        eprintln!("- {line}");
+                    }
+                }
+                similar::ChangeTag::Insert => {
+                    if color {
+                        eprintln!("{} {}", "+".green().bold(), line.green());
+                    } else {
+                        eprintln!("+ {line}");
+                    }
+                }
+                similar::ChangeTag::Equal => {
+                    if color {
+                        eprintln!("  {}", line.dimmed());
+                    } else {
+                        eprintln!("  {line}");
+                    }
+                }
+            }
+        }
+    }
     eprintln!();
 }
 
@@ -3240,6 +3320,10 @@ fn walk_and_link_body(
 fn link_file_with_backup(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>) -> Result<()> {
     use absorb::AbsorbDecision::*;
 
+    if ctx.quit_requested.get() {
+        return Ok(());
+    }
+
     let decision = absorb::classify(src, dst)?;
 
     if ctx.dry_run {
@@ -3307,6 +3391,19 @@ fn absorb_target_into_source(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>)
     Ok(())
 }
 
+/// Inverse of `absorb_target_into_source`: keep source's content,
+/// throw away target's diverged content (after backing it up), and
+/// re-link target so it once again reflects source. Used when the
+/// user picks `[o]verwrite` at the anomaly prompt — i.e. they edited
+/// source intentionally and want the target updated to match.
+fn overwrite_source_into_target(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>) -> Result<()> {
+    info!("overwrite: {src} → {dst}");
+    backup_existing(dst, ctx.backup_root, /* is_dir */ false)?;
+    link::unlink(dst)?;
+    link::link_file(src, dst, ctx.file_mode)?;
+    Ok(())
+}
+
 /// Decide what to do for an anomaly (NeedsConfirm or AutoAbsorb that was
 /// escalated by `auto = false` / dirty git). Per `[absorb] on_anomaly`:
 ///   - `skip`  → log warning, leave target alone
@@ -3323,28 +3420,99 @@ fn handle_anomaly(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>, reason: &s
             warn!("anomaly force: {dst} ({reason}) — absorbing target into source");
             absorb_target_into_source(src, dst, ctx)
         }
-        Ask => {
-            use std::io::IsTerminal;
-            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-                if prompt_absorb_with_diff(src, dst, reason)? {
-                    absorb_target_into_source(src, dst, ctx)
-                } else {
-                    warn!("anomaly skipped by user: {dst}");
-                    Ok(())
-                }
-            } else {
-                warn!("anomaly skip (non-TTY ask mode): {dst} ({reason})");
+        Ask => match prompt_anomaly(ctx, src, dst, reason)? {
+            AnomalyChoice::Absorb => absorb_target_into_source(src, dst, ctx),
+            AnomalyChoice::Overwrite => overwrite_source_into_target(src, dst, ctx),
+            AnomalyChoice::Skip => {
+                warn!("anomaly skipped by user: {dst}");
                 Ok(())
             }
-        }
+            AnomalyChoice::Quit => {
+                warn!("anomaly: user requested quit; stopping apply at {dst}");
+                ctx.quit_requested.set(true);
+                Ok(())
+            }
+        },
     }
 }
 
-fn prompt_absorb_with_diff(src: &Utf8Path, dst: &Utf8Path, reason: &str) -> Result<bool> {
+/// Multi-choice TTY prompt for an anomaly.
+///
+/// Replaces the old binary y/N "absorb?" prompt with chezmoi-style
+/// per-direction options plus uppercase "all-remaining" variants. The
+/// caller is responsible for performing the chosen action; this
+/// function only resolves the user's intent.
+///
+/// Sticky behaviour: if a prior prompt selected an `[A]/[O]/[S]` "all"
+/// option, that choice short-circuits subsequent prompts via
+/// `ctx.sticky_anomaly`. `[q]uit` flips `ctx.quit_requested` so the
+/// walker stops calling per-entry link ops.
+///
+/// Off-TTY: returns `Skip` immediately (caller logs the downgrade) —
+/// matches the previous "non-TTY ask = skip" behaviour. Quit is not
+/// possible without a TTY because there is nothing to interact with.
+fn prompt_anomaly(
+    ctx: &ApplyCtx<'_>,
+    src: &Utf8Path,
+    dst: &Utf8Path,
+    reason: &str,
+) -> Result<AnomalyChoice> {
+    if let Some(c) = ctx.sticky_anomaly.get() {
+        return Ok(c);
+    }
+
+    use std::io::IsTerminal;
+    use std::io::Write as _;
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Ok(AnomalyChoice::Skip);
+    }
+
     eprintln!();
     eprintln!("anomaly: {reason}");
+    eprintln!("  src: {src}");
+    eprintln!("  dst: {dst}");
     print_absorb_diff(src, dst);
-    prompt_yes_no("absorb target into source?")
+
+    loop {
+        eprintln!("  [a/A] absorb     target → source   (this / all remaining)");
+        eprintln!("  [o/O] overwrite  source → target   (this / all remaining)");
+        eprintln!("  [s/S] skip       leave as-is       (this / all remaining)");
+        eprintln!("  [d]   diff       re-show the diff");
+        eprintln!("  [q]   quit       skip this and stop apply");
+        eprint!("choice [s]: ");
+        std::io::stderr().flush().ok();
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let trimmed = input.trim();
+        let choice = match trimmed {
+            "" | "s" => AnomalyChoice::Skip,
+            "a" => AnomalyChoice::Absorb,
+            "o" => AnomalyChoice::Overwrite,
+            "q" => AnomalyChoice::Quit,
+            "A" => {
+                ctx.sticky_anomaly.set(Some(AnomalyChoice::Absorb));
+                AnomalyChoice::Absorb
+            }
+            "O" => {
+                ctx.sticky_anomaly.set(Some(AnomalyChoice::Overwrite));
+                AnomalyChoice::Overwrite
+            }
+            "S" => {
+                ctx.sticky_anomaly.set(Some(AnomalyChoice::Skip));
+                AnomalyChoice::Skip
+            }
+            "d" => {
+                print_absorb_diff(src, dst);
+                continue;
+            }
+            other => {
+                eprintln!("unknown choice: {other:?}");
+                continue;
+            }
+        };
+        return Ok(choice);
+    }
 }
 
 /// Resilient git-clean check: if `git` isn't available or `source` isn't
@@ -3363,6 +3531,11 @@ fn source_repo_is_clean(source: &Utf8Path) -> bool {
 
 fn link_dir_with_backup(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>) -> Result<()> {
     use absorb::AbsorbDecision::*;
+
+    if ctx.quit_requested.get() {
+        return Ok(());
+    }
+
     let decision = absorb::classify(src, dst)?;
 
     if ctx.dry_run {
@@ -3612,24 +3785,30 @@ fn merge_resolve_file_conflict(
                     Ok(())
                 }
                 Ask => {
-                    use std::io::IsTerminal;
-                    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-                        if prompt_absorb_with_diff(
-                            source_path,
-                            target_path,
-                            "merge: file content differs and source is newer",
-                        )? {
+                    let choice = prompt_anomaly(
+                        ctx,
+                        source_path,
+                        target_path,
+                        "merge: file content differs and source is newer",
+                    )?;
+                    match choice {
+                        AnomalyChoice::Absorb => {
                             std::fs::copy(target_path, source_path)?;
-                        } else {
-                            warn!("merge: kept source version by user choice: {source_path}");
+                            Ok(())
                         }
-                        Ok(())
-                    } else {
-                        warn!(
-                            "merge anomaly skip (non-TTY ask mode): {target_path} \
-                             — keeping source version"
-                        );
-                        Ok(())
+                        AnomalyChoice::Overwrite => {
+                            std::fs::copy(source_path, target_path)?;
+                            Ok(())
+                        }
+                        AnomalyChoice::Skip => {
+                            warn!("merge: kept source version by user choice: {source_path}");
+                            Ok(())
+                        }
+                        AnomalyChoice::Quit => {
+                            warn!("merge: user requested quit; stopping at {target_path}");
+                            ctx.quit_requested.set(true);
+                            Ok(())
+                        }
                     }
                 }
             }
@@ -3649,6 +3828,22 @@ fn absorb_target_dir_into_source(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<
     merge_dir_target_into_source(dst, src, ctx)?;
     // Source now carries every regular file from target. Tear down the
     // original target dir and re-expose source via a junction.
+    remove_dir_link_or_real(dst)?;
+    link::link_dir(src, dst, ctx.dir_mode)?;
+    Ok(())
+}
+
+/// Inverse of `absorb_target_dir_into_source`: keep source's dir
+/// content as-is, back up target's diverged content, then re-expose
+/// source via a junction at the target path. Used when the user
+/// picks `[o]verwrite` for a dir-level anomaly.
+fn overwrite_source_dir_into_target(
+    src: &Utf8Path,
+    dst: &Utf8Path,
+    ctx: &ApplyCtx<'_>,
+) -> Result<()> {
+    info!("overwrite dir: {src} → {dst}");
+    backup_existing(dst, ctx.backup_root, /* is_dir */ true)?;
     remove_dir_link_or_real(dst)?;
     link::link_dir(src, dst, ctx.dir_mode)?;
     Ok(())
@@ -3676,30 +3871,19 @@ fn handle_anomaly_dir(
             );
             absorb_target_dir_into_source(src, dst, ctx)
         }
-        Ask => {
-            use std::io::IsTerminal;
-            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-                eprintln!();
-                eprintln!("anomaly: {dst}");
-                eprintln!("  {reason}");
-                eprintln!("  source: {src}");
-                eprint!("  absorb target dir into source? (y/N) ");
-                use std::io::{BufRead as _, Write as _};
-                std::io::stderr().flush().ok();
-                let mut buf = String::new();
-                std::io::stdin().lock().read_line(&mut buf)?;
-                let answer = buf.trim();
-                if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
-                    absorb_target_dir_into_source(src, dst, ctx)
-                } else {
-                    warn!("anomaly skipped by user: {dst}");
-                    Ok(())
-                }
-            } else {
-                warn!("anomaly skip (non-TTY ask mode): {dst} ({reason})");
+        Ask => match prompt_anomaly(ctx, src, dst, reason)? {
+            AnomalyChoice::Absorb => absorb_target_dir_into_source(src, dst, ctx),
+            AnomalyChoice::Overwrite => overwrite_source_dir_into_target(src, dst, ctx),
+            AnomalyChoice::Skip => {
+                warn!("anomaly skipped by user: {dst}");
                 Ok(())
             }
-        }
+            AnomalyChoice::Quit => {
+                warn!("anomaly dir: user requested quit; stopping apply at {dst}");
+                ctx.quit_requested.set(true);
+                Ok(())
+            }
+        },
     }
 }
 
@@ -5962,5 +6146,132 @@ when = "yui.os == 'definitely_not_a_real_os'"
         assert!(!snap.exists(), "dir snapshot removed wholesale");
         assert!(!backup.join("mirror").exists(), "empty mirror chain pruned");
         assert!(backup.exists(), "backup root preserved");
+    }
+
+    /// Build a no-op `ApplyCtx` over a `TempDir`. The returned tuple
+    /// owns the `Config` + paths so the borrow in `ApplyCtx` is valid
+    /// for the test scope. Callers can mutate the `Cell` fields in
+    /// place.
+    fn ctx_for_test(tmp: &TempDir) -> (Config, Utf8PathBuf, Utf8PathBuf) {
+        let source = utf8(tmp.path().join("src"));
+        let backup_root = source.join(".yui/backup");
+        std::fs::create_dir_all(&source).unwrap();
+        let cfg = Config::default();
+        (cfg, source, backup_root)
+    }
+
+    #[test]
+    fn prompt_anomaly_short_circuits_on_sticky_choice() {
+        // The whole point of sticky: once the user picks an `[A]`/`[O]`/`[S]`
+        // "all" option, every following anomaly applies that choice without
+        // re-prompting. We verify by pre-setting the cell and calling the
+        // prompt with stdin/stderr that would otherwise prompt.
+        let tmp = TempDir::new().unwrap();
+        let (cfg, source, backup_root) = ctx_for_test(&tmp);
+        let src_file = source.join("a");
+        let dst_file = utf8(tmp.path().join("dst"));
+        std::fs::write(&src_file, "X").unwrap();
+        std::fs::write(&dst_file, "Y").unwrap();
+
+        let ctx = ApplyCtx {
+            config: &cfg,
+            source: &source,
+            file_mode: resolve_file_mode(cfg.link.file_mode),
+            dir_mode: resolve_dir_mode(cfg.link.dir_mode),
+            backup_root: &backup_root,
+            dry_run: false,
+            sticky_anomaly: Cell::new(Some(AnomalyChoice::Overwrite)),
+            quit_requested: Cell::new(false),
+        };
+
+        let got = prompt_anomaly(&ctx, &src_file, &dst_file, "test").unwrap();
+        assert_eq!(got, AnomalyChoice::Overwrite);
+    }
+
+    #[test]
+    fn overwrite_source_into_target_replaces_target_and_backs_up() {
+        // `[o]verwrite`'s contract: the user keeps source's content and
+        // discards target's. After the call target reflects source, and
+        // target's old content is preserved under backup so it is
+        // recoverable.
+        let tmp = TempDir::new().unwrap();
+        let (cfg, source, backup_root) = ctx_for_test(&tmp);
+        let src_file = source.join("a");
+        let dst_file = utf8(tmp.path().join("dst"));
+        std::fs::write(&src_file, "from source").unwrap();
+        std::fs::write(&dst_file, "diverged target content").unwrap();
+
+        let ctx = ApplyCtx {
+            config: &cfg,
+            source: &source,
+            file_mode: resolve_file_mode(cfg.link.file_mode),
+            dir_mode: resolve_dir_mode(cfg.link.dir_mode),
+            backup_root: &backup_root,
+            dry_run: false,
+            sticky_anomaly: Cell::new(None),
+            quit_requested: Cell::new(false),
+        };
+
+        overwrite_source_into_target(&src_file, &dst_file, &ctx).unwrap();
+
+        // Target now matches source.
+        assert_eq!(std::fs::read_to_string(&dst_file).unwrap(), "from source");
+        // Source untouched.
+        assert_eq!(std::fs::read_to_string(&src_file).unwrap(), "from source");
+        // The diverged target content survives in backup.
+        let mut found_old = false;
+        for entry in walkdir(&backup_root) {
+            if let Ok(s) = std::fs::read_to_string(&entry) {
+                if s == "diverged target content" {
+                    found_old = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found_old,
+            "expected backup containing target's diverged content"
+        );
+    }
+
+    #[test]
+    fn link_file_with_backup_short_circuits_when_quit_requested() {
+        // After `[q]uit` the walker keeps iterating but `quit_requested`
+        // makes every link op return Ok(()) without touching disk. We
+        // set up a clear anomaly (target older + content differs +
+        // on_anomaly=force, which would otherwise absorb) and verify
+        // nothing changed.
+        let tmp = TempDir::new().unwrap();
+        let (mut cfg, source, backup_root) = ctx_for_test(&tmp);
+        cfg.absorb.on_anomaly = crate::config::AnomalyAction::Force;
+
+        let src_file = source.join("a");
+        let dst_file = utf8(tmp.path().join("dst"));
+        let now = std::time::SystemTime::now();
+        let past = now - std::time::Duration::from_secs(120);
+        write_with_mtime(&dst_file, "target old", past);
+        write_with_mtime(&src_file, "source new", now);
+        let dst_before = std::fs::read_to_string(&dst_file).unwrap();
+        let src_before = std::fs::read_to_string(&src_file).unwrap();
+
+        let ctx = ApplyCtx {
+            config: &cfg,
+            source: &source,
+            file_mode: resolve_file_mode(cfg.link.file_mode),
+            dir_mode: resolve_dir_mode(cfg.link.dir_mode),
+            backup_root: &backup_root,
+            dry_run: false,
+            sticky_anomaly: Cell::new(None),
+            quit_requested: Cell::new(true),
+        };
+
+        link_file_with_backup(&src_file, &dst_file, &ctx).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&dst_file).unwrap(), dst_before);
+        assert_eq!(std::fs::read_to_string(&src_file).unwrap(), src_before);
+        assert!(
+            !backup_root.exists() || walkdir(&backup_root).is_empty(),
+            "no backup should be produced when quit is requested"
+        );
     }
 }
