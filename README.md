@@ -279,17 +279,61 @@ access:
    `yui secret encrypt --force <path>` per file. A `yui secret reencrypt`
    helper is planned.)
 
-### Roadmap: hardware MFA / passkey
+### Carrying the X25519 across machines (vault model)
 
-age has a plugin ecosystem (YubiKey, FIDO2 incl. Pixel 10 Pro
-cross-device passkeys, Touch ID via Secure Enclave, Windows Hello,
-TPM, 1Password). yui v1's identity / recipient parsing is X25519-only
-to keep the bootstrap flow simple, but the data model is plugin-ready;
-plugin support (with the callback plumbing those interactive flows
-need) is planned as a follow-up. Until then you can interoperate at
-the file level by encrypting `.age` files outside yui via `rage` /
-`age-plugin-*` and committing them — yui's X25519 identity can still
-decrypt files that were also wrapped to your X25519 recipient.
+`apply` only ever uses the plain X25519 secret at
+`[secrets].identity` — no device prompts on the hot path. To
+ferry that secret to a new machine, yui wraps a vault provider
+of your choice (**Bitwarden** or **1Password**) so the same
+auth you already use for that vault — master password, biometric,
+passkey unlock in the web vault, SSO — gates the unlock here.
+
+```toml
+[secrets]
+identity   = "~/.config/yui/age.txt"   # X25519 plain, gitignored
+recipients = ["age1abc…"]              # X25519 publics for *.age files
+
+[secrets.vault]
+provider = "bitwarden"                 # or "1password"
+item     = "yui-x25519-identity"       # vault item name
+```
+
+#### Setup (once on the first machine)
+
+```sh
+yui secret init                # generates ~/.config/yui/age.txt
+yui secret store               # pushes the file into the vault Secure Note
+```
+
+#### On each new machine
+
+```sh
+git clone <dotfiles>
+# 1. Authenticate the vault CLI ONCE on this machine:
+bw login && bw unlock          # Bitwarden — or `op signin` for 1Password
+# 2. Pull the X25519 from the vault:
+yui secret unlock              # writes ~/.config/yui/age.txt
+yui apply                      # done
+```
+
+The vault CLI itself is the auth boundary — yui shells out to
+`bw` / `op` and inherits whatever factor that CLI accepts.
+Bitwarden's web vault supports passkey unlock; once you've used
+your Pixel passkey to log into the BW web vault and the CLI
+session is alive, `yui secret unlock` will quietly fetch the
+X25519 with no further prompts.
+
+#### Plugin recipients (advanced, unsupported)
+
+`[secrets].recipients` accepts plugin-flavoured public keys
+(`age1yubikey1…`, `age1fido2-hmac1…`, …) alongside the X25519
+ones. yui doesn't ship first-class commands for plugin
+identities — `apply` decrypts only with the X25519 in
+`[secrets].identity` — but encrypting `*.age` files to
+plugin-backed *recipients* works as long as the matching
+`age-plugin-*` binary is on `$PATH`, so a YubiKey holder can
+decrypt the same file via `age` directly without yui in the
+loop. No support promises, but the path is open.
 
 [age]: https://age-encryption.org/
 

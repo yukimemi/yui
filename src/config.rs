@@ -288,10 +288,34 @@ fn default_backup_dir() -> String {
 /// as "secrets feature off".
 #[derive(Debug, Clone, Deserialize)]
 pub struct SecretsConfig {
+    /// Path to the X25519 secret key used by `apply` to decrypt
+    /// `*.age` files. Plain (`AGE-SECRET-KEY-1…`) text, gitignored.
+    /// Default `~/.config/yui/age.txt`.
     #[serde(default = "default_identity_path")]
     pub identity: String,
+
+    /// Public keys that `*.age` files are encrypted to. X25519
+    /// (`age1…`) is the everyday case and is what `yui secret init`
+    /// adds. Plugin recipients (`age1<plugin>1…`) are also accepted
+    /// — yui doesn't ship first-class commands for them, but if you
+    /// hand-write a YubiKey / FIDO2 / TPM / Secure Enclave / 1P
+    /// recipient here it'll be honored, and the matching
+    /// `age-plugin-*` binary on `$PATH` lets `age` itself decrypt
+    /// those stanzas. (yui's apply uses the X25519 in `identity`
+    /// only, so plugin recipients add a *parallel* decrypt path
+    /// without slowing apply down.)
+    ///
+    /// Empty = secrets feature off.
     #[serde(default)]
     pub recipients: Vec<String>,
+
+    /// Vault provider config — when set, `yui secret store` /
+    /// `yui secret unlock` use it to ferry the X25519 identity
+    /// across machines via Bitwarden / 1Password instead of
+    /// asking the user to copy `~/.config/yui/age.txt` by hand.
+    /// Off when absent.
+    #[serde(default)]
+    pub vault: Option<VaultConfig>,
 }
 
 impl Default for SecretsConfig {
@@ -299,8 +323,37 @@ impl Default for SecretsConfig {
         Self {
             identity: default_identity_path(),
             recipients: Vec::new(),
+            vault: None,
         }
     }
+}
+
+/// `[secrets.vault]` — points yui at a vault item that holds the
+/// X25519 identity. yui doesn't authenticate against the vault
+/// itself; it shells out to the provider's official CLI (`bw` or
+/// `op`), which already knows how to drive its own auth flow
+/// (master password, biometric, passkey-via-web-vault, SSO).
+///
+/// Storage convention: the X25519 secret file's full content
+/// (header comments + the `AGE-SECRET-KEY-1…` line) goes in the
+/// item's notes field. Picking notes (rather than the password
+/// field) keeps the multi-line content intact and doesn't pollute
+/// the vault's password autofill UI.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VaultConfig {
+    /// `"bitwarden"` or `"1password"`.
+    pub provider: VaultProvider,
+    /// Item name / id inside the vault. yui passes this verbatim
+    /// to `bw get item <item>` / `op item get <item>`.
+    pub item: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum VaultProvider {
+    Bitwarden,
+    #[serde(alias = "1password")]
+    OnePassword,
 }
 
 impl SecretsConfig {
