@@ -316,13 +316,36 @@ AGE-PLUGIN-FIDO2-HMAC-1…bitwarden…
 
 ```sh
 yui secret init                       # generates ~/.config/yui/age.txt (X25519)
-# Generate plugin identities once per device — yui doesn't bundle plugins:
-cargo install age-plugin-fido2-hmac
-age-plugin-fido2-hmac --generate >> .yui/passkeys.txt   # Pixel tap
-# (paste recipient line into [secrets].passkey_recipients)
+
+# Install the right age plugin for the device you want as a recovery factor.
+# yui doesn't bundle plugins — pick whichever fits your hardware:
+
+# YubiKey 5 / SoloKey (Rust, easiest install):
+cargo install age-plugin-yubikey
+
+# Pixel passkey / FIDO2 hmac-secret (Go binary, not a crates.io crate):
+go install github.com/olastor/age-plugin-fido2-hmac/cmd/age-plugin-fido2-hmac@latest
+# or download a release binary from
+# https://github.com/olastor/age-plugin-fido2-hmac/releases
+
+# Apple Secure Enclave (Touch ID): age-plugin-se
+# 1Password: age-plugin-1p
+# TPM (machine-bound, NOT portable): age-plugin-tpm
+
+# Then: generate the identity → its public key goes in
+# [secrets].passkey_recipients, the private descriptor in passkeys.txt:
+age-plugin-fido2-hmac --generate >> .yui/passkeys.txt   # Pixel/YubiKey tap
 yui secret wrap                       # encrypts ~/.config/yui/age.txt → .yui/age.txt.age
 git add .yui/passkeys.txt .yui/age.txt.age && git commit
 ```
+
+> **Windows + Pixel cross-device note**: the FIDO2 plugins talk to
+> the device via libfido2, which on Windows requires the OS-level
+> Web Authentication API plus working Bluetooth proximity for the
+> Pixel cross-device flow. YubiKey-over-USB or Touch ID on a Mac
+> are smoother bootstrap targets if you hit BT issues; you can
+> always have multiple `passkey_recipients` so any one device
+> works.
 
 #### One-time on each new machine
 
