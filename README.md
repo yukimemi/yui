@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg" />
-    <img src="assets/logo.svg" width="560" alt="yui — target-as-truth dotfiles manager" />
-  </picture>
+  <img src="assets/logo.svg" width="560" alt="yui — target-as-truth dotfiles manager" />
 </p>
 
 <p align="center">
