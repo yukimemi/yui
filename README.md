@@ -300,7 +300,7 @@ provider = "bitwarden"                 # or "1password"
 The vault item is stored under the fixed name
 `yui-x25519-identity` — yui doesn't expose a per-repo override
 yet (no one's hit the multi-yui-tree-on-one-vault collision in
-practice, so it's stayed hardcoded).
+practice, so it's hardcoded).
 
 #### Setup (once on the first machine)
 
