@@ -1,5 +1,8 @@
+# Required-by-APM but intentionally static. Per CLAUDE.md "Version lives
+# only in Cargo.toml"; this apm.yml is consumer-side and not a publishable
+# APM package, so the version below is a placeholder that should never bump.
 name: yui
-version: 0.7.16
+version: 0.0.0
 description: |
   Dev-consumer APM config for the yui repo. yui itself is a Rust CLI
   and ships no agent primitives; this apm.yml only exists to install
