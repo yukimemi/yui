@@ -2802,7 +2802,7 @@ dependencies = [
 
 [[package]]
 name = "yui-cli"
-version = "0.7.13"
+version = "0.7.14"
 dependencies = [
  "age",
  "anyhow",
