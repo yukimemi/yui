@@ -1987,7 +1987,9 @@ fn print_absorb_diff(src: &Utf8Path, dst: &Utf8Path) {
     use owo_colors::OwoColorize as _;
     use std::io::IsTerminal;
 
-    let color = std::io::stderr().is_terminal();
+    // Honor the de-facto NO_COLOR convention (https://no-color.org/) —
+    // any non-empty value disables colorisation, even on a TTY.
+    let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
 
     eprintln!();
     if color {
@@ -3457,6 +3459,13 @@ fn prompt_anomaly(
     dst: &Utf8Path,
     reason: &str,
 ) -> Result<AnomalyChoice> {
+    // If a previous prompt selected `[q]uit`, every nested call (e.g.
+    // remaining file conflicts inside an in-flight dir merge) returns
+    // `Quit` immediately so we don't ask again, log redundant warnings,
+    // or block on stdin during teardown.
+    if ctx.quit_requested.get() {
+        return Ok(AnomalyChoice::Quit);
+    }
     if let Some(c) = ctx.sticky_anomaly.get() {
         return Ok(c);
     }
@@ -3485,9 +3494,12 @@ fn prompt_anomaly(
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         let trimmed = input.trim();
+        // `y` / `n` are kept as aliases for the previous y/N prompt so
+        // muscle memory keeps working: `y` = "yes, absorb" (target →
+        // source), `n` = "no, leave it" (skip).
         let choice = match trimmed {
-            "" | "s" => AnomalyChoice::Skip,
-            "a" => AnomalyChoice::Absorb,
+            "" | "s" | "n" => AnomalyChoice::Skip,
+            "a" | "y" => AnomalyChoice::Absorb,
             "o" => AnomalyChoice::Overwrite,
             "q" => AnomalyChoice::Quit,
             "A" => {
@@ -3645,6 +3657,15 @@ fn merge_dir_target_into_source(
     ctx: &ApplyCtx<'_>,
 ) -> Result<()> {
     for entry in std::fs::read_dir(target)? {
+        // If the user picked `[q]uit` at a previous file-conflict
+        // prompt, every remaining entry in this dir merge becomes a
+        // no-op. The enclosing `absorb_target_dir_into_source` checks
+        // the same flag *after* the merge returns and skips the
+        // teardown/relink that would otherwise complete the absorb
+        // the user just asked us to abandon.
+        if ctx.quit_requested.get() {
+            return Ok(());
+        }
         let entry = entry?;
         let name_os = entry.file_name();
         let Some(name) = name_os.to_str() else {
@@ -3797,6 +3818,13 @@ fn merge_resolve_file_conflict(
                             Ok(())
                         }
                         AnomalyChoice::Overwrite => {
+                            // Preserve target's diverged content before
+                            // we clobber it with source's. The enclosing
+                            // dir absorb later removes target's tree
+                            // wholesale, so without this backup the
+                            // pre-overwrite state is unrecoverable.
+                            // Mirrors the file-level overwrite path.
+                            backup_existing(target_path, ctx.backup_root, /* is_dir */ false)?;
                             std::fs::copy(source_path, target_path)?;
                             Ok(())
                         }
@@ -3826,6 +3854,20 @@ fn absorb_target_dir_into_source(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<
     info!("absorb dir: {dst} → {src}");
     backup_existing(src, ctx.backup_root, /* is_dir */ true)?;
     merge_dir_target_into_source(dst, src, ctx)?;
+    // If the user picked `[q]uit` at a prompt during the merge, do not
+    // proceed with the teardown/relink that would finish the absorb
+    // the user just asked us to abandon. `dst` keeps its (partially
+    // populated) tree intact, source has whatever content was already
+    // merged before the quit, and the source-side backup taken at the
+    // top of this function is the recovery anchor.
+    if ctx.quit_requested.get() {
+        warn!(
+            "absorb dir interrupted by user quit: {dst} \
+             — leaving target tree intact; source backup at {}",
+            ctx.backup_root
+        );
+        return Ok(());
+    }
     // Source now carries every regular file from target. Tear down the
     // original target dir and re-expose source via a junction.
     remove_dir_link_or_real(dst)?;
@@ -6158,6 +6200,34 @@ when = "yui.os == 'definitely_not_a_real_os'"
         std::fs::create_dir_all(&source).unwrap();
         let cfg = Config::default();
         (cfg, source, backup_root)
+    }
+
+    #[test]
+    fn prompt_anomaly_short_circuits_on_quit_requested() {
+        // Once `[q]uit` flips the cell, every subsequent prompt
+        // (including the cascade of per-file prompts inside an
+        // in-flight dir merge) returns `Quit` immediately so we don't
+        // re-prompt or block on stdin during teardown.
+        let tmp = TempDir::new().unwrap();
+        let (cfg, source, backup_root) = ctx_for_test(&tmp);
+        let src_file = source.join("a");
+        let dst_file = utf8(tmp.path().join("dst"));
+        std::fs::write(&src_file, "X").unwrap();
+        std::fs::write(&dst_file, "Y").unwrap();
+
+        let ctx = ApplyCtx {
+            config: &cfg,
+            source: &source,
+            file_mode: resolve_file_mode(cfg.link.file_mode),
+            dir_mode: resolve_dir_mode(cfg.link.dir_mode),
+            backup_root: &backup_root,
+            dry_run: false,
+            sticky_anomaly: Cell::new(None),
+            quit_requested: Cell::new(true),
+        };
+
+        let got = prompt_anomaly(&ctx, &src_file, &dst_file, "test").unwrap();
+        assert_eq!(got, AnomalyChoice::Quit);
     }
 
     #[test]
