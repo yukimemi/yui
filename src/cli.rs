@@ -241,27 +241,6 @@ pub enum SecretAction {
         #[arg(long)]
         rm_plaintext: bool,
     },
-
-    /// Encrypt the X25519 identity at `[secrets].identity` to all
-    /// `[secrets].passkey_recipients` and write the ciphertext to
-    /// `[secrets].passkey_wrapped`. Commit that file so a fresh
-    /// machine can `yui secret unlock` the X25519 once via the
-    /// passkey device, then run normal apply (no more device
-    /// prompts).
-    Wrap,
-
-    /// Decrypt `[secrets].passkey_wrapped` using one of the
-    /// `[secrets].passkey_identities` and restore the plaintext
-    /// X25519 secret to `[secrets].identity`. With multiple
-    /// identities AND a TTY, presents a picker; pass `--passkey
-    /// <label>` to bypass it non-interactively.
-    Unlock {
-        /// Label of the passkey to use — substring match against
-        /// the `# comment` lines in the identities file. Skips
-        /// the interactive picker.
-        #[arg(long, value_name = "LABEL")]
-        passkey: Option<String>,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -329,8 +308,6 @@ impl Cli {
                     force,
                     rm_plaintext,
                 } => cmd::secret_encrypt(source, path, force, rm_plaintext),
-                SecretAction::Wrap => cmd::secret_wrap(source),
-                SecretAction::Unlock { passkey } => cmd::secret_unlock(source, passkey),
             },
             Command::Completion { shell } => {
                 let mut cmd = Cli::command();

@@ -279,98 +279,17 @@ access:
    `yui secret encrypt --force <path>` per file. A `yui secret reencrypt`
    helper is planned.)
 
-### Hardware MFA / passkey (wrap-and-unlock model)
+### Roadmap: hardware MFA / passkey
 
-`apply` only ever uses the plain X25519 secret at
-`[secrets].identity` — no device prompts on the hot path. Hardware
-keys (Pixel passkey, YubiKey, Bitwarden, Touch ID, Windows Hello,
-TPM, 1Password, …) come in via age plugins, but yui scopes them
-to a *one-time-per-machine* unlock step rather than every apply.
-
-```toml
-[secrets]
-identity            = "~/.config/yui/age.txt"     # X25519 plain, gitignored
-recipients          = ["age1abc…"]                 # X25519 publics for *.age files
-
-# Wrap setup — committed, lets a fresh machine recover the X25519:
-passkey_wrapped     = ".yui/age.txt.age"           # ciphertext of identity
-passkey_recipients  = [                            # who can unwrap it
-  "age1fido2-hmac1…pixel",
-  "age1fido2-hmac1…bitwarden",
-]
-passkey_identities  = ".yui/passkeys.txt"          # device descriptors (one per device)
-```
-
-`.yui/passkeys.txt` is a multi-identity file — one comment-and-line
-pair per device:
-
-```
-# Pixel
-AGE-PLUGIN-FIDO2-HMAC-1…pixel…
-
-# Bitwarden
-AGE-PLUGIN-FIDO2-HMAC-1…bitwarden…
-```
-
-#### One-time setup on the first machine
-
-```sh
-yui secret init                       # generates ~/.config/yui/age.txt (X25519)
-
-# Install the right age plugin for the device you want as a recovery factor.
-# yui doesn't bundle plugins — pick whichever fits your hardware:
-
-# YubiKey 5 / SoloKey (Rust, easiest install):
-cargo install age-plugin-yubikey
-
-# Pixel passkey / FIDO2 hmac-secret (Go binary, not a crates.io crate):
-go install github.com/olastor/age-plugin-fido2-hmac/cmd/age-plugin-fido2-hmac@latest
-# or download a release binary from
-# https://github.com/olastor/age-plugin-fido2-hmac/releases
-
-# Apple Secure Enclave (Touch ID): age-plugin-se
-# 1Password: age-plugin-1p
-# TPM (machine-bound, NOT portable): age-plugin-tpm
-
-# Then: generate the identity → its public key goes in
-# [secrets].passkey_recipients, the private descriptor in passkeys.txt:
-age-plugin-fido2-hmac --generate >> .yui/passkeys.txt   # Pixel/YubiKey tap
-yui secret wrap                       # encrypts ~/.config/yui/age.txt → .yui/age.txt.age
-git add .yui/passkeys.txt .yui/age.txt.age && git commit
-```
-
-> **Windows + Pixel cross-device note**: the FIDO2 plugins talk to
-> the device via libfido2, which on Windows requires the OS-level
-> Web Authentication API plus working Bluetooth proximity for the
-> Pixel cross-device flow. YubiKey-over-USB or Touch ID on a Mac
-> are smoother bootstrap targets if you hit BT issues; you can
-> always have multiple `passkey_recipients` so any one device
-> works.
-
-#### One-time on each new machine
-
-```sh
-git clone <dotfiles>
-yui secret unlock                     # picker → tap Pixel (or Bitwarden) → done
-yui apply                             # X25519 only, no prompts
-```
-
-#### Picker
-
-With multiple `passkey_identities`, `unlock` shows a `dialoguer`
-Select prompt so you choose Pixel vs Bitwarden vs whichever device
-you have at hand. Off-TTY (CI / scripts), age tries them in file
-order; pass `--passkey <label>` to pick non-interactively (the
-label is matched as a substring of the `# comment` above each
-identity entry).
-
-#### Trade-off vs full plugin-on-apply
-
-The wrap-and-unlock model means **changing recipients of `*.age`
-files (e.g. revoking a machine's X25519 access) still requires
-re-encrypting those files with the X25519 recipients alone**. The
-passkey only protects the X25519 secret in transit, not individual
-secrets. This is deliberate — it keeps daily apply silent.
+age has a plugin ecosystem (YubiKey, FIDO2 incl. Pixel 10 Pro
+cross-device passkeys, Touch ID via Secure Enclave, Windows Hello,
+TPM, 1Password). yui v1's identity / recipient parsing is X25519-only
+to keep the bootstrap flow simple, but the data model is plugin-ready;
+plugin support (with the callback plumbing those interactive flows
+need) is planned as a follow-up. Until then you can interoperate at
+the file level by encrypting `.age` files outside yui via `rage` /
+`age-plugin-*` and committing them — yui's X25519 identity can still
+decrypt files that were also wrapped to your X25519 recipient.
 
 [age]: https://age-encryption.org/
 
