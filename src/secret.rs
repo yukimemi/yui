@@ -55,15 +55,15 @@ pub type BoxedIdentity = Box<dyn age::Identity>;
 
 /// Validate that `bytes` is a parseable X25519 identity file —
 /// at least one non-comment line is `AGE-SECRET-KEY-1…`. Used by
-/// `yui secret unlock` to fail before persisting bytes that
-/// happen to decrypt but aren't actually an identity (wrong
-/// `passkey_wrapped` path / corrupted blob). PR #60 review by
-/// coderabbitai.
+/// both `yui secret store` (refuse to upload a corrupted local
+/// file) and `yui secret unlock` (refuse to persist a vault item
+/// that doesn't actually hold an age identity). The messages
+/// name "the payload" rather than a specific source so both
+/// call sites read naturally.
 pub fn validate_x25519_identity_bytes(bytes: &[u8]) -> Result<()> {
     let text = std::str::from_utf8(bytes).map_err(|_| {
         Error::Other(anyhow::anyhow!(
-            "decrypted payload is not valid UTF-8 — \
-             passkey_wrapped doesn't look like an age identity file"
+            "payload is not valid UTF-8 — does not look like an age identity file"
         ))
     })?;
     let line = text
@@ -72,16 +72,15 @@ pub fn validate_x25519_identity_bytes(bytes: &[u8]) -> Result<()> {
         .find(|l| !l.is_empty() && !l.starts_with('#'))
         .ok_or_else(|| {
             Error::Other(anyhow::anyhow!(
-                "decrypted payload contains no key line \
-                 (only comments / blank lines) — passkey_wrapped \
-                 is not an age identity file"
+                "payload contains no key line (only comments / blank lines) — \
+                 not an age identity file"
             ))
         })?;
     age::x25519::Identity::from_str(line)
         .map(drop)
         .map_err(|e| {
             Error::Other(anyhow::anyhow!(
-                "decrypted payload is not a valid age X25519 secret \
+                "payload is not a valid age X25519 secret \
              (`AGE-SECRET-KEY-1…` expected): {e}"
             ))
         })

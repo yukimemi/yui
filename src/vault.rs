@@ -271,7 +271,27 @@ impl Vault for OnePasswordVault {
             .output()
             .map_err(|e| Error::Other(anyhow::anyhow!("invoking `op`: {e}")))?;
 
-        let assignment = format!("notesPlain[text]={content_str}");
+        // Build a JSON template and pipe it via stdin instead of
+        // passing the secret as `notesPlain[text]=…` argv. The
+        // assignment-statement form is documented but exposes
+        // the secret to local `ps` / WMIC inspection while the
+        // op process is alive — JSON-via-stdin is 1Password's
+        // recommended secure flow. (PR #61 review by coderabbitai.)
+        let template = serde_json::json!({
+            "title": item,
+            "category": "SECURE_NOTE",
+            "fields": [
+                {
+                    "id": "notesPlain",
+                    "type": "STRING",
+                    "purpose": "NOTES",
+                    "label": "notesPlain",
+                    "value": content_str,
+                }
+            ],
+        });
+        let payload = serde_json::to_vec(&template)
+            .map_err(|e| Error::Other(anyhow::anyhow!("serialise op item template: {e}")))?;
 
         if existing.status.success() {
             if !force {
@@ -279,34 +299,39 @@ impl Vault for OnePasswordVault {
                     "1Password item {item:?} already exists; pass --force to overwrite"
                 )));
             }
-            let status = Command::new("op")
-                .args(["item", "edit", item, &assignment])
-                .status()
-                .map_err(|e| Error::Other(anyhow::anyhow!("invoking `op`: {e}")))?;
-            if !status.success() {
-                return Err(Error::Other(anyhow::anyhow!(
-                    "op item edit {item:?} failed"
-                )));
-            }
+            run_op_with_stdin(&["item", "edit", item, "-"], &payload)?;
         } else {
-            let status = Command::new("op")
-                .args([
-                    "item",
-                    "create",
-                    "--category",
-                    "Secure Note",
-                    "--title",
-                    item,
-                    &assignment,
-                ])
-                .status()
-                .map_err(|e| Error::Other(anyhow::anyhow!("invoking `op`: {e}")))?;
-            if !status.success() {
-                return Err(Error::Other(anyhow::anyhow!(
-                    "op item create {item:?} failed"
-                )));
-            }
+            run_op_with_stdin(&["item", "create", "-"], &payload)?;
         }
         Ok(())
     }
+}
+
+fn run_op_with_stdin(args: &[&str], stdin_bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let mut child = Command::new("op")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::Other(anyhow::anyhow!("invoking `op`: {e}")))?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| Error::Other(anyhow::anyhow!("op stdin closed early")))?
+        .write_all(stdin_bytes)
+        .map_err(|e| Error::Other(anyhow::anyhow!("writing to op stdin: {e}")))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| Error::Other(anyhow::anyhow!("waiting on op: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::Other(anyhow::anyhow!(
+            "op {} failed: {}",
+            args.join(" "),
+            stderr.trim()
+        )));
+    }
+    Ok(())
 }

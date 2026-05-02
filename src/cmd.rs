@@ -908,6 +908,11 @@ pub fn secret_store(source: Option<Utf8PathBuf>, force: bool) -> Result<()> {
         );
     }
     let plaintext = std::fs::read(&identity_path)?;
+    // Refuse to upload bytes that aren't actually an age identity
+    // — a mistyped `[secrets].identity` path or a corrupted file
+    // would otherwise stash garbage that `yui secret unlock`
+    // would only fail to use later. (PR #61 review by coderabbitai.)
+    secret::validate_x25519_identity_bytes(&plaintext)?;
 
     let vault = vault::driver(vault_cfg);
     // Verify the provider CLI is installed and authenticated
