@@ -121,16 +121,24 @@ before reverting any of them.
 **Practice TDD.** Red-green-refactor.
 
 ```bash
+cargo make setup                    # one-time on clone: pre-push hook + APM install
 cargo test                          # unit + integration
 cargo test --test cli               # integration only
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo make check                    # all of the above (pre-push gate)
-cargo make hook-install             # install pre-push hook (one-time)
 ```
 
 `cargo make check` mirrors CI. A pre-push hook should be installed on
 checkout so failed checks block push.
+
+`cargo make setup` is `hook-install` + `apm-install`. The latter
+runs `apm install`, which compiles the
+[renri](https://github.com/yukimemi/renri) skill (declared in
+`apm.yml`, pinned to `#v0.1.5`) into `.github/skills/` so AI
+sessions know how to manage worktrees / jj workspaces while
+developing yui. Lockfile is `apm.lock.yaml`. Bump the pinned version
+explicitly when wanting newer renri features.
 
 ## Resilience principle
 
