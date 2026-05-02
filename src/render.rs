@@ -98,10 +98,17 @@ pub fn render_all(
         )?;
     }
 
-    if !dry_run && config.render.manage_gitignore {
-        update_gitignore(source, &collect_managed_paths(&report))?;
-    }
     Ok(report)
+}
+
+/// Every `*.tera` output path the report knows about — written /
+/// unchanged / diverged. The apply orchestrator unions this with
+/// the secret pipeline's plaintext outputs to drive a single
+/// `write_managed_section` call (rather than render writing one
+/// list of paths and secrets immediately overwriting it with a
+/// different one). PR #57 review.
+pub fn report_managed_paths(report: &RenderReport) -> Vec<Utf8PathBuf> {
+    collect_managed_paths(report)
 }
 
 /// Render a single template and return the body it would produce
@@ -301,6 +308,18 @@ fn collect_managed_paths(report: &RenderReport) -> Vec<Utf8PathBuf> {
     all.sort();
     all.dedup();
     all
+}
+
+/// Write or replace yui's managed `.gitignore` section in the
+/// repo root, listing every absolute path the apply pipeline
+/// produced as a sibling-without-suffix (rendered `.tera` outputs
+/// AND decrypted `.age` outputs share this section). The block is
+/// delimited by `# >>> yui rendered (auto-managed) >>>` /
+/// `# <<< yui rendered (auto-managed) <<<` so successive runs
+/// idempotently rewrite it without disturbing user content above
+/// or below.
+pub fn write_managed_section(source: &Utf8Path, managed_abs_paths: &[Utf8PathBuf]) -> Result<()> {
+    update_gitignore(source, managed_abs_paths)
 }
 
 fn update_gitignore(source: &Utf8Path, rendered_abs_paths: &[Utf8PathBuf]) -> Result<()> {
@@ -568,7 +587,11 @@ mod tests {
         let r = root(&tmp);
         write(&r.join("home/foo.tera"), "body");
         write(&r.join("home/bar.tera"), "body2");
-        let _ = render_all(&r, &empty_config(), &yui_vars(&r), false).unwrap();
+        let report = render_all(&r, &empty_config(), &yui_vars(&r), false).unwrap();
+        // PR #57: render_all no longer manages .gitignore as a
+        // side effect; callers (apply / cmd::render) drive the
+        // single deterministic write.
+        write_managed_section(&r, &report_managed_paths(&report)).unwrap();
         let gi = std::fs::read_to_string(r.join(".gitignore")).unwrap();
         assert!(gi.contains(GITIGNORE_BEGIN));
         assert!(gi.contains(GITIGNORE_END));
@@ -586,7 +609,8 @@ mod tests {
         let r = root(&tmp);
         write(&r.join(".gitignore"), "node_modules/\ntarget/\n");
         write(&r.join("home/foo.tera"), "body");
-        let _ = render_all(&r, &empty_config(), &yui_vars(&r), false).unwrap();
+        let report = render_all(&r, &empty_config(), &yui_vars(&r), false).unwrap();
+        write_managed_section(&r, &report_managed_paths(&report)).unwrap();
         let gi = std::fs::read_to_string(r.join(".gitignore")).unwrap();
         assert!(gi.contains("node_modules/"));
         assert!(gi.contains("target/"));
@@ -603,7 +627,8 @@ mod tests {
             &format!("node_modules/\n\n{GITIGNORE_BEGIN}\nstale/path\n{GITIGNORE_END}\n\nfoo\n"),
         );
         write(&r.join("home/foo.tera"), "body");
-        let _ = render_all(&r, &empty_config(), &yui_vars(&r), false).unwrap();
+        let report = render_all(&r, &empty_config(), &yui_vars(&r), false).unwrap();
+        write_managed_section(&r, &report_managed_paths(&report)).unwrap();
         let gi = std::fs::read_to_string(r.join(".gitignore")).unwrap();
         assert!(gi.contains("node_modules/"));
         assert!(gi.contains("home/foo"));

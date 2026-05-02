@@ -230,6 +230,69 @@ shallower ones, `!negation` re-includes paths, and rules apply only to
 the subtree below the file. Put repo-wide rules at `$DOTFILES/.yuiignore`
 and per-tree rules where they belong.
 
+## Secrets (`*.age` — opt-in)
+
+Files ending in `.age` are encrypted with [age]; on every `apply` the
+ciphertext is decrypted to a sibling file without the suffix, exactly
+like `*.tera` rendering. The plaintext sibling is added to the managed
+`.gitignore` section so it never gets committed.
+
+```
+home/.ssh/id_ed25519.age   →  home/.ssh/id_ed25519   →  ~/.ssh/id_ed25519
+       ↑ committed                  ↑ gitignored               ↑ linked
+```
+
+### Bootstrap
+
+```sh
+yui secret init        # generates ~/.config/yui/age.txt
+                       # appends the public key to $DOTFILES/config.local.toml
+yui secret encrypt home/.ssh/id_ed25519
+                       # produces home/.ssh/id_ed25519.age, ready to commit
+```
+
+`config.toml` after `init`:
+
+```toml
+[secrets]
+identity = "~/.config/yui/age.txt"          # picked up automatically
+recipients = [
+  "age1abc...",   # this machine's public key
+  # add more entries to grant other machines access
+]
+```
+
+The feature is **off** until `recipients` has at least one entry — old
+repos without `[secrets]` keep behaving exactly as before.
+
+### Multi-machine
+
+age supports multiple recipients per file. To grant a new machine
+access:
+
+1. On the new machine: `yui secret init` → generates a per-machine key,
+   appends its public key to `config.local.toml` `[secrets].recipients`.
+   Move that public-key line to `config.toml` (the committed one) so
+   other machines see it too.
+2. On a machine that already has the secret: re-encrypt every `.age`
+   so its recipient list includes the new public key. (For now: run
+   `yui secret encrypt --force <path>` per file. A `yui secret reencrypt`
+   helper is planned.)
+
+### Roadmap: hardware MFA / passkey
+
+age has a plugin ecosystem (YubiKey, FIDO2 incl. Pixel 10 Pro
+cross-device passkeys, Touch ID via Secure Enclave, Windows Hello,
+TPM, 1Password). yui v1's identity / recipient parsing is X25519-only
+to keep the bootstrap flow simple, but the data model is plugin-ready;
+plugin support (with the callback plumbing those interactive flows
+need) is planned as a follow-up. Until then you can interoperate at
+the file level by encrypting `.age` files outside yui via `rage` /
+`age-plugin-*` and committing them — yui's X25519 identity can still
+decrypt files that were also wrapped to your X25519 recipient.
+
+[age]: https://age-encryption.org/
+
 ## Hooks — run scripts around `apply`
 
 Drop a script under `$DOTFILES/.yui/bin/` and reference it with a

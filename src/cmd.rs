@@ -16,6 +16,7 @@ use crate::link::{self, EffectiveDirMode, EffectiveFileMode, resolve_dir_mode, r
 use crate::marker::{self, MarkerSpec};
 use crate::mount::{self, ResolvedMount};
 use crate::render::{self, RenderReport};
+use crate::secret;
 use crate::template;
 use crate::vars::YuiVars;
 use crate::{absorb, backup, paths};
@@ -211,7 +212,23 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
         dry_run,
     )?;
 
-    // 1. Render templates first so the link walk picks up rendered files.
+    // 1a. Decrypt `*.age` files first — the rendered templates
+    //     might `{{ ... }}`-reference plaintext siblings indirectly
+    //     (via env vars set by hooks), and even when they don't,
+    //     decrypting first keeps the order of "physical sibling
+    //     files appear" predictable.
+    let secret_report = secret::decrypt_all(&source, &config, dry_run)?;
+    log_secret_report(&secret_report);
+    if secret_report.has_drift() {
+        anyhow::bail!(
+            "secret drift detected ({} file(s)); the plaintext sibling diverged \
+             from the canonical .age — run `yui secret encrypt <path>` to roll \
+             the edit back into ciphertext before re-running apply",
+            secret_report.diverged.len()
+        );
+    }
+
+    // 1b. Render templates so the link walk picks up rendered files.
     let render_report = render::render_all(&source, &config, &yui, dry_run)?;
     log_render_report(&render_report);
     if render_report.has_drift() {
@@ -219,6 +236,22 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
             "render drift detected ({} file(s)); reflect target edits back into the .tera before re-running apply",
             render_report.diverged.len()
         );
+    }
+
+    // 1c. Single deterministic write of the `.gitignore` managed
+    //     section, covering both `*.tera` outputs and `*.age`
+    //     plaintext siblings. (Earlier this was two writes — once
+    //     inside `render_all`, once here — which made the managed
+    //     section flicker if a reader read between them. PR #57
+    //     review caught it; render_all no longer touches gitignore.)
+    if !dry_run && config.render.manage_gitignore {
+        let mut managed: Vec<Utf8PathBuf> = render::report_managed_paths(&render_report)
+            .into_iter()
+            .chain(secret_report.managed_paths().cloned())
+            .collect();
+        managed.sort();
+        managed.dedup();
+        render::write_managed_section(&source, &managed)?;
     }
 
     // 2. Resolve mounts and link.
@@ -289,6 +322,18 @@ fn log_render_report(r: &RenderReport) {
     }
     for d in &r.diverged {
         warn!("rendered file diverged from template: {d}");
+    }
+}
+
+fn log_secret_report(r: &secret::SecretReport) {
+    if !r.written.is_empty() {
+        info!("decrypted {} secret file(s)", r.written.len());
+    }
+    if !r.unchanged.is_empty() {
+        info!("decrypted {} secret(s) unchanged", r.unchanged.len());
+    }
+    for d in &r.diverged {
+        warn!("plaintext sibling diverged from .age: {d}");
     }
 }
 
@@ -602,8 +647,17 @@ pub fn render(source: Option<Utf8PathBuf>, check: bool, dry_run: bool) -> Result
     let yui = YuiVars::detect(&source);
     let config = config::load(&source, &yui)?;
     // --check is a stricter dry-run: never writes, exits non-zero on drift.
-    let report = render::render_all(&source, &config, &yui, dry_run || check)?;
+    let effective_dry_run = dry_run || check;
+    let report = render::render_all(&source, &config, &yui, effective_dry_run)?;
     log_render_report(&report);
+    // Stand-alone `yui render` has no secrets pipeline running
+    // alongside, so the managed section here just covers `*.tera`
+    // outputs. (Use `yui apply` if you need both rendered AND
+    // decrypted siblings to land in the same write.)
+    if !effective_dry_run && config.render.manage_gitignore {
+        let managed = render::report_managed_paths(&report);
+        render::write_managed_section(&source, &managed)?;
+    }
     if check && report.has_drift() {
         anyhow::bail!("render drift detected ({} file(s))", report.diverged.len());
     }
@@ -624,6 +678,200 @@ pub fn unlink(source: Option<Utf8PathBuf>, paths_arg: Vec<Utf8PathBuf>) -> Resul
         let abs = absolutize(&p)?;
         info!("unlink: {abs}");
         link::unlink(&abs)?;
+    }
+    Ok(())
+}
+
+/// `yui secret init [--comment TEXT]` — generate an age X25519
+/// keypair on this machine, write the secret to the configured
+/// identity path, and append the public key to
+/// `$DOTFILES/config.local.toml` `[secrets] recipients`.
+///
+/// `config.local.toml` is the right place because it's
+/// machine-local and gitignored — committing per-machine recipient
+/// keys to the public repo is fine in principle (recipients are
+/// public information) but the convention has the keys live in
+/// the local file alongside other host-specific config.
+pub fn secret_init(source: Option<Utf8PathBuf>, comment: Option<String>) -> Result<()> {
+    let source = resolve_source(source)?;
+    let yui = YuiVars::detect(&source);
+    let config = config::load(&source, &yui)?;
+
+    // 1. Resolve identity path (default: ~/.config/yui/age.txt).
+    let identity_path = paths::expand_tilde(&config.secrets.identity);
+    if identity_path.exists() {
+        anyhow::bail!(
+            "identity file already exists at {identity_path}; \
+             refusing to overwrite. Delete it first if you really \
+             mean to start fresh (you'll lose access to existing \
+             .age files encrypted to its public key)."
+        );
+    }
+
+    // 2. Generate the keypair + serialise the identity file with
+    //    the same header age-keygen uses, so the file is
+    //    interoperable with the standalone CLI tools.
+    let (secret, public) = secret::generate_x25519_keypair();
+    if let Some(parent) = identity_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let now = jiff::Zoned::now().to_string();
+    let body = format!(
+        "# created: {now}\n\
+         # public key: {public}\n\
+         {secret}\n"
+    );
+    std::fs::write(&identity_path, body)?;
+    info!("wrote identity file: {identity_path}");
+
+    // 3. Append the public key to `[secrets] recipients` in
+    //    config.local.toml — appending is safe because that file
+    //    is the per-machine layer the user explicitly owns.
+    let local_path = source.join("config.local.toml");
+    let comment = comment.unwrap_or_else(|| format!("{} {}", yui.host, yui.user));
+    let entry_comment = format!("{comment} — added by `yui secret init` on {now}");
+    let local_existing = match std::fs::read_to_string(&local_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => anyhow::bail!("read {local_path}: {e}"),
+    };
+    let updated_local = append_recipient_to_local(&local_existing, &entry_comment, &public)?;
+    std::fs::write(&local_path, updated_local)?;
+    info!("appended public key to {local_path}");
+    println!();
+    println!("  age identity:  {identity_path}");
+    println!("  public key:    {public}");
+    println!();
+    println!(
+        "  Next: encrypt a file with `yui secret encrypt <path>`. \
+         The plaintext sibling will be auto-decrypted on every `yui apply`."
+    );
+    Ok(())
+}
+
+/// Append a recipient entry to the user's `config.local.toml`.
+///
+/// Uses `toml_edit` to parse the file into an in-memory document
+/// tree, modify the `[secrets].recipients` array, then serialise
+/// back. This preserves user comments / spacing / table ordering,
+/// and survives quirky inputs (other tables after `[secrets]`,
+/// trailing comments, multi-line arrays, etc.) — string-pasting
+/// the same shape used to land tokens in the wrong place when the
+/// file's layout deviated from the most common case. (Caught in
+/// PR #57 review by gemini-code-assist.)
+///
+/// Returns the file unchanged when the public key is already in
+/// the recipients list (idempotent re-init).
+fn append_recipient_to_local(existing: &str, comment: &str, public: &str) -> Result<String> {
+    use toml_edit::{Array, DocumentMut, Item, Table, Value};
+
+    let mut doc: DocumentMut = if existing.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        existing
+            .parse()
+            .map_err(|e| anyhow::anyhow!("config.local.toml is not valid TOML: {e}"))?
+    };
+
+    // Make sure `[secrets]` exists as a table.
+    if !doc.contains_key("secrets") {
+        let mut t = Table::new();
+        t.set_implicit(false);
+        doc.insert("secrets", Item::Table(t));
+    }
+    let secrets = doc["secrets"].as_table_mut().ok_or_else(|| {
+        anyhow::anyhow!("[secrets] in config.local.toml is not a table — refusing to clobber")
+    })?;
+
+    // Make sure `recipients` is an array.
+    if !secrets.contains_key("recipients") {
+        secrets.insert("recipients", Item::Value(Value::Array(Array::new())));
+    }
+    let recipients = secrets["recipients"]
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("[secrets].recipients is not an array"))?;
+
+    // Idempotent: if the public key already appears, we're done.
+    let already_present = recipients.iter().any(|v| v.as_str() == Some(public));
+    if already_present {
+        return Ok(doc.to_string());
+    }
+
+    // Append the new entry with a leading-comment decor block so
+    // the user can tell which key belongs to which machine just by
+    // reading the file.
+    let mut value = Value::from(public);
+    let prefix = format!("\n  # {comment}\n  ");
+    *value.decor_mut() = toml_edit::Decor::new(prefix, "");
+    recipients.push_formatted(value);
+    // Force the array onto multiple lines so the comments above
+    // entries actually have a place to live (a single-line array
+    // can't carry per-element comments).
+    recipients.set_trailing("\n");
+    recipients.set_trailing_comma(true);
+
+    Ok(doc.to_string())
+}
+
+/// `yui secret encrypt <path> [--force] [--rm-plaintext]` — encrypt
+/// a plaintext file to every recipient in `[secrets] recipients`
+/// and write the ciphertext alongside as `<path>.age`.
+pub fn secret_encrypt(
+    source: Option<Utf8PathBuf>,
+    path: Utf8PathBuf,
+    force: bool,
+    rm_plaintext: bool,
+) -> Result<()> {
+    let source = resolve_source(source)?;
+    let yui = YuiVars::detect(&source);
+    let config = config::load(&source, &yui)?;
+
+    if !config.secrets.enabled() {
+        anyhow::bail!(
+            "no recipients configured — run `yui secret init` to generate \
+             a keypair, or add at least one entry to `[secrets] recipients`."
+        );
+    }
+
+    // Resolve the plaintext path: absolute as-is, relative against
+    // CWD (so the user can `yui secret encrypt home/.ssh/id_ed25519`
+    // from inside `$DOTFILES`).
+    let plaintext_path = if path.is_absolute() {
+        path.clone()
+    } else {
+        absolutize(&path)?
+    };
+    if !plaintext_path.is_file() {
+        anyhow::bail!("plaintext file not found: {plaintext_path}");
+    }
+    let cipher_path = Utf8PathBuf::from(format!("{plaintext_path}.age"));
+    if cipher_path.exists() && !force {
+        anyhow::bail!("{cipher_path} already exists; pass --force to overwrite");
+    }
+
+    let plaintext = std::fs::read(&plaintext_path)?;
+    let recipients: Vec<age::x25519::Recipient> = config
+        .secrets
+        .recipients
+        .iter()
+        .map(|s| secret::parse_recipient(s))
+        .collect::<crate::Result<_>>()?;
+    let cipher = secret::encrypt(&plaintext, &recipients)?;
+    std::fs::write(&cipher_path, &cipher)?;
+    info!("encrypted {plaintext_path} → {cipher_path}");
+
+    if rm_plaintext {
+        // Only remove plaintext when it lives under `$DOTFILES` —
+        // erasing files outside the repo on a typo would be cruel.
+        if plaintext_path.starts_with(&source) {
+            std::fs::remove_file(&plaintext_path)?;
+            info!("removed plaintext: {plaintext_path}");
+        } else {
+            warn!(
+                "plaintext lives outside source ({plaintext_path}); \
+                 skipping --rm-plaintext as a safety check"
+            );
+        }
     }
     Ok(())
 }
@@ -4667,6 +4915,205 @@ dst = "{}"
         assert!(!source.join("home/note").exists());
         assert!(!target.join("note").exists());
         assert!(!target.join("note.tera").exists());
+    }
+
+    // -----------------------------------------------------------------
+    // secrets (age) end-to-end
+    // -----------------------------------------------------------------
+
+    /// `yui apply` decrypts every `*.age` to its sibling and the
+    /// sibling lands in target as a regular file. The plaintext is
+    /// also added to the managed `.gitignore` section so it doesn't
+    /// get committed.
+    #[test]
+    fn apply_decrypts_age_files_to_sibling_and_links() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let target = utf8(tmp.path().join("target"));
+        std::fs::create_dir_all(source.join("home/.ssh")).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+
+        // 1. Generate a keypair, write identity file inside the test
+        //    sandbox so we don't touch the user's real `~/.config/yui/`.
+        let identity_path = utf8(tmp.path().join("age.txt"));
+        let (secret, public) = secret::generate_x25519_keypair();
+        std::fs::write(&identity_path, format!("{secret}\n")).unwrap();
+
+        // 2. Encrypt a fake private key into source as `.age`.
+        let recipient = secret::parse_recipient(&public).unwrap();
+        let cipher = secret::encrypt(b"-- super secret key --\n", &[recipient]).unwrap();
+        std::fs::write(source.join("home/.ssh/id_ed25519.age"), &cipher).unwrap();
+
+        // 3. config.toml: mount + secrets pointing at the test identity.
+        let cfg = format!(
+            r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+
+[secrets]
+identity = "{}"
+recipients = ["{}"]
+"#,
+            toml_path(&target),
+            toml_path(&identity_path),
+            public
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+        apply(Some(source.clone()), false).unwrap();
+
+        // Plaintext sibling appeared.
+        assert!(source.join("home/.ssh/id_ed25519").exists());
+        // Target got the linked file with decrypted content.
+        let target_bytes = std::fs::read(target.join(".ssh/id_ed25519")).unwrap();
+        assert_eq!(target_bytes, b"-- super secret key --\n");
+        // Plaintext path is in the managed .gitignore section.
+        let gi = std::fs::read_to_string(source.join(".gitignore")).unwrap();
+        assert!(
+            gi.contains("home/.ssh/id_ed25519"),
+            ".gitignore should list the decrypted plaintext sibling: {gi}"
+        );
+        // The .age ciphertext is the canonical, NOT in the managed list.
+        // (It's expected to be committed normally.)
+    }
+
+    /// `yui apply` bails when the on-disk plaintext sibling has
+    /// drifted from the canonical `.age`. Mirrors render-drift
+    /// semantics: the user must run `yui secret encrypt` to roll
+    /// the change back into ciphertext before re-running apply.
+    #[test]
+    fn apply_bails_on_secret_drift() {
+        let tmp = TempDir::new().unwrap();
+        let source = utf8(tmp.path().join("dotfiles"));
+        let target = utf8(tmp.path().join("target"));
+        std::fs::create_dir_all(source.join("home")).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+
+        let identity_path = utf8(tmp.path().join("age.txt"));
+        let (secret_key, public) = secret::generate_x25519_keypair();
+        std::fs::write(&identity_path, format!("{secret_key}\n")).unwrap();
+
+        let recipient = secret::parse_recipient(&public).unwrap();
+        let cipher = secret::encrypt(b"v1 content\n", &[recipient]).unwrap();
+        std::fs::write(source.join("home/secret.age"), &cipher).unwrap();
+        // Drifted sibling: plaintext exists but doesn't match the .age content.
+        std::fs::write(source.join("home/secret"), "edited locally\n").unwrap();
+
+        let cfg = format!(
+            r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+
+[secrets]
+identity = "{}"
+recipients = ["{}"]
+"#,
+            toml_path(&target),
+            toml_path(&identity_path),
+            public
+        );
+        std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+        let err = apply(Some(source.clone()), false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("secret drift"),
+            "expected secret drift error, got: {err:#}"
+        );
+    }
+
+    // -- append_recipient_to_local (PR #57 review: toml_edit) --
+
+    #[test]
+    fn append_recipient_creates_secrets_table_when_missing() {
+        let result =
+            append_recipient_to_local("", "host alice", "age1abcrecipientpublickey").unwrap();
+        // Round-trip parse — must be valid TOML.
+        let parsed: toml::Table = toml::from_str(&result).unwrap();
+        let secrets = parsed.get("secrets").and_then(|v| v.as_table()).unwrap();
+        let recipients = secrets
+            .get("recipients")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(recipients[0].as_str(), Some("age1abcrecipientpublickey"));
+    }
+
+    #[test]
+    fn append_recipient_preserves_existing_other_tables() {
+        // Crude string-pasting used to put a new recipient in the
+        // wrong place when other tables followed `[secrets]`.
+        // toml_edit handles arbitrary table ordering.
+        let existing = r#"
+[vars]
+greet = "hi"
+
+[secrets]
+recipients = ["age1machine_a"]
+
+[ui]
+icons = "ascii"
+"#;
+        let result = append_recipient_to_local(existing, "host b", "age1machine_b").unwrap();
+        let parsed: toml::Table = toml::from_str(&result).unwrap();
+        // All three tables still there.
+        assert!(parsed.get("vars").is_some());
+        assert!(parsed.get("secrets").is_some());
+        assert!(parsed.get("ui").is_some());
+        // Both recipients in the array.
+        let recipients = parsed["secrets"]["recipients"].as_array().unwrap();
+        assert_eq!(recipients.len(), 2);
+        let pubs: Vec<&str> = recipients.iter().filter_map(|v| v.as_str()).collect();
+        assert!(pubs.contains(&"age1machine_a"));
+        assert!(pubs.contains(&"age1machine_b"));
+    }
+
+    #[test]
+    fn append_recipient_is_idempotent_on_duplicate() {
+        let existing = r#"[secrets]
+recipients = ["age1same"]
+"#;
+        let result = append_recipient_to_local(existing, "anyone", "age1same").unwrap();
+        let parsed: toml::Table = toml::from_str(&result).unwrap();
+        let recipients = parsed["secrets"]["recipients"].as_array().unwrap();
+        assert_eq!(recipients.len(), 1, "duplicate must not be appended twice");
+    }
+
+    #[test]
+    fn append_recipient_creates_recipients_array_when_secrets_table_empty() {
+        // `[secrets]` exists but no recipients yet (e.g. user hand-
+        // initialised a different field first).
+        let existing = r#"[secrets]
+identity = "~/.config/yui/age.txt"
+"#;
+        let result = append_recipient_to_local(existing, "h", "age1new").unwrap();
+        let parsed: toml::Table = toml::from_str(&result).unwrap();
+        let secrets = parsed["secrets"].as_table().unwrap();
+        assert_eq!(
+            secrets["identity"].as_str(),
+            Some("~/.config/yui/age.txt"),
+            "existing identity field must survive"
+        );
+        let recipients = secrets["recipients"].as_array().unwrap();
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(recipients[0].as_str(), Some("age1new"));
+    }
+
+    /// Secrets feature is opt-in: an empty `[secrets] recipients`
+    /// list keeps `decrypt_all` a no-op so existing repos behave
+    /// exactly as before this PR.
+    #[test]
+    fn apply_without_recipients_skips_secret_walker() {
+        let tmp = TempDir::new().unwrap();
+        let (source, _target) = setup_minimal_dotfiles(&tmp);
+        // No `[secrets]` block at all.
+        std::fs::write(source.join("home/.bashrc"), "x").unwrap();
+        // A stray `.age` file with no recipients configured: walker
+        // shouldn't even open it (no identity loaded → no decrypt
+        // attempt → no error).
+        std::fs::write(source.join("home/some.junk.age"), b"not actually a cipher").unwrap();
+        apply(Some(source.clone()), false).unwrap();
     }
 
     /// v0.6+: parent `.yuilink` doesn't stop the walker. A parent

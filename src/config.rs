@@ -42,6 +42,9 @@ pub struct Config {
 
     #[serde(default)]
     pub hook: Vec<HookConfig>,
+
+    #[serde(default)]
+    pub secrets: SecretsConfig,
 }
 
 /// One hook = one script invocation triggered around `yui apply`.
@@ -272,6 +275,49 @@ impl Default for BackupConfig {
 
 fn default_backup_dir() -> String {
     ".yui/backup".to_string()
+}
+
+/// `[secrets]` — wires the age encryption pipeline into apply.
+///
+/// `identity` is the path to your local age secret key file (NOT
+/// committed). `recipients` is the public-key list every new
+/// encryption is wrapped to — at minimum, the public key matching
+/// `identity`, and any additional machines / users that should
+/// also be able to decrypt. yui defaults the identity path to
+/// `~/.config/yui/age.txt` and treats an empty `recipients` list
+/// as "secrets feature off".
+#[derive(Debug, Clone, Deserialize)]
+pub struct SecretsConfig {
+    #[serde(default = "default_identity_path")]
+    pub identity: String,
+    #[serde(default)]
+    pub recipients: Vec<String>,
+}
+
+impl Default for SecretsConfig {
+    fn default() -> Self {
+        Self {
+            identity: default_identity_path(),
+            recipients: Vec::new(),
+        }
+    }
+}
+
+impl SecretsConfig {
+    /// `[secrets]` is "on" once the user has populated `recipients`
+    /// (which `yui secret init` does). Until then, the apply walker
+    /// won't even look for `*.age` files — keeps every existing
+    /// dotfiles repo behaving exactly the same as before this PR.
+    pub fn enabled(&self) -> bool {
+        !self.recipients.is_empty()
+    }
+}
+
+fn default_identity_path() -> String {
+    // Cross-platform `~/.config/yui/age.txt` — `paths::expand_tilde`
+    // turns `~` into `$HOME` / `$USERPROFILE` at use time so the
+    // string stays portable across machines.
+    "~/.config/yui/age.txt".to_string()
 }
 
 fn default_ts_format() -> String {

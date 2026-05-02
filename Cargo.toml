@@ -30,6 +30,7 @@ name = "yui"
 path = "src/lib.rs"
 
 [dependencies]
+age = "0.11.1"
 anyhow = "1.0.102"
 camino = { version = "1.2.2", features = ["serde1"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
@@ -47,6 +48,7 @@ similar = "3"
 tera = "1.20.1"
 thiserror = "2.0.18"
 toml = "1.1.2"
+toml_edit = "0.23"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 whoami = "2"
