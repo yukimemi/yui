@@ -53,9 +53,9 @@ echo "Installed pre-push hook -> ${hook_file}"
 '''
 
 [tasks.apm-install]
-description = "Install agent skills declared in apm.yml (currently: renri for worktree management)"
+description = "Install agent skills declared in apm.yml — pinned to copilot + claude targets"
 command = "apm"
-args = ["install"]
+args = ["install", "-t", "copilot,claude"]
 
 [tasks.setup]
 description = "One-time setup for new contributors: pre-push hook + APM install"
