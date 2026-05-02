@@ -912,12 +912,10 @@ pub fn secret_wrap(source: Option<Utf8PathBuf>) -> Result<()> {
     let wrapped_path = resolve_secrets_path(&source, wrapped_rel);
 
     let plaintext = std::fs::read(&identity_path)?;
-    let recipients: Vec<secret::BoxedRecipient> = config
-        .secrets
-        .passkey_recipients
-        .iter()
-        .map(|s| secret::parse_passkey_recipient(s))
-        .collect::<crate::Result<_>>()?;
+    // Use the batch parser so multiple recipients of the same
+    // plugin share a single `RecipientPluginV1` (one process
+    // invocation, one prompt round). PR #60 review.
+    let recipients = secret::parse_passkey_recipients(&config.secrets.passkey_recipients)?;
     let cipher = secret::encrypt_to_passkeys(&plaintext, &recipients)?;
     if let Some(parent) = wrapped_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1053,10 +1051,17 @@ fn pick_passkey_identity(
                  (available: {labels:?})"
             ),
             1 => return Ok(Some(matches[0])),
-            n => anyhow::bail!(
-                "--passkey {want:?} is ambiguous — matches {n} entries \
-                 ({labels:?}); narrow it down"
-            ),
+            n => {
+                // List only the labels that matched, not the full
+                // identities file — a big passkeys file would
+                // bury the actual ambiguity. (PR #60 review.)
+                let matched_labels: Vec<&str> =
+                    matches.iter().map(|&i| labels[i].as_str()).collect();
+                anyhow::bail!(
+                    "--passkey {want:?} is ambiguous — matches {n} entries \
+                     ({matched_labels:?}); narrow it down"
+                )
+            }
         }
     }
 

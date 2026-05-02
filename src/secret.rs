@@ -116,25 +116,53 @@ pub fn parse_x25519_recipient(s: &str) -> Result<age::x25519::Recipient> {
     })
 }
 
-/// Parse any recipient string — X25519 or plugin. Used by
-/// `yui secret wrap` to encrypt the X25519 identity to
-/// passkey-backed devices.
+/// Parse a single recipient string — X25519 or plugin. Used in
+/// tests and for debugging; production wrap goes through
+/// `parse_passkey_recipients` which batches plugin recipients.
 pub fn parse_passkey_recipient(s: &str) -> Result<BoxedRecipient> {
-    let trimmed = s.trim();
-    if let Ok(r) = age::x25519::Recipient::from_str(trimmed) {
-        return Ok(Box::new(r));
+    parse_passkey_recipients(std::slice::from_ref(&s.to_string()))
+        .map(|mut v| v.pop().expect("single input → single output"))
+}
+
+/// Parse a list of recipient strings, grouping plugin recipients
+/// by plugin name into a single `RecipientPluginV1` per group.
+/// Without grouping, each plugin recipient would spawn the
+/// `age-plugin-*` binary independently — wasteful and (for some
+/// plugins) prompts the user multiple times. (PR #60 review by
+/// gemini-code-assist.)
+///
+/// X25519 recipients pass through one-Box-per-string since they
+/// have no plugin process to batch.
+pub fn parse_passkey_recipients(strings: &[String]) -> Result<Vec<BoxedRecipient>> {
+    use std::collections::BTreeMap;
+
+    let mut out: Vec<BoxedRecipient> = Vec::new();
+    let mut by_plugin: BTreeMap<String, Vec<age::plugin::Recipient>> = BTreeMap::new();
+
+    for s in strings {
+        let trimmed = s.trim();
+        if let Ok(r) = age::x25519::Recipient::from_str(trimmed) {
+            out.push(Box::new(r));
+            continue;
+        }
+        if let Ok(r) = age::plugin::Recipient::from_str(trimmed) {
+            let name = r.plugin().to_string();
+            by_plugin.entry(name).or_default().push(r);
+            continue;
+        }
+        return Err(Error::Other(anyhow::anyhow!(
+            "not a valid age recipient {trimmed:?} \
+             (expected `age1…` or `age1<plugin>1…`)"
+        )));
     }
-    if let Ok(r) = age::plugin::Recipient::from_str(trimmed) {
-        let name = r.plugin().to_string();
-        let plugin_recipient =
-            age::plugin::RecipientPluginV1::new(&name, &[r], &[], UiCallbacks)
-                .map_err(|e| Error::Other(anyhow::anyhow!("plugin recipient {trimmed:?}: {e}")))?;
-        return Ok(Box::new(plugin_recipient));
+
+    for (name, recipients) in by_plugin {
+        let plugin = age::plugin::RecipientPluginV1::new(&name, &recipients, &[], UiCallbacks)
+            .map_err(|e| Error::Other(anyhow::anyhow!("plugin recipient group {name:?}: {e}")))?;
+        out.push(Box::new(plugin));
     }
-    Err(Error::Other(anyhow::anyhow!(
-        "not a valid age recipient {trimmed:?} \
-         (expected `age1…` or `age1<plugin>1…`)"
-    )))
+
+    Ok(out)
 }
 
 /// Encrypt `plaintext` to one or more X25519 recipients. Used for
