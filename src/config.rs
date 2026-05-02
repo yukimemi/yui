@@ -288,10 +288,40 @@ fn default_backup_dir() -> String {
 /// as "secrets feature off".
 #[derive(Debug, Clone, Deserialize)]
 pub struct SecretsConfig {
+    /// Path to the X25519 secret key used by `apply` to decrypt
+    /// `*.age` files. Plain (`AGE-SECRET-KEY-1…`) text, gitignored.
+    /// Default `~/.config/yui/age.txt`.
     #[serde(default = "default_identity_path")]
     pub identity: String,
+
+    /// X25519 public keys that `*.age` files are encrypted to.
+    /// Empty = secrets feature off. Each machine usually adds its
+    /// own here so multi-recipient encryption lets all machines
+    /// decrypt.
     #[serde(default)]
     pub recipients: Vec<String>,
+
+    /// Optional path (source-relative or absolute) where
+    /// `yui secret wrap` stashes the X25519 identity, encrypted to
+    /// `passkey_recipients`. Committed to the dotfiles repo so it
+    /// travels to new machines; `yui secret unlock` reads it
+    /// there. Off when absent.
+    #[serde(default)]
+    pub passkey_wrapped: Option<String>,
+
+    /// Public keys (X25519 or plugin) that `passkey_wrapped` is
+    /// encrypted to. Multiple = redundancy: any one device can
+    /// recover the X25519 secret on a new machine.
+    #[serde(default)]
+    pub passkey_recipients: Vec<String>,
+
+    /// Optional path (source-relative or absolute) to the file
+    /// holding the *identity descriptors* (`AGE-PLUGIN-…` lines)
+    /// that `yui secret unlock` tries against `passkey_wrapped`.
+    /// Plugin identity descriptors are device addresses, not
+    /// secrets — committing them is fine.
+    #[serde(default)]
+    pub passkey_identities: Option<String>,
 }
 
 impl Default for SecretsConfig {
@@ -299,6 +329,9 @@ impl Default for SecretsConfig {
         Self {
             identity: default_identity_path(),
             recipients: Vec::new(),
+            passkey_wrapped: None,
+            passkey_recipients: Vec::new(),
+            passkey_identities: None,
         }
     }
 }
