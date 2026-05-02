@@ -686,13 +686,30 @@ pub fn unlink(source: Option<Utf8PathBuf>, paths_arg: Vec<Utf8PathBuf>) -> Resul
 /// `yui secret init [--comment TEXT]` — generate an age X25519
 /// keypair on this machine, write the secret to the configured
 /// identity path, and append the public key to
-/// `$DOTFILES/config.local.toml` `[secrets] recipients`.
+/// `$DOTFILES/config.toml` `[secrets] recipients`.
 ///
-/// `config.local.toml` is the right place because it's
-/// machine-local and gitignored — committing per-machine recipient
-/// keys to the public repo is fine in principle (recipients are
-/// public information) but the convention has the keys live in
-/// the local file alongside other host-specific config.
+/// `config.toml` is the *committed* config (not the per-machine
+/// `config.local.toml`). That's load-bearing for multi-machine
+/// use: `recipients` is the public-key list every `*.age`
+/// encryption wraps to, so machine B needs to see machine A's
+/// public key after A runs `yui secret init`. Public keys are
+/// safe to commit — the ciphertext only opens with the matching
+/// secret, which never leaves the machine that generated it.
+///
+/// ## Migrating from yui ≤ v0.7.13
+///
+/// Older versions wrote the recipient into `config.local.toml`
+/// (gitignored), which silently broke multi-machine use. If you
+/// ran `yui secret init` against an earlier yui:
+///
+/// 1. Open `$DOTFILES/config.local.toml` and locate the
+///    `[secrets] recipients = [...]` block.
+/// 2. Cut it and paste it into `$DOTFILES/config.toml`.
+/// 3. `git add config.toml && git commit && git push`.
+/// 4. On every other machine: `git pull && yui apply` once.
+///
+/// Subsequent `yui secret init` (e.g. on a new machine) appends
+/// directly to `config.toml` — no manual move needed.
 pub fn secret_init(source: Option<Utf8PathBuf>, comment: Option<String>) -> Result<()> {
     let source = resolve_source(source)?;
     let yui = YuiVars::detect(&source);
@@ -724,20 +741,21 @@ pub fn secret_init(source: Option<Utf8PathBuf>, comment: Option<String>) -> Resu
     secret::write_private_file(&identity_path, body.as_bytes())?;
     info!("wrote identity file: {identity_path}");
 
-    // 3. Append the public key to `[secrets] recipients` in
-    //    config.local.toml — appending is safe because that file
-    //    is the per-machine layer the user explicitly owns.
-    let local_path = source.join("config.local.toml");
+    // 3. Append the public key to `[secrets] recipients` in the
+    //    committed `config.toml`. Recipients are public — the
+    //    other machines need to see this entry to encrypt new
+    //    `*.age` files for the user who just ran init.
+    let config_path = source.join("config.toml");
     let comment = comment.unwrap_or_else(|| format!("{} {}", yui.host, yui.user));
     let entry_comment = format!("{comment} — added by `yui secret init` on {now}");
-    let local_existing = match std::fs::read_to_string(&local_path) {
+    let config_existing = match std::fs::read_to_string(&config_path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => anyhow::bail!("read {local_path}: {e}"),
+        Err(e) => anyhow::bail!("read {config_path}: {e}"),
     };
-    let updated_local = append_recipient_to_local(&local_existing, &entry_comment, &public)?;
-    std::fs::write(&local_path, updated_local)?;
-    info!("appended public key to {local_path}");
+    let updated_config = append_recipient_to_config(&config_existing, &entry_comment, &public)?;
+    std::fs::write(&config_path, updated_config)?;
+    info!("appended public key to {config_path}");
     println!();
     println!("  age identity:  {identity_path}");
     println!("  public key:    {public}");
@@ -749,7 +767,7 @@ pub fn secret_init(source: Option<Utf8PathBuf>, comment: Option<String>) -> Resu
     Ok(())
 }
 
-/// Append a recipient entry to the user's `config.local.toml`.
+/// Append a recipient entry to the user's `config.toml`.
 ///
 /// Uses `toml_edit` to parse the file into an in-memory document
 /// tree, modify the `[secrets].recipients` array, then serialise
@@ -762,7 +780,7 @@ pub fn secret_init(source: Option<Utf8PathBuf>, comment: Option<String>) -> Resu
 ///
 /// Returns the file unchanged when the public key is already in
 /// the recipients list (idempotent re-init).
-fn append_recipient_to_local(existing: &str, comment: &str, public: &str) -> Result<String> {
+fn append_recipient_to_config(existing: &str, comment: &str, public: &str) -> Result<String> {
     use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
     let mut doc: DocumentMut = if existing.trim().is_empty() {
@@ -770,7 +788,7 @@ fn append_recipient_to_local(existing: &str, comment: &str, public: &str) -> Res
     } else {
         existing
             .parse()
-            .map_err(|e| anyhow::anyhow!("config.local.toml is not valid TOML: {e}"))?
+            .map_err(|e| anyhow::anyhow!("config.toml is not valid TOML: {e}"))?
     };
 
     // Make sure `[secrets]` exists as a table.
@@ -780,7 +798,7 @@ fn append_recipient_to_local(existing: &str, comment: &str, public: &str) -> Res
         doc.insert("secrets", Item::Table(t));
     }
     let secrets = doc["secrets"].as_table_mut().ok_or_else(|| {
-        anyhow::anyhow!("[secrets] in config.local.toml is not a table — refusing to clobber")
+        anyhow::anyhow!("[secrets] in config.toml is not a table — refusing to clobber")
     })?;
 
     // Make sure `recipients` is an array.
@@ -5135,12 +5153,12 @@ recipients = ["{}"]
         );
     }
 
-    // -- append_recipient_to_local (PR #57 review: toml_edit) --
+    // -- append_recipient_to_config (PR #57 review: toml_edit) --
 
     #[test]
     fn append_recipient_creates_secrets_table_when_missing() {
         let result =
-            append_recipient_to_local("", "host alice", "age1abcrecipientpublickey").unwrap();
+            append_recipient_to_config("", "host alice", "age1abcrecipientpublickey").unwrap();
         // Round-trip parse — must be valid TOML.
         let parsed: toml::Table = toml::from_str(&result).unwrap();
         let secrets = parsed.get("secrets").and_then(|v| v.as_table()).unwrap();
@@ -5167,7 +5185,7 @@ recipients = ["age1machine_a"]
 [ui]
 icons = "ascii"
 "#;
-        let result = append_recipient_to_local(existing, "host b", "age1machine_b").unwrap();
+        let result = append_recipient_to_config(existing, "host b", "age1machine_b").unwrap();
         let parsed: toml::Table = toml::from_str(&result).unwrap();
         // All three tables still there.
         assert!(parsed.get("vars").is_some());
@@ -5186,7 +5204,7 @@ icons = "ascii"
         let existing = r#"[secrets]
 recipients = ["age1same"]
 "#;
-        let result = append_recipient_to_local(existing, "anyone", "age1same").unwrap();
+        let result = append_recipient_to_config(existing, "anyone", "age1same").unwrap();
         let parsed: toml::Table = toml::from_str(&result).unwrap();
         let recipients = parsed["secrets"]["recipients"].as_array().unwrap();
         assert_eq!(recipients.len(), 1, "duplicate must not be appended twice");
@@ -5199,7 +5217,7 @@ recipients = ["age1same"]
         let existing = r#"[secrets]
 identity = "~/.config/yui/age.txt"
 "#;
-        let result = append_recipient_to_local(existing, "h", "age1new").unwrap();
+        let result = append_recipient_to_config(existing, "h", "age1new").unwrap();
         let parsed: toml::Table = toml::from_str(&result).unwrap();
         let secrets = parsed["secrets"].as_table().unwrap();
         assert_eq!(
