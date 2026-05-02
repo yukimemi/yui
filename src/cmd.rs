@@ -19,6 +19,7 @@ use crate::render::{self, RenderReport};
 use crate::secret;
 use crate::template;
 use crate::vars::YuiVars;
+use crate::vault;
 use crate::{absorb, backup, paths};
 
 // NOTE: `owo_colors::OwoColorize` is intentionally NOT imported at module
@@ -712,16 +713,15 @@ pub fn secret_init(source: Option<Utf8PathBuf>, comment: Option<String>) -> Resu
     //    the same header age-keygen uses, so the file is
     //    interoperable with the standalone CLI tools.
     let (secret, public) = secret::generate_x25519_keypair();
-    if let Some(parent) = identity_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let now = jiff::Zoned::now().to_string();
     let body = format!(
         "# created: {now}\n\
          # public key: {public}\n\
          {secret}\n"
     );
-    std::fs::write(&identity_path, body)?;
+    // 0600 on Unix so other local users can't read the X25519
+    // secret. PR #60 review by coderabbitai.
+    secret::write_private_file(&identity_path, body.as_bytes())?;
     info!("wrote identity file: {identity_path}");
 
     // 3. Append the public key to `[secrets] recipients` in
@@ -850,13 +850,15 @@ pub fn secret_encrypt(
     }
 
     let plaintext = std::fs::read(&plaintext_path)?;
-    let recipients: Vec<age::x25519::Recipient> = config
-        .secrets
-        .recipients
-        .iter()
-        .map(|s| secret::parse_recipient(s))
-        .collect::<crate::Result<_>>()?;
-    let cipher = secret::encrypt(&plaintext, &recipients)?;
+    // Use the general parser so `[secrets].recipients` can hold
+    // plugin entries (`age1yubikey1…` / `age1fido2-hmac1…` etc.)
+    // alongside the X25519 ones. yui doesn't drive plugin flows
+    // first-class, but a hand-written plugin recipient still gets
+    // a stanza in the ciphertext — useful if a user wants their
+    // YubiKey to decrypt the same `*.age` outside yui via the
+    // standalone `age` CLI.
+    let recipients = secret::parse_passkey_recipients(&config.secrets.recipients)?;
+    let cipher = secret::encrypt_to_passkeys(&plaintext, &recipients)?;
     std::fs::write(&cipher_path, &cipher)?;
     info!("encrypted {plaintext_path} → {cipher_path}");
 
@@ -873,6 +875,105 @@ pub fn secret_encrypt(
             );
         }
     }
+    Ok(())
+}
+
+/// `yui secret store [--force]` — push the X25519 identity at
+/// `[secrets].identity` into the configured `[secrets.vault]`.
+/// Run on a machine that already has the identity; the new
+/// machine then recovers it via `yui secret unlock`.
+///
+/// yui doesn't drive the vault's auth flow itself — it shells
+/// out to `bw` / `op`. Whatever those CLIs are configured to
+/// accept (master password, biometric, passkey unlock in the
+/// web vault, SSO) gates the operation.
+pub fn secret_store(source: Option<Utf8PathBuf>, force: bool) -> Result<()> {
+    let source = resolve_source(source)?;
+    let yui = YuiVars::detect(&source);
+    let config = config::load(&source, &yui)?;
+
+    let vault_cfg = config.secrets.vault.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "[secrets.vault] is not configured — set provider \
+             (\"bitwarden\" or \"1password\") and item before \
+             calling store"
+        )
+    })?;
+
+    let identity_path = paths::expand_tilde(&config.secrets.identity);
+    if !identity_path.is_file() {
+        anyhow::bail!(
+            "no X25519 identity at {identity_path}; run `yui secret init` first \
+             (store needs that file's content to push to the vault)"
+        );
+    }
+    let plaintext = std::fs::read(&identity_path)?;
+
+    let vault = vault::driver(vault_cfg);
+    info!(
+        "pushing X25519 identity to {} item {:?}",
+        vault.provider_name(),
+        vault_cfg.item
+    );
+    vault.store(&vault_cfg.item, &plaintext, force)?;
+
+    println!();
+    println!(
+        "  X25519 identity pushed to {} item {:?}",
+        vault.provider_name(),
+        vault_cfg.item
+    );
+    println!("  On a new machine, run `yui secret unlock`.");
+    Ok(())
+}
+
+/// `yui secret unlock` — fetch the X25519 identity from the
+/// configured `[secrets.vault]` and write it to
+/// `[secrets].identity`. The vault provider's CLI (`bw` / `op`)
+/// handles auth — yui inherits whatever factor that CLI is
+/// configured to require.
+pub fn secret_unlock(source: Option<Utf8PathBuf>) -> Result<()> {
+    let source = resolve_source(source)?;
+    let yui = YuiVars::detect(&source);
+    let config = config::load(&source, &yui)?;
+
+    let vault_cfg = config.secrets.vault.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "[secrets.vault] is not configured — nothing to unlock. \
+             Run `yui secret init` + `yui secret store` on an existing \
+             machine first, then commit + push the config."
+        )
+    })?;
+    let identity_path = paths::expand_tilde(&config.secrets.identity);
+    if identity_path.exists() {
+        anyhow::bail!(
+            "{identity_path} already exists — refusing to clobber a live \
+             X25519 identity. Delete it first if you really mean to \
+             re-unlock from scratch."
+        );
+    }
+
+    let vault = vault::driver(vault_cfg);
+    info!(
+        "fetching X25519 identity from {} item {:?}",
+        vault.provider_name(),
+        vault_cfg.item
+    );
+    let plaintext = vault.fetch(&vault_cfg.item)?;
+
+    // Validate before persisting — the vault could legitimately
+    // hold any blob, so the fetched bytes might not actually be
+    // an age identity (typo'd item name, wrong field). Bail
+    // before touching `[secrets].identity` so a future apply
+    // doesn't fail with a confusing "not a valid age key" error.
+    secret::validate_x25519_identity_bytes(&plaintext)?;
+
+    // 0600 on Unix — never leave the X25519 secret world-readable.
+    secret::write_private_file(&identity_path, &plaintext)?;
+    info!("wrote X25519 identity: {identity_path}");
+    println!();
+    println!("  X25519 identity restored at {identity_path}");
+    println!("  Run `yui apply` next.");
     Ok(())
 }
 
@@ -4940,8 +5041,8 @@ dst = "{}"
         std::fs::write(&identity_path, format!("{secret}\n")).unwrap();
 
         // 2. Encrypt a fake private key into source as `.age`.
-        let recipient = secret::parse_recipient(&public).unwrap();
-        let cipher = secret::encrypt(b"-- super secret key --\n", &[recipient]).unwrap();
+        let recipient = secret::parse_x25519_recipient(&public).unwrap();
+        let cipher = secret::encrypt_x25519(b"-- super secret key --\n", &[recipient]).unwrap();
         std::fs::write(source.join("home/.ssh/id_ed25519.age"), &cipher).unwrap();
 
         // 3. config.toml: mount + secrets pointing at the test identity.
@@ -4994,8 +5095,8 @@ recipients = ["{}"]
         let (secret_key, public) = secret::generate_x25519_keypair();
         std::fs::write(&identity_path, format!("{secret_key}\n")).unwrap();
 
-        let recipient = secret::parse_recipient(&public).unwrap();
-        let cipher = secret::encrypt(b"v1 content\n", &[recipient]).unwrap();
+        let recipient = secret::parse_x25519_recipient(&public).unwrap();
+        let cipher = secret::encrypt_x25519(b"v1 content\n", &[recipient]).unwrap();
         std::fs::write(source.join("home/secret.age"), &cipher).unwrap();
         // Drifted sibling: plaintext exists but doesn't match the .age content.
         std::fs::write(source.join("home/secret"), "edited locally\n").unwrap();

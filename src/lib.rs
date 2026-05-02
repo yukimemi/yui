@@ -15,6 +15,7 @@ pub mod render;
 pub mod secret;
 pub mod template;
 pub mod vars;
+pub mod vault;
 
 pub use error::{Error, Result};
 

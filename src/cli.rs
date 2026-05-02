@@ -241,6 +241,25 @@ pub enum SecretAction {
         #[arg(long)]
         rm_plaintext: bool,
     },
+
+    /// Push the X25519 secret at `[secrets].identity` into the
+    /// configured `[secrets.vault]` (Bitwarden or 1Password).
+    /// Run this once on a machine that has the X25519; then on
+    /// a new machine `yui secret unlock` recovers it through the
+    /// vault provider's own auth (master password, biometric,
+    /// passkey, SSO — whatever the vault itself accepts).
+    Store {
+        /// Overwrite the existing vault item without prompting.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Fetch the X25519 secret from the configured `[secrets.vault]`
+    /// and write it to `[secrets].identity`. The vault CLI (`bw`
+    /// or `op`) handles its own auth, so any factor that CLI
+    /// supports (passkey unlock in the BW web vault, Touch ID via
+    /// 1Password, …) gates this command.
+    Unlock,
 }
 
 #[derive(Subcommand, Debug)]
@@ -308,6 +327,8 @@ impl Cli {
                     force,
                     rm_plaintext,
                 } => cmd::secret_encrypt(source, path, force, rm_plaintext),
+                SecretAction::Store { force } => cmd::secret_store(source, force),
+                SecretAction::Unlock => cmd::secret_unlock(source),
             },
             Command::Completion { shell } => {
                 let mut cmd = Cli::command();
