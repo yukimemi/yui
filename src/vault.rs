@@ -33,9 +33,19 @@ use crate::{Error, Result};
 /// "store a Secure Note's content" — the only two operations
 /// `secret store` / `secret unlock` need.
 pub trait Vault {
+    /// Verify that the vault CLI is installed and authenticated
+    /// before we try to read or write. yui doesn't drive
+    /// `bw login` / `op signin` / `bw unlock` itself (the master
+    /// password / passkey / SSO factor should go to the
+    /// provider's CLI directly, not through yui's stdin), but it
+    /// can at least detect the unauthenticated / locked state up
+    /// front and emit an actionable hint instead of letting the
+    /// raw provider error propagate.
+    fn precheck(&self) -> Result<()>;
+
     /// Read the notes field of `item`. Errors if the item is
-    /// missing, the CLI isn't authenticated, or the CLI is not
-    /// installed.
+    /// missing or the CLI isn't installed. (Auth state is checked
+    /// separately via `precheck`.)
     fn fetch(&self, item: &str) -> Result<Vec<u8>>;
 
     /// Create or overwrite the Secure Note at `item` with
@@ -62,6 +72,40 @@ struct BitwardenVault;
 impl Vault for BitwardenVault {
     fn provider_name(&self) -> &'static str {
         "Bitwarden"
+    }
+
+    fn precheck(&self) -> Result<()> {
+        let out = Command::new("bw").args(["status"]).output().map_err(|e| {
+            Error::Other(anyhow::anyhow!(
+                "invoking `bw status`: {e} — is the Bitwarden CLI installed?"
+            ))
+        })?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(Error::Other(anyhow::anyhow!(
+                "bw status failed: {}",
+                stderr.trim()
+            )));
+        }
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .map_err(|e| Error::Other(anyhow::anyhow!("parse bw status output: {e}")))?;
+        match v.get("status").and_then(|s| s.as_str()) {
+            Some("unlocked") => Ok(()),
+            Some("locked") => Err(Error::Other(anyhow::anyhow!(
+                "Bitwarden vault is locked. Run `bw unlock` and follow \
+                 its instructions to export the BW_SESSION env var, then \
+                 retry. (BW vault unlock can use a passkey via the web \
+                 vault flow if you've set that up.)"
+            ))),
+            Some("unauthenticated") => Err(Error::Other(anyhow::anyhow!(
+                "Bitwarden CLI is not logged in. Run `bw login` (or \
+                 `bw login --apikey` for non-interactive SSO/API-key \
+                 use), then `bw unlock`, then retry."
+            ))),
+            other => Err(Error::Other(anyhow::anyhow!(
+                "unexpected `bw status` output: status={other:?}"
+            ))),
+        }
     }
 
     fn fetch(&self, item: &str) -> Result<Vec<u8>> {
@@ -171,6 +215,30 @@ struct OnePasswordVault;
 impl Vault for OnePasswordVault {
     fn provider_name(&self) -> &'static str {
         "1Password"
+    }
+
+    fn precheck(&self) -> Result<()> {
+        // `op whoami` exits non-zero when the session is gone or
+        // the desktop-app integration isn't unlocked. Stderr from
+        // op already carries a decent message ("[ERROR] you are
+        // not currently signed in. ..."); we wrap it with a yui-
+        // shaped hint so the user doesn't have to wonder which
+        // command we just tried.
+        let out = Command::new("op").args(["whoami"]).output().map_err(|e| {
+            Error::Other(anyhow::anyhow!(
+                "invoking `op whoami`: {e} — is the 1Password CLI installed?"
+            ))
+        })?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        Err(Error::Other(anyhow::anyhow!(
+            "1Password CLI is not signed in: {}. \
+             Run `op signin` (or unlock the 1Password desktop app to \
+             auto-share its session via the CLI integration), then retry.",
+            stderr.trim()
+        )))
     }
 
     fn fetch(&self, item: &str) -> Result<Vec<u8>> {

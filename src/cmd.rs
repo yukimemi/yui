@@ -910,6 +910,11 @@ pub fn secret_store(source: Option<Utf8PathBuf>, force: bool) -> Result<()> {
     let plaintext = std::fs::read(&identity_path)?;
 
     let vault = vault::driver(vault_cfg);
+    // Verify the provider CLI is installed and authenticated
+    // BEFORE reading the identity into memory + pushing — gives
+    // the user an actionable hint instead of the raw `bw` /
+    // `op` error from the upcoming write.
+    vault.precheck()?;
     info!(
         "pushing X25519 identity to {} item {:?}",
         vault.provider_name(),
@@ -954,6 +959,7 @@ pub fn secret_unlock(source: Option<Utf8PathBuf>) -> Result<()> {
     }
 
     let vault = vault::driver(vault_cfg);
+    vault.precheck()?;
     info!(
         "fetching X25519 identity from {} item {:?}",
         vault.provider_name(),
