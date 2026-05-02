@@ -58,5 +58,5 @@ command = "apm"
 args = ["install", "-t", "copilot,claude,gemini"]
 
 [tasks.setup]
-description = "One-time setup for new contributors: pre-push hook + APM install"
+description = "One-time setup for new contributors: pre-push hook + APM install (requires `apm` CLI on PATH — see https://github.com/microsoft/apm)"
 dependencies = ["hook-install", "apm-install"]
