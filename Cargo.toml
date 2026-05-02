@@ -48,7 +48,7 @@ similar = "3"
 tera = "1.20.1"
 thiserror = "2.0.18"
 toml = "1.1.2"
-toml_edit = "0.23"
+toml_edit = "0.25.11"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 whoami = "2"
