@@ -712,16 +712,15 @@ pub fn secret_init(source: Option<Utf8PathBuf>, comment: Option<String>) -> Resu
     //    the same header age-keygen uses, so the file is
     //    interoperable with the standalone CLI tools.
     let (secret, public) = secret::generate_x25519_keypair();
-    if let Some(parent) = identity_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let now = jiff::Zoned::now().to_string();
     let body = format!(
         "# created: {now}\n\
          # public key: {public}\n\
          {secret}\n"
     );
-    std::fs::write(&identity_path, body)?;
+    // 0600 on Unix so other local users can't read the X25519
+    // secret. PR #60 review by coderabbitai.
+    secret::write_private_file(&identity_path, body.as_bytes())?;
     info!("wrote identity file: {identity_path}");
 
     // 3. Append the public key to `[secrets] recipients` in
@@ -1010,10 +1009,17 @@ pub fn secret_unlock(source: Option<Utf8PathBuf>, passkey: Option<String>) -> Re
         secret::decrypt_with_passkeys(&cipher, &identities)?
     };
 
-    if let Some(parent) = identity_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&identity_path, &plaintext)?;
+    // Validate before persisting — `decrypt_with_passkeys` only
+    // proves the blob unwrapped, not that the result is actually
+    // an X25519 identity file. If the user mis-pointed
+    // passkey_wrapped at some other ciphertext, fail here rather
+    // than write garbage that would only fail later during apply.
+    // PR #60 review by coderabbitai.
+    secret::validate_x25519_identity_bytes(&plaintext)?;
+
+    // 0600 on Unix — never leave the X25519 secret world-readable
+    // even momentarily. PR #60 review by coderabbitai.
+    secret::write_private_file(&identity_path, &plaintext)?;
     info!("wrote unwrapped X25519 identity: {identity_path}");
     println!();
     println!("  X25519 identity restored at {identity_path}");

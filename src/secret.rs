@@ -53,6 +53,71 @@ use crate::{Error, Result};
 /// and plugin variants share the same type at the boundary.
 pub type BoxedIdentity = Box<dyn age::Identity>;
 
+/// Validate that `bytes` is a parseable X25519 identity file —
+/// at least one non-comment line is `AGE-SECRET-KEY-1…`. Used by
+/// `yui secret unlock` to fail before persisting bytes that
+/// happen to decrypt but aren't actually an identity (wrong
+/// `passkey_wrapped` path / corrupted blob). PR #60 review by
+/// coderabbitai.
+pub fn validate_x25519_identity_bytes(bytes: &[u8]) -> Result<()> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        Error::Other(anyhow::anyhow!(
+            "decrypted payload is not valid UTF-8 — \
+             passkey_wrapped doesn't look like an age identity file"
+        ))
+    })?;
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .ok_or_else(|| {
+            Error::Other(anyhow::anyhow!(
+                "decrypted payload contains no key line \
+                 (only comments / blank lines) — passkey_wrapped \
+                 is not an age identity file"
+            ))
+        })?;
+    age::x25519::Identity::from_str(line)
+        .map(drop)
+        .map_err(|e| {
+            Error::Other(anyhow::anyhow!(
+                "decrypted payload is not a valid age X25519 secret \
+             (`AGE-SECRET-KEY-1…` expected): {e}"
+            ))
+        })
+}
+
+/// Write `bytes` to `path` with owner-only permissions on Unix
+/// (0600). On Windows we fall back to a plain write because file
+/// permissions don't translate cleanly — the user's `AGE-SECRET-KEY`
+/// is still in their `~/.config/yui/` directory which isn't shared
+/// by default. Used by both `secret_init` and `secret_unlock` so
+/// neither flow leaves the X25519 secret world-readable. PR #60
+/// review by coderabbitai.
+pub fn write_private_file(path: &Utf8Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| Error::Other(anyhow::anyhow!("create {path}: {e}")))?;
+        file.write_all(bytes)
+            .map_err(|e| Error::Other(anyhow::anyhow!("write {path}: {e}")))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, bytes).map_err(|e| Error::Other(anyhow::anyhow!("write {path}: {e}")))?;
+    Ok(())
+}
+
 /// Boxed dyn-trait recipient. Same reasoning as `BoxedIdentity` —
 /// `Encryptor::with_recipients` works on trait objects.
 pub type BoxedRecipient = Box<dyn age::Recipient + Send>;
@@ -496,6 +561,64 @@ mod tests {
     fn parse_recipient_rejects_garbage() {
         let err = parse_x25519_recipient("ssh-rsa AAAA…").unwrap_err();
         assert!(format!("{err}").contains("not a valid age X25519 recipient"));
+    }
+
+    /// PR #60 review: don't persist a decrypted blob that isn't
+    /// actually an age identity. Successful decrypt + bad payload
+    /// must fail, never get to disk.
+    #[test]
+    fn validate_x25519_identity_bytes_round_trip() {
+        let (secret, _public) = generate_x25519_keypair();
+        let body = format!("# header\n{secret}\n");
+        validate_x25519_identity_bytes(body.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn validate_x25519_identity_bytes_rejects_non_identity() {
+        let err = validate_x25519_identity_bytes(b"this is not an age identity\n").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not a valid age X25519 secret") || msg.contains("contains no key line"),
+            "unexpected error: {msg}",
+        );
+    }
+
+    #[test]
+    fn validate_x25519_identity_bytes_rejects_non_utf8() {
+        let err = validate_x25519_identity_bytes(&[0xff, 0xfe, 0x00]).unwrap_err();
+        assert!(format!("{err}").contains("not valid UTF-8"));
+    }
+
+    /// PR #60 review: write_private_file should never leave the
+    /// X25519 secret world-readable. We can only assert mode 0o600
+    /// on Unix; on Windows the helper falls back to plain write.
+    #[test]
+    fn write_private_file_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let path = Utf8PathBuf::from_path_buf(tmp.path().join("nested/age.txt")).unwrap();
+        write_private_file(&path, b"hello\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            // mode includes file type bits; mask down to perms.
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "expected 0o600, got {:o}",
+                mode & 0o777
+            );
+        }
+    }
+
+    #[test]
+    fn write_private_file_overwrites_existing() {
+        let tmp = TempDir::new().unwrap();
+        let path = Utf8PathBuf::from_path_buf(tmp.path().join("age.txt")).unwrap();
+        write_private_file(&path, b"v1").unwrap();
+        write_private_file(&path, b"v2").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"v2");
     }
 
     #[test]
