@@ -1,6 +1,6 @@
 [package]
 name = "yui-cli"
-version = "0.7.14"
+version = "0.7.15"
 edition = "2024"
 rust-version = "1.85"
 description = "Target-as-truth dotfiles manager: edit your live configs, source repo updates automatically via hardlink/junction/symlink."
