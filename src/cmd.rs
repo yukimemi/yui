@@ -695,8 +695,21 @@ pub fn unlink(source: Option<Utf8PathBuf>, paths_arg: Vec<Utf8PathBuf>) -> Resul
 /// public key after A runs `yui secret init`. Public keys are
 /// safe to commit — the ciphertext only opens with the matching
 /// secret, which never leaves the machine that generated it.
-/// (Earlier versions wrote to `config.local.toml`, which made
-/// each machine's pub key invisible to every other machine.)
+///
+/// ## Migrating from yui ≤ v0.7.13
+///
+/// Older versions wrote the recipient into `config.local.toml`
+/// (gitignored), which silently broke multi-machine use. If you
+/// ran `yui secret init` against an earlier yui:
+///
+/// 1. Open `$DOTFILES/config.local.toml` and locate the
+///    `[secrets] recipients = [...]` block.
+/// 2. Cut it and paste it into `$DOTFILES/config.toml`.
+/// 3. `git add config.toml && git commit && git push`.
+/// 4. On every other machine: `git pull && yui apply` once.
+///
+/// Subsequent `yui secret init` (e.g. on a new machine) appends
+/// directly to `config.toml` — no manual move needed.
 pub fn secret_init(source: Option<Utf8PathBuf>, comment: Option<String>) -> Result<()> {
     let source = resolve_source(source)?;
     let yui = YuiVars::detect(&source);
