@@ -40,6 +40,50 @@ pub fn home_dir() -> Option<Utf8PathBuf> {
         .map(Utf8PathBuf::from)
 }
 
+/// Resolve a `[[mount.entry]] src = "..."` value to an absolute
+/// path. `~` and `~/...` expand to the home directory; absolute
+/// inputs are returned verbatim (so a private clone at
+/// `~/.dotfiles-private/home` mounts directly without symlinking).
+/// Anything else is treated as relative to `source` (the dotfiles
+/// repo root) — the historical default.
+///
+/// Implementation detail: `Utf8PathBuf::join` already replaces the
+/// base with absolute arguments, so we just need `expand_tilde`
+/// first to handle the `~` form.
+///
+/// If `expand_tilde` couldn't resolve `~` (both `HOME` and
+/// `USERPROFILE` unset), it returns the input verbatim — in that
+/// case we MUST NOT rebase it under `source`, because
+/// `<source>/~/foo` silently resolves to a wrong tree instead of
+/// surfacing the unset-home configuration error. Return the
+/// unresolved `~` form so the caller hits a clear "no such path"
+/// later. (Caught in PR #56 review by coderabbitai.)
+pub fn resolve_mount_src(source: &Utf8Path, src: &str) -> Utf8PathBuf {
+    resolve_mount_src_with(source, src, home_dir().as_deref())
+}
+
+/// `resolve_mount_src` with an explicit home — used in tests so we
+/// don't mutate the process-wide `HOME` env var (which races with
+/// parallel tests). Production code goes through `resolve_mount_src`.
+pub fn resolve_mount_src_with(
+    source: &Utf8Path,
+    src: &str,
+    home: Option<&Utf8Path>,
+) -> Utf8PathBuf {
+    let expanded = match home {
+        Some(h) => expand_tilde_with(src, h),
+        None => Utf8PathBuf::from(src),
+    };
+    let is_tilde_form = src == "~" || src.starts_with("~/") || src.starts_with("~\\");
+    if is_tilde_form && expanded.as_str() == src {
+        // No home to resolve against — return the unresolved form
+        // verbatim so the caller surfaces a clear "no such path"
+        // rather than a silent rebase under `source`.
+        return expanded;
+    }
+    source.join(expanded)
+}
+
 /// One-shot `.yuiignore` test for a single path under `source`.
 ///
 /// Builds a fresh `YuiIgnoreStack`, pushes every directory between
@@ -297,6 +341,66 @@ mod tests {
         assert_eq!(
             expand_tilde_with("~root/foo", home),
             Utf8PathBuf::from("~root/foo")
+        );
+    }
+
+    /// Regression for PR #56 review: when neither `HOME` nor
+    /// `USERPROFILE` is set, `expand_tilde` is a no-op and returns
+    /// `~/foo` verbatim. `resolve_mount_src` must NOT then rebase
+    /// it under `source` (which would yield `<source>/~/foo`,
+    /// silently pointing at a wrong tree). Instead, return the
+    /// unresolved `~/foo` so the caller's "no such path" error is
+    /// the clear failure mode.
+    #[test]
+    fn resolve_mount_src_preserves_unresolved_tilde() {
+        let source = Utf8Path::new("/dot");
+        // `home: None` simulates HOME / USERPROFILE both unset.
+        assert_eq!(
+            resolve_mount_src_with(source, "~/foo", None),
+            Utf8PathBuf::from("~/foo"),
+        );
+        assert_eq!(
+            resolve_mount_src_with(source, "~", None),
+            Utf8PathBuf::from("~"),
+        );
+    }
+
+    /// When home is available, `~/foo` resolves to the absolute
+    /// `<HOME>/foo` and `Utf8PathBuf::join` correctly drops
+    /// `source` (absolute argument replaces the base).
+    #[test]
+    fn resolve_mount_src_expands_tilde_when_home_set() {
+        let source = Utf8Path::new("/dot");
+        let home = Utf8Path::new("/h/u");
+        assert_eq!(
+            resolve_mount_src_with(source, "~/private/home", Some(home)),
+            Utf8PathBuf::from("/h/u/private/home"),
+        );
+        assert_eq!(
+            resolve_mount_src_with(source, "~", Some(home)),
+            Utf8PathBuf::from("/h/u"),
+        );
+    }
+
+    /// Plain relative input keeps the historical "join under
+    /// source" behaviour.
+    #[test]
+    fn resolve_mount_src_relative_joins_under_source() {
+        let source = Utf8Path::new("/dot");
+        assert_eq!(
+            resolve_mount_src_with(source, "home", Some(Utf8Path::new("/h/u"))),
+            Utf8PathBuf::from("/dot/home"),
+        );
+    }
+
+    /// Absolute input is returned verbatim (Path::join with
+    /// absolute replaces the base).
+    #[test]
+    fn resolve_mount_src_absolute_returns_verbatim() {
+        let source = Utf8Path::new("/dot");
+        assert_eq!(
+            resolve_mount_src_with(source, "/abs/private/home", Some(Utf8Path::new("/h/u"))),
+            Utf8PathBuf::from("/abs/private/home"),
         );
     }
 

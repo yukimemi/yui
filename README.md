@@ -118,6 +118,17 @@ file to a directory to junction the whole directory as one unit (so
 files an app creates inside that dir land back in source
 automatically).
 
+`src` is the path *to* yui's source for that mount; it accepts
+relative paths (resolved against `$DOTFILES`), absolute paths, `~`
+/ `~/...`, and Tera tags. So a private clone outside `$DOTFILES`
+can participate as its own mount:
+
+```toml
+[[mount.entry]]
+src = "~/.dotfiles-private/home"
+dst = "~"
+```
+
 ## Templates (`*.tera`)
 
 Files ending in `.tera` are rendered with [Tera] before linking; the
