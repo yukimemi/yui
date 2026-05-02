@@ -30,12 +30,11 @@ name = "yui"
 path = "src/lib.rs"
 
 [dependencies]
-age = { version = "0.11.3", features = ["cli-common", "plugin"] }
+age = "0.11.3"
 anyhow = "1.0.102"
 camino = { version = "1.2.2", features = ["serde1"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 clap_complete = "4.6.3"
-dialoguer = { version = "0.12", default-features = false }
 globset = "0.4.18"
 ignore = "0.4.25"
 indicatif = "0.18.4"

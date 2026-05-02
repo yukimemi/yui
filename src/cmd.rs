@@ -712,15 +712,16 @@ pub fn secret_init(source: Option<Utf8PathBuf>, comment: Option<String>) -> Resu
     //    the same header age-keygen uses, so the file is
     //    interoperable with the standalone CLI tools.
     let (secret, public) = secret::generate_x25519_keypair();
+    if let Some(parent) = identity_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let now = jiff::Zoned::now().to_string();
     let body = format!(
         "# created: {now}\n\
          # public key: {public}\n\
          {secret}\n"
     );
-    // 0600 on Unix so other local users can't read the X25519
-    // secret. PR #60 review by coderabbitai.
-    secret::write_private_file(&identity_path, body.as_bytes())?;
+    std::fs::write(&identity_path, body)?;
     info!("wrote identity file: {identity_path}");
 
     // 3. Append the public key to `[secrets] recipients` in
@@ -853,9 +854,9 @@ pub fn secret_encrypt(
         .secrets
         .recipients
         .iter()
-        .map(|s| secret::parse_x25519_recipient(s))
+        .map(|s| secret::parse_recipient(s))
         .collect::<crate::Result<_>>()?;
-    let cipher = secret::encrypt_x25519(&plaintext, &recipients)?;
+    let cipher = secret::encrypt(&plaintext, &recipients)?;
     std::fs::write(&cipher_path, &cipher)?;
     info!("encrypted {plaintext_path} → {cipher_path}");
 
@@ -873,277 +874,6 @@ pub fn secret_encrypt(
         }
     }
     Ok(())
-}
-
-/// `yui secret wrap` — encrypt the X25519 secret at
-/// `[secrets].identity` to every recipient in
-/// `[secrets].passkey_recipients` and write the ciphertext to
-/// `[secrets].passkey_wrapped`. Committing that ciphertext lets
-/// the dotfiles repo carry the X25519 secret across machines
-/// safely; on a new machine `yui secret unlock` taps the user's
-/// passkey device (Pixel / Bitwarden / YubiKey) once to recover
-/// the plain X25519, after which everyday `apply` is plugin-free.
-pub fn secret_wrap(source: Option<Utf8PathBuf>) -> Result<()> {
-    let source = resolve_source(source)?;
-    let yui = YuiVars::detect(&source);
-    let config = config::load(&source, &yui)?;
-
-    let wrapped_rel = config.secrets.passkey_wrapped.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "[secrets].passkey_wrapped is not configured — set it to a \
-             repo-relative path (e.g. \".yui/age.txt.age\") before calling wrap"
-        )
-    })?;
-    if config.secrets.passkey_recipients.is_empty() {
-        anyhow::bail!(
-            "[secrets].passkey_recipients is empty — add at least one \
-             passkey public key (e.g. an `age1fido2-hmac1…` from \
-             `age-plugin-fido2-hmac --generate`) before calling wrap"
-        );
-    }
-    let identity_path = paths::expand_tilde(&config.secrets.identity);
-    if !identity_path.is_file() {
-        anyhow::bail!(
-            "no X25519 identity at {identity_path}; run `yui secret init` first \
-             (wrap encrypts that file's contents to your passkey devices)"
-        );
-    }
-    let wrapped_path = resolve_secrets_path(&source, wrapped_rel);
-
-    let plaintext = std::fs::read(&identity_path)?;
-    // Use the batch parser so multiple recipients of the same
-    // plugin share a single `RecipientPluginV1` (one process
-    // invocation, one prompt round). PR #60 review.
-    let recipients = secret::parse_passkey_recipients(&config.secrets.passkey_recipients)?;
-    let cipher = secret::encrypt_to_passkeys(&plaintext, &recipients)?;
-    if let Some(parent) = wrapped_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&wrapped_path, &cipher)?;
-    info!("wrote passkey-wrapped identity: {wrapped_path}");
-    println!();
-    println!("  Recipients: {}", config.secrets.passkey_recipients.len());
-    println!("  Wrapped at: {wrapped_path}");
-    println!();
-    println!("  Commit this file. On a new machine, run `yui secret unlock`.");
-    Ok(())
-}
-
-/// `yui secret unlock` — decrypt `[secrets].passkey_wrapped` using
-/// any identity in `[secrets].passkey_identities`, write the
-/// resulting plaintext to `[secrets].identity`. With multiple
-/// passkey identities AND a TTY, presents an interactive picker
-/// so the user can choose which device to use (Pixel vs
-/// Bitwarden); off-TTY or with `--passkey <label>` the choice is
-/// non-interactive.
-pub fn secret_unlock(source: Option<Utf8PathBuf>, passkey: Option<String>) -> Result<()> {
-    let source = resolve_source(source)?;
-    let yui = YuiVars::detect(&source);
-    let config = config::load(&source, &yui)?;
-
-    let wrapped_rel = config.secrets.passkey_wrapped.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "[secrets].passkey_wrapped is not set — nothing to unlock. \
-             Run `yui secret init` + `yui secret wrap` on an existing \
-             machine first, then commit + push."
-        )
-    })?;
-    let identities_rel = config.secrets.passkey_identities.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "[secrets].passkey_identities is not set — point it at the \
-             file holding your `AGE-PLUGIN-…` identity descriptors \
-             (e.g. \".yui/passkeys.txt\")"
-        )
-    })?;
-
-    let wrapped_path = resolve_secrets_path(&source, wrapped_rel);
-    let identities_path = resolve_secrets_path(&source, identities_rel);
-    let identity_path = paths::expand_tilde(&config.secrets.identity);
-
-    if !wrapped_path.is_file() {
-        anyhow::bail!("passkey_wrapped not found at {wrapped_path}");
-    }
-    if !identities_path.is_file() {
-        anyhow::bail!("passkey_identities not found at {identities_path}");
-    }
-    if identity_path.exists() {
-        anyhow::bail!(
-            "{identity_path} already exists — refusing to clobber a live \
-             X25519 identity. Delete it first if you really mean to \
-             re-unlock from scratch."
-        );
-    }
-
-    // Parse the identities file twice — once to pluck per-entry
-    // labels (preceding `# comment` lines) for the picker, once
-    // through age's IdentityFile to get the actual usable
-    // identities. The two parses iterate the file in the same
-    // order, so labels[i] corresponds to identities[i].
-    let raw = std::fs::read_to_string(&identities_path)?;
-    let labels = parse_identity_labels(&raw);
-    let identities = secret::load_passkey_identities(&identities_path)?;
-    if identities.is_empty() {
-        anyhow::bail!(
-            "no identities loaded from {identities_path}; expected one \
-             or more `AGE-PLUGIN-…` (or `AGE-SECRET-KEY-1…`) lines"
-        );
-    }
-
-    let picked_idx = pick_passkey_identity(&labels, identities.len(), passkey.as_deref())?;
-    let cipher = std::fs::read(&wrapped_path)?;
-
-    // If the user picked a specific identity, hand only that one
-    // to age — otherwise age tries them all in file order.
-    let plaintext = if let Some(idx) = picked_idx {
-        let single: Vec<secret::BoxedIdentity> = vec![identities.into_iter().nth(idx).unwrap()];
-        info!(
-            "unlocking via {}",
-            labels.get(idx).map(String::as_str).unwrap_or("(unlabeled)")
-        );
-        secret::decrypt_with_passkeys(&cipher, &single)?
-    } else {
-        info!(
-            "unlocking — age will try {} identities in order",
-            identities.len()
-        );
-        secret::decrypt_with_passkeys(&cipher, &identities)?
-    };
-
-    // Validate before persisting — `decrypt_with_passkeys` only
-    // proves the blob unwrapped, not that the result is actually
-    // an X25519 identity file. If the user mis-pointed
-    // passkey_wrapped at some other ciphertext, fail here rather
-    // than write garbage that would only fail later during apply.
-    // PR #60 review by coderabbitai.
-    secret::validate_x25519_identity_bytes(&plaintext)?;
-
-    // 0600 on Unix — never leave the X25519 secret world-readable
-    // even momentarily. PR #60 review by coderabbitai.
-    secret::write_private_file(&identity_path, &plaintext)?;
-    info!("wrote unwrapped X25519 identity: {identity_path}");
-    println!();
-    println!("  X25519 identity restored at {identity_path}");
-    println!("  Run `yui apply` next — no more passkey prompts needed.");
-    Ok(())
-}
-
-/// Given a list of human-readable labels (one per identity) and
-/// a non-interactive override (`--passkey <label>`), decide which
-/// identity to use. Returns `Some(idx)` for a single pick, `None`
-/// for "let age try them all in order".
-///
-/// Decision tree:
-///   - explicit `--passkey <label>` → match by label (case-insensitive substring),
-///     error if no / multiple match
-///   - 1 identity                 → use it (no prompt)
-///   - multiple identities + TTY  → dialoguer Select
-///   - multiple identities + no TTY → fall through to "try them all"
-fn pick_passkey_identity(
-    labels: &[String],
-    identity_count: usize,
-    override_label: Option<&str>,
-) -> Result<Option<usize>> {
-    if let Some(want) = override_label {
-        let needle = want.to_ascii_lowercase();
-        let matches: Vec<usize> = labels
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.to_ascii_lowercase().contains(&needle))
-            .map(|(i, _)| i)
-            .collect();
-        match matches.len() {
-            0 => anyhow::bail!(
-                "--passkey {want:?} matches no identity label \
-                 (available: {labels:?})"
-            ),
-            1 => return Ok(Some(matches[0])),
-            n => {
-                // List only the labels that matched, not the full
-                // identities file — a big passkeys file would
-                // bury the actual ambiguity. (PR #60 review.)
-                let matched_labels: Vec<&str> =
-                    matches.iter().map(|&i| labels[i].as_str()).collect();
-                anyhow::bail!(
-                    "--passkey {want:?} is ambiguous — matches {n} entries \
-                     ({matched_labels:?}); narrow it down"
-                )
-            }
-        }
-    }
-
-    if identity_count <= 1 {
-        return Ok(None); // let the single identity be tried
-    }
-
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
-        // Off-TTY: don't prompt, fall through to "try all in order"
-        // so scripts work without `--passkey`.
-        return Ok(None);
-    }
-
-    let labelled: Vec<&str> = labels
-        .iter()
-        .map(|l| l.as_str())
-        .chain(std::iter::repeat("(unlabeled)"))
-        .take(identity_count)
-        .collect();
-    let pick = dialoguer::Select::new()
-        .with_prompt("Which passkey to unlock with?")
-        .items(&labelled)
-        .default(0)
-        .interact()
-        .map_err(|e| anyhow::anyhow!("interactive prompt: {e}"))?;
-    Ok(Some(pick))
-}
-
-/// Walk the lines of a passkey-identities file and pair each
-/// non-comment / non-blank "identity" line with the comment block
-/// that immediately precedes it. Used to label entries in the
-/// dialoguer picker.
-///
-/// ```text
-/// # Pixel
-/// AGE-PLUGIN-FIDO2-HMAC-1...        <- labelled "Pixel"
-///
-/// # Bitwarden
-/// AGE-PLUGIN-FIDO2-HMAC-2...        <- labelled "Bitwarden"
-/// ```
-fn parse_identity_labels(raw: &str) -> Vec<String> {
-    let mut labels = Vec::new();
-    let mut comment = String::new();
-    for line in raw.lines() {
-        let l = line.trim();
-        if l.is_empty() {
-            continue;
-        }
-        if let Some(rest) = l.strip_prefix('#') {
-            if !comment.is_empty() {
-                comment.push(' ');
-            }
-            comment.push_str(rest.trim());
-        } else {
-            labels.push(if comment.is_empty() {
-                format!("identity #{}", labels.len() + 1)
-            } else {
-                comment.clone()
-            });
-            comment.clear();
-        }
-    }
-    labels
-}
-
-/// Resolve a `[secrets]` path-like field (relative or absolute,
-/// possibly tilde-prefixed) to an absolute path. Relative paths
-/// resolve against `source`.
-fn resolve_secrets_path(source: &Utf8Path, p: &str) -> Utf8PathBuf {
-    let expanded = paths::expand_tilde(p);
-    if expanded.is_absolute() {
-        expanded
-    } else {
-        source.join(expanded)
-    }
 }
 
 /// `yui update [--dry-run]` — pull source repo and re-apply.
@@ -5210,8 +4940,8 @@ dst = "{}"
         std::fs::write(&identity_path, format!("{secret}\n")).unwrap();
 
         // 2. Encrypt a fake private key into source as `.age`.
-        let recipient = secret::parse_x25519_recipient(&public).unwrap();
-        let cipher = secret::encrypt_x25519(b"-- super secret key --\n", &[recipient]).unwrap();
+        let recipient = secret::parse_recipient(&public).unwrap();
+        let cipher = secret::encrypt(b"-- super secret key --\n", &[recipient]).unwrap();
         std::fs::write(source.join("home/.ssh/id_ed25519.age"), &cipher).unwrap();
 
         // 3. config.toml: mount + secrets pointing at the test identity.
@@ -5264,8 +4994,8 @@ recipients = ["{}"]
         let (secret_key, public) = secret::generate_x25519_keypair();
         std::fs::write(&identity_path, format!("{secret_key}\n")).unwrap();
 
-        let recipient = secret::parse_x25519_recipient(&public).unwrap();
-        let cipher = secret::encrypt_x25519(b"v1 content\n", &[recipient]).unwrap();
+        let recipient = secret::parse_recipient(&public).unwrap();
+        let cipher = secret::encrypt(b"v1 content\n", &[recipient]).unwrap();
         std::fs::write(source.join("home/secret.age"), &cipher).unwrap();
         // Drifted sibling: plaintext exists but doesn't match the .age content.
         std::fs::write(source.join("home/secret"), "edited locally\n").unwrap();
