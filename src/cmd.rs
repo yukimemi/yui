@@ -941,15 +941,15 @@ pub fn secret_store(source: Option<Utf8PathBuf>, force: bool) -> Result<()> {
     info!(
         "pushing X25519 identity to {} item {:?}",
         vault.provider_name(),
-        vault_cfg.item
+        config::VAULT_ITEM_NAME
     );
-    vault.store(&vault_cfg.item, &plaintext, force)?;
+    vault.store(config::VAULT_ITEM_NAME, &plaintext, force)?;
 
     println!();
     println!(
         "  X25519 identity pushed to {} item {:?}",
         vault.provider_name(),
-        vault_cfg.item
+        config::VAULT_ITEM_NAME
     );
     println!("  On a new machine, run `yui secret unlock`.");
     Ok(())
@@ -986,9 +986,9 @@ pub fn secret_unlock(source: Option<Utf8PathBuf>) -> Result<()> {
     info!(
         "fetching X25519 identity from {} item {:?}",
         vault.provider_name(),
-        vault_cfg.item
+        config::VAULT_ITEM_NAME
     );
-    let plaintext = vault.fetch(&vault_cfg.item)?;
+    let plaintext = vault.fetch(config::VAULT_ITEM_NAME)?;
 
     // Validate before persisting — the vault could legitimately
     // hold any blob, so the fetched bytes might not actually be

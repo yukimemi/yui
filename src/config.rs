@@ -343,10 +343,14 @@ impl Default for SecretsConfig {
 pub struct VaultConfig {
     /// `"bitwarden"` or `"1password"`.
     pub provider: VaultProvider,
-    /// Item name / id inside the vault. yui passes this verbatim
-    /// to `bw get item <item>` / `op item get <item>`.
-    pub item: String,
 }
+
+/// Vault item name yui stores the X25519 identity under. Hardcoded
+/// rather than configurable — the realistic "I have multiple yui
+/// dotfiles trees sharing one vault account" case is rare enough
+/// that the simplification of one-less config knob wins. Add a
+/// configurable knob back if a user actually hits the collision.
+pub const VAULT_ITEM_NAME: &str = "yui-x25519-identity";
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
