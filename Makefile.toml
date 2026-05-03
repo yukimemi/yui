@@ -51,3 +51,12 @@ hook_content = set "#!/bin/sh\n# Installed by: cargo make hook-install\ncargo ma
 writefile ${hook_file} ${hook_content}
 echo "Installed pre-push hook -> ${hook_file}"
 '''
+
+[tasks.apm-install]
+description = "Install agent skills declared in apm.yml — pinned to copilot, claude, and gemini targets"
+command = "apm"
+args = ["install", "-t", "copilot,claude,gemini"]
+
+[tasks.setup]
+description = "One-time setup for new contributors: pre-push hook + APM install (requires `apm` CLI on PATH — see https://github.com/microsoft/apm)"
+dependencies = ["hook-install", "apm-install"]
