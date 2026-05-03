@@ -138,11 +138,11 @@ requires the [APM](https://github.com/microsoft/apm) CLI on `PATH`
 on macOS, `pip install apm-cli`, or `curl -sSL https://aka.ms/apm-unix | sh`).
 It runs `apm install`, which compiles the
 [renri](https://github.com/yukimemi/renri) skill (declared in
-`apm.yml`, pinned to `#v0.1.5`) into `.claude/skills/` +
+`apm.yml`, pinned to `#main`) into `.claude/skills/` +
 `.gemini/skills/` + `.github/skills/` so AI sessions know how to
 manage worktrees / jj workspaces while developing yui. Lockfile is
-`apm.lock.yaml`. Bump the pinned version explicitly when wanting
-newer renri features.
+`apm.lock.yaml`. Pinned to `#main`, so `apm install --update`
+always pulls the latest renri skill content.
 
 ## Resilience principle
 

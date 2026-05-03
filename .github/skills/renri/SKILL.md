@@ -4,7 +4,28 @@
 **jj workspaces**. It auto-detects the backend, dispatches to the right
 one, and exposes one verb set across both.
 
-## When to Use
+## When to use proactively
+
+**Without being asked**, prefer creating a renri worktree for any of:
+
+- **Reviewer feedback on an open PR** — branch off the PR branch in a
+  worktree, push fixes, leave main untouched.
+- **A multi-commit feature or refactor** that will land as a single PR.
+- **Risky or experimental changes** you might want to throw away or
+  compare against main.
+- **Parallel agent sessions** on the same repo — one agent on feature
+  A, another on feature B, no shared working tree to fight over.
+
+**Skip renri for**:
+
+- Trivial typo / whitespace / docs-wording fixes.
+- Single-file config bumps (Cargo.toml version, dependency upgrade).
+- Anything you would do directly on main without a PR.
+
+The cost of a worktree is one `renri add` + one `cd`; the benefit is
+that main stays clean and the work is named, parkable, and discardable.
+
+## When the user explicitly asks
 
 Use this skill when the user wants to:
 
@@ -15,6 +36,24 @@ Use this skill when the user wants to:
 - Share base config across machines via `include = [...]` / per-host
   / per-OS Tera conditionals.
 - Clean up stale worktrees / forgotten jj workspaces.
+
+## Standard workflow for PR-style work
+
+```sh
+# 1. Create a worktree on a fresh branch
+renri add fix/review-feedback
+
+# 2. Move there (cd-wrapper from `renri shell-init` makes this work)
+renri cd fix/review-feedback
+
+# 3. Make the changes, commit, push
+# ... edit / cargo test / git commit / git push -u origin fix/review-feedback
+
+# 4. Open a PR (or push fixes to an existing PR branch)
+
+# 5. After merge, clean up
+renri remove fix/review-feedback   # or: renri prune (after main pulls)
+```
 
 ## Verbs
 
