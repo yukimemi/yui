@@ -13,9 +13,20 @@
   },
   "prHourlyLimit": 4,
   "prConcurrentLimit": 8,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "fileMatch": ["^\\.github/workflows/.+\\.template$"],
+      "matchStrings": [
+        "uses:\\s*(?<depName>[\\w./-]+)@(?<currentValue>[\\w.-]+)"
+      ],
+      "datasourceTemplate": "github-tags",
+      "description": "Pick up `uses:` action references inside .template workflow files (kata sources). Renovate's default github-actions manager only scans .yml/.yaml; .template is here so the source isn't auto-executed by GitHub Actions."
+    }
+  ],
   "packageRules": [
     {
-      "description": "Auto-merge patch-level updates once CI passes",
+      "description": "Auto-merge patch / pin / digest bumps once CI passes",
       "matchUpdateTypes": ["patch", "pin", "digest"],
       "automerge": true
     },
@@ -23,6 +34,15 @@
       "description": "Group all GitHub Actions updates into one PR",
       "matchManagers": ["github-actions"],
       "groupName": "github-actions"
+    },
+    {
+      "description": "These workflow files are kata-managed (sourced from yukimemi/pj-rust* templates). Action bumps happen centrally there; local edits would be reverted by the next `kata apply`.",
+      "matchManagers": ["github-actions"],
+      "matchFileNames": [
+        ".github/workflows/ci.yml",
+        ".github/workflows/release.yml"
+      ],
+      "enabled": false
     }
   ]
 }

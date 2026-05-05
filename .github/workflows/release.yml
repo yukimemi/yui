@@ -10,6 +10,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Cargo binary name derived from the GitHub repo so this template
+  # works unchanged for any yukimemi/* CLI without per-PJ patching.
+  # If your `[[bin]] name` in Cargo.toml differs from the repo name,
+  # override this on the spot.
+  BIN_NAME: ${{ github.event.repository.name }}
 
 jobs:
   build:
@@ -39,18 +44,18 @@ jobs:
         run: |
           mkdir -p dist
           pkg=target/${{ matrix.target }}/release
-          tar czf dist/yui-${{ matrix.target }}.tar.gz -C "$pkg" yui
+          tar czf "dist/${BIN_NAME}-${{ matrix.target }}.tar.gz" -C "$pkg" "${BIN_NAME}"
       - name: package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist
           $pkg = "target/${{ matrix.target }}/release"
-          Compress-Archive -Path "$pkg/yui.exe" `
-            -DestinationPath dist/yui-${{ matrix.target }}.zip
+          Compress-Archive -Path "$pkg/$env:BIN_NAME.exe" `
+            -DestinationPath "dist/$env:BIN_NAME-${{ matrix.target }}.zip"
       - uses: actions/upload-artifact@v7
         with:
-          name: yui-${{ matrix.target }}
+          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
           path: dist/*
 
   release:
@@ -76,6 +81,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      # --locked keeps the committed Cargo.lock so the publish verification
-      # step cannot fail the dirty-git-state check by rewriting the lock.
+      # --locked keeps the committed Cargo.lock so the publish
+      # verification step cannot fail the dirty-git-state check by
+      # rewriting the lock.
       - run: cargo publish --locked --token ${{ secrets.CARGO_REGISTRY_TOKEN }}

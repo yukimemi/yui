@@ -1,14 +1,13 @@
-# Required-by-APM but intentionally static. Per CLAUDE.md "Version lives
-# only in Cargo.toml"; this apm.yml is consumer-side and not a publishable
-# APM package, so the version below is a placeholder that should never bump.
+# Required-by-APM but intentionally static. yukimemi/* projects
+# are not APM publishers; this apm.yml exists only to install
+# agent skills that contributors want available while working on
+# this repo — currently the `renri` worktree skill.
 name: yui
 version: 0.0.0
 description: |
-  Dev-consumer APM config for the yui repo. yui itself is a Rust CLI
-  and ships no agent primitives; this apm.yml only exists to install
-  agent skills that contributors want available while working on yui
-  — currently just the `renri` skill so AI sessions can manage
-  worktrees / jj workspaces while developing.
+  Dev-consumer APM config for the yui repo. Pinned
+  to `#main` so `apm install --update` always pulls the latest
+  renri skill.
 author: yukimemi
 dependencies:
   apm:
