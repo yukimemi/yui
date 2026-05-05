@@ -18,12 +18,12 @@ args = ["fmt", "--all"]
 [tasks.clippy]
 description = "Run clippy with warnings as errors"
 command = "cargo"
-args = ["clippy", "--all-targets", "--", "-D", "warnings"]
+args = ["clippy", "--locked", "--all-targets", "--", "-D", "warnings"]
 
 [tasks.test]
 description = "Run all tests"
 command = "cargo"
-args = ["test"]
+args = ["test", "--locked"]
 
 [tasks.lock-check]
 description = "Verify Cargo.lock is in sync with Cargo.toml"

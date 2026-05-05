@@ -1,14 +1,14 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-05-05T13:50:04.717536Z"
+applied_at = "2026-05-05T16:39:35.334322Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
-rev = "bb0f4e1a43ace5d264b998e0862ef543dcee2d34"
-version = "0.2.0"
+rev = "280ca2337400c0fe4cd2da17dc16185581f3a2dd"
+version = "0.3.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust"
-rev = "1c81f1bc11bb713851ec4bef416b718095c65859"
+rev = "8c3842eb0e073b506f6bc293423a2d20273accae"
 version = "0.2.0"
 
 [[templates]]
@@ -19,6 +19,9 @@ version = "0.2.0"
 [files.".editorconfig"]
 content_hash = "58657ee086523ff34b0b1aef4da8a50a7489d1219ed206ddd774794f493275bb"
 once_applied = true
+
+[files.".gemini/settings.json"]
+content_hash = "486c974de88903113ed99b4e643432b7050e88f1031276f5263e8da7b43fe11e"
 
 [files.".github/workflows/release.yml"]
 content_hash = "fd5c3f524d212d7d237b9f410d0d2a0378e2a434ddac1dadef38da1bcc46fb2b"
@@ -37,7 +40,10 @@ content_hash = "a76b3af252969b8120128d7ce44f2b6cfdcf88c7420ee00675732f542d047529
 content_hash = "3670f70a2f0be4013926bab6e878b90a42ad64c17899080aef4d193b246fa390"
 
 [files."Makefile.toml"]
-content_hash = "a472b7d29835466dfa5d9fe7dbceb69dd39736a5b05b1fbe5b2cd7726a63a025"
+content_hash = "656e02f02146079b1d966219eb395000462fe9121719621dc2d9696f80b13e25"
+
+[files."OPENCODE.md"]
+content_hash = "11993dc7feec5fca8e83934f135de33879b88f100c48aeba0729de2f57a11a48"
 
 [files."apm.yml"]
 content_hash = "9d1f51de218e6ea8c36bd27480e680b87724f96c8fe55203f3e7c37529123ee6"
@@ -45,8 +51,11 @@ content_hash = "9d1f51de218e6ea8c36bd27480e680b87724f96c8fe55203f3e7c37529123ee6
 [files."clippy.toml"]
 content_hash = "89dbb3b4fd63c479f61f077d2383ab5c0998ea838f271ed57fd09281975deda0"
 
+[files."opencode.json"]
+content_hash = "2ada1cf4347db9e98fadd67ca72cd9e29042c5bf6ab719d666b5d71f97663e81"
+
 [files."renovate.json"]
-content_hash = "7a523c7cffd41452b2190e94fb585c4d0dd6b600f5b21f56cc6a4b0d5b0aba08"
+content_hash = "32569a8b8904be51b03feff5955357333e191a4e95d93bc2b38bf067f56a6bbb"
 
 [files."renri.toml"]
 content_hash = "f4751570494ba62997cfb47e3abee2e707d3e01d924d1e8b940905a4e7c974f3"

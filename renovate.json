@@ -18,10 +18,10 @@
       "customType": "regex",
       "fileMatch": ["^\\.github/workflows/.+\\.template$"],
       "matchStrings": [
-        "uses:\\s*(?<depName>[\\w./-]+)@(?<currentValue>[\\w.-]+)"
+        "uses:\\s*[\"']?(?<depName>[\\w./-]+)@(?<currentValue>[\\w./-]+)[\"']?"
       ],
       "datasourceTemplate": "github-tags",
-      "description": "Pick up `uses:` action references inside .template workflow files (kata sources). Renovate's default github-actions manager only scans .yml/.yaml; .template is here so the source isn't auto-executed by GitHub Actions."
+      "description": "Pick up `uses:` action references inside .template workflow files (kata sources). Renovate's default github-actions manager only scans .yml/.yaml; .template is here so the source isn't auto-executed by GitHub Actions. Optional `[\"']?` wrappers around depName + currentValue accept bare, single-quoted, and double-quoted forms — all three are valid YAML for `uses:`."
     }
   ],
   "packageRules": [
@@ -31,8 +31,9 @@
       "automerge": true
     },
     {
-      "description": "Group all GitHub Actions updates into one PR",
-      "matchManagers": ["github-actions"],
+      "description": "Group all GitHub Actions updates into one PR (covers both the built-in github-actions manager and the regex customManager that scans .template files). matchDatasources scopes this to github-tags so future customManagers for non-actions deps don't accidentally land in the github-actions group.",
+      "matchManagers": ["github-actions", "regex"],
+      "matchDatasources": ["github-tags"],
       "groupName": "github-actions"
     },
     {
