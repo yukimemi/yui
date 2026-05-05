@@ -1,5 +1,5 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-05-05T10:54:51.2765784Z"
+applied_at = "2026-05-05T13:50:04.717536Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
@@ -8,7 +8,7 @@ version = "0.2.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust"
-rev = "24012b25f20eced513d2e1e53b43d833b36afd17"
+rev = "1c81f1bc11bb713851ec4bef416b718095c65859"
 version = "0.2.0"
 
 [[templates]]
@@ -37,7 +37,7 @@ content_hash = "a76b3af252969b8120128d7ce44f2b6cfdcf88c7420ee00675732f542d047529
 content_hash = "3670f70a2f0be4013926bab6e878b90a42ad64c17899080aef4d193b246fa390"
 
 [files."Makefile.toml"]
-content_hash = "5f3394eb981415aaa0b52e0cecfd67d9b68781ff951eaf416278561a62672243"
+content_hash = "a472b7d29835466dfa5d9fe7dbceb69dd39736a5b05b1fbe5b2cd7726a63a025"
 
 [files."apm.yml"]
 content_hash = "9d1f51de218e6ea8c36bd27480e680b87724f96c8fe55203f3e7c37529123ee6"

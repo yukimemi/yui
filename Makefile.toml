@@ -49,8 +49,17 @@ hook_file = set "${hook_dir}/pre-push"
 mkdir ${hook_dir}
 hook_content = set "#!/bin/sh\n# Installed by: cargo make hook-install\ncargo make check"
 writefile ${hook_file} ${hook_content}
-# Unix needs the exec bit; on Windows chmod is a no-op via Git for Windows / busybox.
-exec chmod +x ${hook_file}
+# chmod +x is needed on Unix; on Windows the exec bit is a no-op
+# AND `chmod` may not be on PATH (it's only present when Git for
+# Windows / busybox is wired into the shell). Skip silently if
+# `chmod` isn't reachable so plain Windows shells don't fail this
+# task with `program not found`.
+chmod_path = which chmod
+if not is_empty ${chmod_path}
+    exec chmod +x ${hook_file}
+else
+    echo "chmod not on PATH; skipping exec-bit (no-op on Windows; on Unix this means the hook may not be executable)"
+end
 echo "Installed pre-push hook -> ${hook_file}"
 '''
 
@@ -72,7 +81,7 @@ exec apm install -t copilot,claude,gemini
 '''
 
 [tasks.apm-install-update]
-description = "Refresh APM dependencies to upstream latest. Skipped silently when apm.yml or the apm CLI is absent."
+description = "Refresh APM dependencies to upstream latest. Skipped when apm.yml/apm absent, or when apm.lock.yaml already records the current upstream renri HEAD (kicks in on every cargo make on-add after the first to keep worktree creation fast)."
 script_runner = "@duckscript"
 script = '''
 exists = is_path_exists "apm.yml"
@@ -85,6 +94,38 @@ if is_empty ${apm_path}
     echo "apm CLI not on PATH; skipping apm-install-update (install via aka.ms/apm-unix or your platform's package manager)"
     exit 0
 end
+
+# Fast-path: if apm.lock.yaml already records the current
+# upstream HEAD of yukimemi/renri (the only APM dependency for
+# yukimemi/* projects), don't re-run `apm install --update` —
+# git ls-remote is ~100ms, an actual reinstall is several
+# seconds. This makes `cargo make on-add` cheap on every
+# `renri add` after the first.
+lock_exists = is_path_exists "apm.lock.yaml"
+if ${lock_exists}
+    ls_result = exec git ls-remote https://github.com/yukimemi/renri.git refs/heads/main
+    ls_ok = eq ${ls_result.code} 0
+    if ${ls_ok}
+        upstream_line = trim ${ls_result.stdout}
+        upstream_sha = substring ${upstream_line} 0 40
+        # Guard against empty / short upstream_sha. duckscript's
+        # `contains "haystack" ""` returns true (empty needle is
+        # always a substring), so without this check a successful-
+        # but-empty `git ls-remote` (deleted main ref, weird CI
+        # mirror, etc.) would incorrectly skip the install.
+        sha_len = length ${upstream_sha}
+        sha_valid = eq ${sha_len} 40
+        if ${sha_valid}
+            lock_body = readfile apm.lock.yaml
+            already_synced = contains ${lock_body} ${upstream_sha}
+            if ${already_synced}
+                echo "apm.lock.yaml already at upstream renri ${upstream_sha}; skipping apm install --update"
+                exit 0
+            end
+        end
+    end
+end
+
 exec apm install --update -t copilot,claude,gemini
 '''
 
