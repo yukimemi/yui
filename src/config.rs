@@ -117,10 +117,35 @@ pub enum HookPhase {
     Post,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct UiConfig {
     #[serde(default)]
     pub icons: IconsMode,
+    /// When true, yui spawns a background update check on every
+    /// non-self-update invocation and shows a banner at exit if a
+    /// newer release is available. Powered by `kaishin::Checker`;
+    /// mirrors renri / rvpm.
+    #[serde(default = "default_auto_update_check")]
+    pub auto_update_check: bool,
+    /// Cadence override for the background update check (e.g.
+    /// `"24h"`, `"1d"`, `"30m"`). Parsed by `kaishin::parse_interval`.
+    /// `None` falls back to the kaishin default (24h).
+    #[serde(default)]
+    pub update_check_interval: Option<String>,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            icons: IconsMode::default(),
+            auto_update_check: default_auto_update_check(),
+            update_check_interval: None,
+        }
+    }
+}
+
+fn default_auto_update_check() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
