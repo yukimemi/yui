@@ -231,6 +231,12 @@ pub enum SecretAction {
     /// `[secrets] recipients`, and write the ciphertext as
     /// `<path>.age` next to it. Refuses to clobber an existing
     /// `.age` without `--force`.
+    ///
+    /// The plaintext sibling is added to the managed `.gitignore`
+    /// section immediately so it can't be staged accidentally
+    /// before the next `apply`. Pass `--rm-plaintext` to also
+    /// delete the plaintext after a successful encryption (works
+    /// only when it lives under `$DOTFILES`).
     Encrypt {
         path: Utf8PathBuf,
         /// Replace an existing `<path>.age`.
