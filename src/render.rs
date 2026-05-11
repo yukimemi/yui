@@ -322,6 +322,64 @@ pub fn write_managed_section(source: &Utf8Path, managed_abs_paths: &[Utf8PathBuf
     update_gitignore(source, managed_abs_paths)
 }
 
+/// Additively merge `plaintext_abs_path` into yui's managed
+/// `.gitignore` section, preserving every other entry already
+/// there. Used by `yui secret encrypt` to close the window where a
+/// freshly written plaintext sibling would be visible to `git add`
+/// until the next `apply` rewrites the full managed block (issue
+/// #71).
+///
+/// Unlike [`write_managed_section`], this is non-destructive: it
+/// parses the existing section, unions the single new entry, sorts
+/// and dedupes, and rewrites only the block between the markers.
+/// Content above and below the markers is untouched.
+pub fn add_to_managed_section(source: &Utf8Path, plaintext_abs_path: &Utf8Path) -> Result<()> {
+    let gi_path = source.join(".gitignore");
+    let existing = match std::fs::read_to_string(&gi_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(Error::Template(format!("read {gi_path}: {e}"))),
+    };
+
+    let new_entry = plaintext_abs_path
+        .strip_prefix(source)
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|_| plaintext_abs_path.as_str().to_string())
+        .replace('\\', "/");
+
+    let mut managed = parse_managed_section(&existing);
+    managed.push(new_entry);
+    managed.sort();
+    managed.dedup();
+
+    let new_section = build_managed_section(&managed);
+    let updated = replace_or_append_section(&existing, &new_section);
+
+    if updated != existing {
+        std::fs::write(&gi_path, updated)?;
+    }
+    Ok(())
+}
+
+fn parse_managed_section(text: &str) -> Vec<String> {
+    let Some(start) = text.find(GITIGNORE_BEGIN) else {
+        return Vec::new();
+    };
+    let Some(end) = text.find(GITIGNORE_END) else {
+        return Vec::new();
+    };
+    if start >= end {
+        return Vec::new();
+    }
+    let body_start = start + GITIGNORE_BEGIN.len();
+    text[body_start..end]
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn update_gitignore(source: &Utf8Path, rendered_abs_paths: &[Utf8PathBuf]) -> Result<()> {
     let gi_path = source.join(".gitignore");
     let existing = match std::fs::read_to_string(&gi_path) {
@@ -693,6 +751,76 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(r.join("home/foo")).unwrap(),
             "old rendered output"
+        );
+    }
+
+    #[test]
+    fn add_to_managed_creates_section_when_missing() {
+        let tmp = TempDir::new().unwrap();
+        let r = root(&tmp);
+        // No .gitignore at all yet — first encrypt should create one
+        // with the new plaintext sibling inside the managed block.
+        let plain = r.join("home/.config/foo/private.env");
+        add_to_managed_section(&r, &plain).unwrap();
+        let gi = std::fs::read_to_string(r.join(".gitignore")).unwrap();
+        assert!(gi.contains(GITIGNORE_BEGIN));
+        assert!(gi.contains(GITIGNORE_END));
+        assert!(gi.contains("home/.config/foo/private.env"));
+    }
+
+    #[test]
+    fn add_to_managed_preserves_existing_entries() {
+        let tmp = TempDir::new().unwrap();
+        let r = root(&tmp);
+        // Pre-existing managed section with a render-produced entry
+        // plus user content above + below.
+        write(
+            &r.join(".gitignore"),
+            &format!(
+                "node_modules/\n\n{GITIGNORE_BEGIN}\nhome/.gitconfig\n{GITIGNORE_END}\n\ntarget/\n"
+            ),
+        );
+        let plain = r.join("home/.config/foo/private.env");
+        add_to_managed_section(&r, &plain).unwrap();
+        let gi = std::fs::read_to_string(r.join(".gitignore")).unwrap();
+        // Existing render entry still there.
+        assert!(gi.contains("home/.gitconfig"));
+        // New secret entry merged in.
+        assert!(gi.contains("home/.config/foo/private.env"));
+        // User content above + below untouched.
+        assert!(gi.contains("node_modules/"));
+        assert!(gi.contains("target/"));
+    }
+
+    #[test]
+    fn add_to_managed_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let r = root(&tmp);
+        let plain = r.join("home/secret.env");
+        add_to_managed_section(&r, &plain).unwrap();
+        add_to_managed_section(&r, &plain).unwrap();
+        let gi = std::fs::read_to_string(r.join(".gitignore")).unwrap();
+        let occurrences = gi.matches("home/secret.env").count();
+        assert_eq!(occurrences, 1, "duplicate entries in: {gi}");
+    }
+
+    #[test]
+    fn add_to_managed_normalises_windows_separators() {
+        let tmp = TempDir::new().unwrap();
+        let r = root(&tmp);
+        // Synthesise a backslash-bearing absolute path the way Windows
+        // would; the managed section must always use forward slashes
+        // so the `.gitignore` works on both platforms.
+        let plain = Utf8PathBuf::from(format!("{}\\home\\.config\\foo\\private.env", r.as_str()));
+        add_to_managed_section(&r, &plain).unwrap();
+        let gi = std::fs::read_to_string(r.join(".gitignore")).unwrap();
+        assert!(
+            gi.contains("home/.config/foo/private.env"),
+            "expected forward-slash entry in: {gi}"
+        );
+        assert!(
+            !gi.contains("home\\.config"),
+            "managed section should not carry backslashes: {gi}"
         );
     }
 

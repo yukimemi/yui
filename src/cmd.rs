@@ -907,6 +907,19 @@ pub fn secret_encrypt(
     std::fs::write(&cipher_path, &cipher)?;
     info!("encrypted {plaintext_path} → {cipher_path}");
 
+    // Issue #71: close the .gitignore window. `apply` rewrites the
+    // managed section from a full render+decrypt walk, but until
+    // that runs the freshly created plaintext sibling is visible to
+    // `git add` / `git commit -a`. Merge this one entry now so the
+    // plaintext can't be staged accidentally between encrypt and the
+    // next apply. Only meaningful when the plaintext actually lives
+    // under `$DOTFILES` (matches the `rm_plaintext` safety check
+    // below) and when gitignore management is enabled.
+    if config.render.manage_gitignore && plaintext_path.starts_with(&source) {
+        render::add_to_managed_section(&source, &plaintext_path)?;
+    }
+    info!("run `yui apply` to refresh links and the rest of the managed section");
+
     if rm_plaintext {
         // Only remove plaintext when it lives under `$DOTFILES` —
         // erasing files outside the repo on a typo would be cruel.
