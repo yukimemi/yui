@@ -3,17 +3,17 @@ applied_at = "2026-05-05T16:39:35.334322Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
-rev = "280ca2337400c0fe4cd2da17dc16185581f3a2dd"
+rev = "e86efe88c5769d31a34d07c84a67b0dd869e094d"
 version = "0.3.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust"
-rev = "8c3842eb0e073b506f6bc293423a2d20273accae"
+rev = "29bdb14f7e4ba0060c8af90ee55035fe4ae8c6ee"
 version = "0.2.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust-cli"
-rev = "048e9fecbe348a9f0507b4fe61d259810d6c704a"
+rev = "383b0ee5ce5907f36b066d44d435d6c50b6b30fb"
 version = "0.2.0"
 
 [files.".editorconfig"]
