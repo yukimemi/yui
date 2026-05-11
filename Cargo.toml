@@ -40,6 +40,9 @@ globset = "0.4.18"
 ignore = "0.4.25"
 indicatif = "0.18.4"
 jiff = { version = "0.2.24", features = ["serde"] }
+# Shared self-update library (`yui self-update`). Pinned exact to
+# match rvpm / renri; kaishin's surface is still 0.x.
+kaishin = "0.2.4"
 owo-colors = "4.3.0"
 same-file = "1.0.6"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -48,6 +51,12 @@ sha2 = "0.11.0"
 similar = "3"
 tera = "1.20.1"
 thiserror = "2.0.18"
+# Minimal runtime needed by kaishin's async API; we drive it from a
+# blocking `current_thread` runtime in `updater::run_self_update`
+# so the rest of yui can stay sync. `rt` is the only feature we
+# need — `updater` doesn't use `#[tokio::main]` / `tokio::test` /
+# the `macros` family (PR #74 review by gemini-code-assist).
+tokio = { version = "1", features = ["rt"] }
 toml = "1.1.2"
 toml_edit = "0.23"
 tracing = "0.1.44"
