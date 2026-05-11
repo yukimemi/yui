@@ -14,6 +14,7 @@ pub mod paths;
 pub mod render;
 pub mod secret;
 pub mod template;
+pub mod updater;
 pub mod vars;
 pub mod vault;
 

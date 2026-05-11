@@ -6,6 +6,7 @@ use clap_complete::Shell;
 
 use crate::cmd;
 use crate::config::IconsMode;
+use crate::updater;
 
 /// Explicit colour palette for `--help` output. clap honours `NO_COLOR`
 /// and falls back to monochrome when stdout isn't a TTY, so this is
@@ -201,6 +202,27 @@ pub enum Command {
         action: SecretAction,
     },
 
+    /// Update the `yui` binary itself to the latest GitHub release.
+    ///
+    /// Detects how `yui` was installed (cargo install / `cargo build`
+    /// dev binary / direct binary download) and picks the right
+    /// upgrade path. Powered by the shared `yukimemi/kaishin`
+    /// library so the behaviour matches `rvpm self-update` /
+    /// `renri self-update`.
+    SelfUpdate {
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Print whether an update is available and exit without
+        /// installing.
+        #[arg(long)]
+        check: bool,
+        /// Bail out instead of prompting when stdin isn't a tty.
+        /// Pair with `--yes` to drive `self-update` from scripts.
+        #[arg(long)]
+        non_interactive: bool,
+    },
+
     /// Generate shell completion script for `<shell>` to stdout.
     ///
     /// Pipe into the right place for your shell, e.g.
@@ -336,6 +358,11 @@ impl Cli {
                 SecretAction::Store { force } => cmd::secret_store(source, force),
                 SecretAction::Unlock => cmd::secret_unlock(source),
             },
+            Command::SelfUpdate {
+                yes,
+                check,
+                non_interactive,
+            } => updater::run_self_update(yes, check, non_interactive),
             Command::Completion { shell } => {
                 let mut cmd = Cli::command();
                 clap_complete::generate(shell, &mut cmd, "yui", &mut std::io::stdout());
