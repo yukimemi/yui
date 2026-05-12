@@ -78,7 +78,7 @@ jobs:
 
       - name: Open / update PR if there are changes
         id: cpr
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.KATA_APPLY_TOKEN }}
           branch: kata-apply/auto
