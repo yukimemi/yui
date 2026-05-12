@@ -35,7 +35,7 @@ anyhow = "1.0.102"
 base64 = "0.22.1"
 camino = { version = "1.2.2", features = ["serde1"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
-clap_complete = "4.6.4"
+clap_complete = "4.6.5"
 globset = "0.4.18"
 ignore = "0.4.25"
 indicatif = "0.18.4"
