@@ -1,15 +1,15 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-05-11T23:33:13.5959059Z"
+applied_at = "2026-05-12T14:27:56.7737096Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
-rev = "c9d03e3bc2a50c526276c1902f8146140af90c71"
-version = "0.7.0"
+rev = "4c0d51572d6f7c25883a220f2f8473beab8a9c23"
+version = "0.9.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust"
-rev = "53e800e32456697fee3a3a28c028bc5fbab62e15"
-version = "0.4.0"
+rev = "99af835c61fbc9da55b886ba3b3f22f23b8ee8b5"
+version = "0.4.2"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust-cli"
@@ -33,7 +33,10 @@ content_hash = "486c974de88903113ed99b4e643432b7050e88f1031276f5263e8da7b43fe11e
 content_hash = "1a4b579b1b643a41dbf97d8834ff1f3f1fe532ff863d0f861431cf3ca47d31e2"
 
 [files.".github/workflows/ci.yml"]
-content_hash = "3a3da2a8ca5ea9b4a2e88163ad4b6de7fb58fa3762b52431aec06294ac4646fc"
+content_hash = "ec163f67d4b75e3a3499ac45998472dac7cb24a3594a685559a250dc4f48d3d0"
+
+[files.".github/workflows/kata-apply.yml"]
+content_hash = "3aefabfef313f5c3c6343804450c6a38feb53678c4f4683bb3f0220ea6d7a24a"
 
 [files.".github/workflows/release.yml"]
 content_hash = "fd5c3f524d212d7d237b9f410d0d2a0378e2a434ddac1dadef38da1bcc46fb2b"
@@ -58,7 +61,7 @@ content_hash = "3670f70a2f0be4013926bab6e878b90a42ad64c17899080aef4d193b246fa390
 once_applied = true
 
 [files."Makefile.toml"]
-content_hash = "6fc09bdba9c464e8f924f0c54091a9cd29abdecc65d12b7e903d53758e62989f"
+content_hash = "27e3f57b9efd6c177843d9b0d248f40af5843739bcde6ceaf985f2ce518ecfcf"
 
 [files."OPENCODE.md"]
 content_hash = "11993dc7feec5fca8e83934f135de33879b88f100c48aeba0729de2f57a11a48"
