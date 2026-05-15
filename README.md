@@ -10,6 +10,8 @@
   <a href="https://crates.io/crates/yui-cli"><img src="https://img.shields.io/crates/v/yui-cli.svg" alt="crates.io"/></a>
   <a href="https://github.com/yukimemi/yui/actions/workflows/ci.yml"><img src="https://github.com/yukimemi/yui/actions/workflows/ci.yml/badge.svg" alt="CI"/></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"/></a>
+  <a href="https://deepwiki.com/yukimemi/yui"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"/></a>
+  <a href="https://codewiki.google/github.com/yukimemi/yui"><img src="https://img.shields.io/badge/View-Code_Wiki-4285F4?logo=google" alt="View Code Wiki"/></a>
 </p>
 
 `yui` flips the chezmoi flow: instead of editing your source repo and
