@@ -42,7 +42,7 @@ indicatif = "0.18.4"
 jiff = { version = "0.2.24", features = ["serde"] }
 # Shared self-update library (`yui self-update`). Pinned exact to
 # match rvpm / renri; kaishin's surface is still 0.x.
-kaishin = "0.2.4"
+kaishin = "0.3.0"
 owo-colors = "4.3.0"
 same-file = "1.0.6"
 serde = { version = "1.0.228", features = ["derive"] }
