@@ -231,13 +231,20 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     }
 
     // 1b. Render templates so the link walk picks up rendered files.
+    //     Drift is resolved interactively (`[o]verwrite` / `[s]kip`) so the
+    //     "I just edited the `.tera`" / "I just changed `vars`" / "I want
+    //     `vars` substitution to land in the rendered file" cases don't
+    //     dead-end at a `bail!`. Dry-run only logs; the prompt never fires
+    //     so apply previews stay non-interactive.
     let render_report = render::render_all(&source, &config, &yui, dry_run)?;
     log_render_report(&render_report);
-    if render_report.has_drift() {
-        anyhow::bail!(
-            "render drift detected ({} file(s)); reflect target edits back into the .tera before re-running apply",
-            render_report.diverged.len()
-        );
+    let render_quit: Cell<bool> = Cell::new(false);
+    if render_report.has_drift() && !dry_run {
+        resolve_render_drift(&render_report, &render_quit)?;
+    }
+    if render_quit.get() {
+        info!("user quit during render drift resolution; skipping link pass");
+        return Ok(());
     }
 
     // 1c. Single deterministic write of the `.gitignore` managed
@@ -325,7 +332,7 @@ fn log_render_report(r: &RenderReport) {
         );
     }
     for d in &r.diverged {
-        warn!("rendered file diverged from template: {d}");
+        warn!("rendered file diverged from template: {}", d.rendered_path);
     }
 }
 
@@ -361,6 +368,23 @@ enum AnomalyChoice {
     /// Leave both as-is for now.
     Skip,
     /// Skip this entry and stop walking remaining entries.
+    Quit,
+}
+
+/// User-chosen direction for a render-drift prompt.
+///
+/// Render drift has no `[a] absorb` direction: rendered files have
+/// already had Tera substitutions applied, so writing them back over
+/// the `.tera` source would silently erase the template syntax. A
+/// user who wants the on-disk rendered content reflected into the
+/// template picks `[s]kip` and edits the `.tera` by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderDriftChoice {
+    /// Write the fresh template output over the on-disk rendered file.
+    Overwrite,
+    /// Leave both as-is. The link pass may still relink afterwards.
+    Skip,
+    /// Skip this entry and stop walking remaining render-drift entries.
     Quit,
 }
 
@@ -1286,11 +1310,10 @@ pub fn diff(
 
     // Render-drift surfaces too — same as cmd::status.
     let render_report = render::render_all(&source, &config, &yui, /* dry_run */ true)?;
-    for rendered in &render_report.diverged {
-        let tera_path = Utf8PathBuf::from(format!("{rendered}.tera"));
+    for entry in &render_report.diverged {
         report.push(StatusItem {
-            src: tera_path,
-            dst: rendered.clone(),
+            src: entry.tera_path.clone(),
+            dst: entry.rendered_path.clone(),
             state: StatusState::RenderDrift,
         });
     }
@@ -1522,14 +1545,13 @@ pub fn status(
     // 1. Template drift — render in dry-run mode and surface anything
     //    whose rendered counterpart on disk no longer matches.
     let render_report = render::render_all(&source, &config, &yui, /* dry_run */ true)?;
-    for rendered in &render_report.diverged {
-        // `diverged` holds the rendered path; the template lives at
-        // `<rendered>.tera`. Show the .tera as src so it's clear which
-        // file the user needs to update.
-        let tera_path = Utf8PathBuf::from(format!("{rendered}.tera"));
+    for entry in &render_report.diverged {
+        // Show the `.tera` as src so it's clear which file the user
+        // would edit to reflect a target-side change back into the
+        // template.
         report.push(StatusItem {
-            src: relative_for_display(&source, &tera_path),
-            dst: rendered.clone(),
+            src: relative_for_display(&source, &entry.tera_path),
+            dst: entry.rendered_path.clone(),
             state: StatusState::RenderDrift,
         });
     }
@@ -3540,6 +3562,208 @@ fn prompt_anomaly(
     }
 }
 
+/// Walk every diverged template and resolve each one interactively.
+///
+/// Caller must have already gated this on `!dry_run` — drift is only
+/// surfaced via logs during dry-run so previews stay non-interactive.
+/// `quit_flag` is set when the user picks `[q]uit` so `apply` can
+/// short-circuit the link pass.
+///
+/// Sticky `[O]` / `[S]` "all remaining" choices short-circuit
+/// subsequent prompts within this call.
+fn resolve_render_drift(report: &render::RenderReport, quit_flag: &Cell<bool>) -> Result<()> {
+    let sticky: Cell<Option<RenderDriftChoice>> = Cell::new(None);
+
+    for entry in &report.diverged {
+        if quit_flag.get() {
+            warn!("render drift quit: leaving {} as-is", entry.rendered_path);
+            continue;
+        }
+
+        let choice = match sticky.get() {
+            Some(c) => c,
+            None => prompt_render_drift(entry, &sticky, quit_flag)?,
+        };
+
+        match choice {
+            RenderDriftChoice::Overwrite => {
+                info!(
+                    "render overwrite: {} → {}",
+                    entry.tera_path, entry.rendered_path
+                );
+                if let Some(parent) = entry.rendered_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&entry.rendered_path, &entry.fresh_body)
+                    .with_context(|| format!("writing fresh render to {}", entry.rendered_path))?;
+            }
+            RenderDriftChoice::Skip => {
+                warn!(
+                    "render drift skipped by user: {} (rendered file left as-is)",
+                    entry.rendered_path
+                );
+            }
+            RenderDriftChoice::Quit => {
+                warn!("render drift quit: leaving {} as-is", entry.rendered_path);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Multi-choice TTY prompt for a render-drift entry.
+///
+/// Mirrors `prompt_anomaly`'s shape but with one fewer direction —
+/// see `RenderDriftChoice` for why `[a]bsorb` is omitted. mtime is
+/// used to pick the recommended default:
+///   - `.tera` newer than rendered → `[o]verwrite` (user just edited
+///     the template)
+///   - otherwise → `[s]kip` (rendered file may carry a target-side
+///     edit, don't clobber)
+///
+/// Off-TTY: returns `Skip` immediately (matches `prompt_anomaly`).
+fn prompt_render_drift(
+    entry: &render::DivergedEntry,
+    sticky: &Cell<Option<RenderDriftChoice>>,
+    quit_flag: &Cell<bool>,
+) -> Result<RenderDriftChoice> {
+    use std::io::IsTerminal;
+    use std::io::Write as _;
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Ok(RenderDriftChoice::Skip);
+    }
+
+    let default = match (entry.tera_mtime, entry.rendered_mtime) {
+        (Some(t), Some(r)) if t > r => RenderDriftChoice::Overwrite,
+        _ => RenderDriftChoice::Skip,
+    };
+    let default_label = match default {
+        RenderDriftChoice::Overwrite => "o",
+        _ => "s",
+    };
+
+    eprintln!();
+    eprintln!("render drift: on-disk rendered file diverged from .tera output");
+    eprintln!("  src (.tera):    {}", entry.tera_path);
+    eprintln!("  dst (rendered): {}", entry.rendered_path);
+    print_render_drift_diff(entry);
+
+    loop {
+        eprintln!("  [o/O] overwrite  .tera output → rendered   (this / all remaining)");
+        eprintln!("  [s/S] skip       leave as-is                (this / all remaining)");
+        eprintln!("  [d]   diff       re-show the diff");
+        eprintln!("  [q]   quit       skip this and stop apply");
+        eprint!("choice [{default_label}]: ");
+        std::io::stderr().flush().ok();
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let trimmed = input.trim();
+        let choice = match trimmed {
+            "" => default,
+            "s" | "n" => RenderDriftChoice::Skip,
+            "o" | "y" => RenderDriftChoice::Overwrite,
+            "q" => {
+                quit_flag.set(true);
+                RenderDriftChoice::Quit
+            }
+            "O" => {
+                sticky.set(Some(RenderDriftChoice::Overwrite));
+                RenderDriftChoice::Overwrite
+            }
+            "S" => {
+                sticky.set(Some(RenderDriftChoice::Skip));
+                RenderDriftChoice::Skip
+            }
+            "d" => {
+                print_render_drift_diff(entry);
+                continue;
+            }
+            other => {
+                eprintln!("unknown choice: {other:?}");
+                continue;
+            }
+        };
+        return Ok(choice);
+    }
+}
+
+/// Render-drift counterpart of `print_absorb_diff`. The "src" side is
+/// in-memory (the fresh template output) so we can't reuse the file→file
+/// helper directly — we read the on-disk rendered file and diff it
+/// against `entry.fresh_body`.
+fn print_render_drift_diff(entry: &render::DivergedEntry) {
+    use owo_colors::OwoColorize as _;
+    use std::io::IsTerminal;
+
+    let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+
+    eprintln!();
+    if color {
+        eprintln!(
+            "{}  {}  {}",
+            "── unified diff ──".bold(),
+            "[-] rendered (on disk)".red().bold(),
+            "[+] fresh (.tera output)".green().bold()
+        );
+        eprintln!("  {} {}", "[-] rendered:".red(), entry.rendered_path);
+        eprintln!("  {} {}", "[+] .tera:   ".green(), entry.tera_path);
+    } else {
+        eprintln!("── unified diff ──  [-] rendered (on disk)   [+] fresh (.tera output)");
+        eprintln!("  [-] rendered: {}", entry.rendered_path);
+        eprintln!("  [+] .tera:    {}", entry.tera_path);
+    }
+    eprintln!();
+
+    let rendered = match std::fs::read_to_string(&entry.rendered_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("(failed to read {}: {e})", entry.rendered_path);
+            eprintln!();
+            return;
+        }
+    };
+
+    let diff = similar::TextDiff::from_lines(rendered.as_str(), entry.fresh_body.as_str());
+    for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
+        let header = hunk.header().to_string();
+        if color {
+            eprintln!("{}", header.cyan());
+        } else {
+            eprintln!("{header}");
+        }
+        for change in hunk.iter_changes() {
+            let line = change.value();
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            match change.tag() {
+                similar::ChangeTag::Delete => {
+                    if color {
+                        eprintln!("{} {}", "-".red().bold(), line.red());
+                    } else {
+                        eprintln!("- {line}");
+                    }
+                }
+                similar::ChangeTag::Insert => {
+                    if color {
+                        eprintln!("{} {}", "+".green().bold(), line.green());
+                    } else {
+                        eprintln!("+ {line}");
+                    }
+                }
+                similar::ChangeTag::Equal => {
+                    if color {
+                        eprintln!("  {}", line.dimmed());
+                    } else {
+                        eprintln!("  {line}");
+                    }
+                }
+            }
+        }
+    }
+    eprintln!();
+}
+
 /// Resilient git-clean check: if `git` isn't available or `source` isn't
 /// a repo, log a warning and proceed as if clean. We don't want a missing
 /// `git` to block apply — the require_clean_git knob is a *safety net*,
@@ -4393,7 +4617,12 @@ dst = "{}"
     }
 
     #[test]
-    fn apply_aborts_on_render_drift() {
+    fn apply_skips_render_drift_off_tty() {
+        // Render drift used to abort apply with a `bail!`. New behaviour
+        // is to resolve interactively — and off-TTY (where `cargo test`
+        // runs) the prompt defaults to Skip, so apply proceeds. The
+        // rendered file is left alone (no clobber) and the link pass
+        // still wires up the target from what's on disk.
         let tmp = TempDir::new().unwrap();
         let source = utf8(tmp.path().join("dotfiles"));
         let target = utf8(tmp.path().join("target"));
@@ -4412,15 +4641,18 @@ dst = "{}"
         );
         std::fs::write(source.join("config.toml"), cfg).unwrap();
 
-        let err = apply(Some(source.clone()), false).unwrap_err();
-        assert!(format!("{err}").contains("drift"));
-        // Existing rendered file untouched.
+        apply(Some(source.clone()), false).unwrap();
+        // Off-TTY prompt default = Skip → rendered file untouched.
         assert_eq!(
             std::fs::read_to_string(source.join("home/foo")).unwrap(),
             "manually edited"
         );
-        // Linking aborted — target empty.
-        assert!(!target.join("foo").exists());
+        // Link pass still wires up the target from the (skipped)
+        // rendered file.
+        assert_eq!(
+            std::fs::read_to_string(target.join("foo")).unwrap(),
+            "manually edited"
+        );
     }
 
     #[test]

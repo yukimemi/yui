@@ -14,9 +14,13 @@
 //!
 //! Drift policy: if the rendered file already exists with content that
 //! diverges from what the template would produce now, we DO NOT overwrite
-//! it. The user has likely edited the rendered file in place and needs to
-//! reflect that change back into the `.tera` first. The divergence is
-//! reported in `RenderReport::diverged`; `--check` treats it as fatal.
+//! it as a side effect of rendering. Each divergence is recorded as a
+//! [`DivergedEntry`] (with both paths, the fresh body, and best-effort
+//! mtimes) so callers can resolve it however they want — `apply` walks
+//! the list and prompts the user per entry, `render --check` bails as
+//! the CI gate.
+
+use std::time::SystemTime;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -31,6 +35,25 @@ use crate::{Error, Result};
 const GITIGNORE_BEGIN: &str = "# >>> yui rendered (auto-managed, do not edit) >>>";
 const GITIGNORE_END: &str = "# <<< yui rendered (auto-managed) <<<";
 
+/// A render-drift case: the on-disk rendered file's content differs
+/// from what the template would produce now. Carries the template
+/// path, the rendered path, the fresh output (so callers can apply
+/// it without re-rendering), and best-effort mtimes that the apply
+/// prompt uses to pick a sensible default choice.
+#[derive(Debug, Clone)]
+pub struct DivergedEntry {
+    /// `*.tera` source path.
+    pub tera_path: Utf8PathBuf,
+    /// Rendered sibling-without-suffix path (the on-disk file that diverged).
+    pub rendered_path: Utf8PathBuf,
+    /// What the template would produce right now (with current vars).
+    pub fresh_body: String,
+    /// `mtime` of the `.tera`, if obtainable.
+    pub tera_mtime: Option<SystemTime>,
+    /// `mtime` of the on-disk rendered file, if obtainable.
+    pub rendered_mtime: Option<SystemTime>,
+}
+
 #[derive(Debug, Default)]
 pub struct RenderReport {
     /// Templates rendered for the first time (or after deletion).
@@ -40,8 +63,9 @@ pub struct RenderReport {
     /// Skipped because file-header or config rule `when` evaluated to false.
     pub skipped_when_false: Vec<Utf8PathBuf>,
     /// Existing rendered file diverges from current template output.
-    /// User must reflect the manual edit back into `.tera` before re-rendering.
-    pub diverged: Vec<Utf8PathBuf>,
+    /// `apply` resolves these interactively (`[o]verwrite` / `[s]kip` / …);
+    /// `render --check` bails on them as the CI gate.
+    pub diverged: Vec<DivergedEntry>,
 }
 
 impl RenderReport {
@@ -225,7 +249,17 @@ fn process_template(
             return Ok(());
         }
         Ok(_) => {
-            report.diverged.push(target);
+            let tera_mtime = std::fs::metadata(template_path)
+                .and_then(|m| m.modified())
+                .ok();
+            let rendered_mtime = std::fs::metadata(&target).and_then(|m| m.modified()).ok();
+            report.diverged.push(DivergedEntry {
+                tera_path: template_path.to_path_buf(),
+                rendered_path: target,
+                fresh_body: body,
+                tera_mtime,
+                rendered_mtime,
+            });
             return Ok(());
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -302,7 +336,7 @@ fn collect_managed_paths(report: &RenderReport) -> Vec<Utf8PathBuf> {
         .written
         .iter()
         .chain(report.unchanged.iter())
-        .chain(report.diverged.iter())
+        .chain(report.diverged.iter().map(|d| &d.rendered_path))
         .cloned()
         .collect();
     all.sort();
@@ -622,7 +656,12 @@ mod tests {
         let report = render_all(&r, &empty_config(), &yui_vars(&r), false).unwrap();
         assert!(report.has_drift());
         assert_eq!(report.diverged.len(), 1);
-        // existing content NOT overwritten
+        let entry = &report.diverged[0];
+        assert_eq!(entry.tera_path, r.join("home/foo.tera"));
+        assert_eq!(entry.rendered_path, r.join("home/foo"));
+        // Fresh body is what the template would produce, NOT what's on disk.
+        assert_eq!(entry.fresh_body, "fresh body");
+        // Existing content NOT overwritten by render.
         assert_eq!(
             std::fs::read_to_string(r.join("home/foo")).unwrap(),
             "manually edited"
