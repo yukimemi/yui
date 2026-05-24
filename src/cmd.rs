@@ -3576,8 +3576,10 @@ fn resolve_render_drift(report: &render::RenderReport, quit_flag: &Cell<bool>) -
 
     for entry in &report.diverged {
         if quit_flag.get() {
-            warn!("render drift quit: leaving {} as-is", entry.rendered_path);
-            continue;
+            // `apply` already logs "user quit … skipping link pass" once
+            // when it sees `render_quit`; per-entry warns here would just
+            // multiply that message by the number of remaining drifts.
+            break;
         }
 
         let choice = match sticky.get() {
@@ -3716,10 +3718,13 @@ fn print_render_drift_diff(entry: &render::DivergedEntry) {
     }
     eprintln!();
 
-    let rendered = match std::fs::read_to_string(&entry.rendered_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("(failed to read {}: {e})", entry.rendered_path);
+    // Use the shared text/binary classifier so a non-UTF-8 rendered file
+    // bails the diff cleanly instead of leaking a raw read error — same
+    // behaviour as `print_absorb_diff`.
+    let rendered = match read_text_for_diff(&entry.rendered_path) {
+        DiffSide::Text(s) => s,
+        DiffSide::Binary => {
+            eprintln!("(binary file or non-UTF-8 content — diff skipped)");
             eprintln!();
             return;
         }
