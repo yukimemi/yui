@@ -58,7 +58,7 @@ thiserror = "2.0.18"
 # the `macros` family (PR #74 review by gemini-code-assist).
 tokio = { version = "1.52.3", features = ["rt"] }
 toml = "1.1.2"
-toml_edit = "0.25.11"
+toml_edit = "0.25.12"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 whoami = "2"
