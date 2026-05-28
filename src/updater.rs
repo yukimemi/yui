@@ -94,10 +94,12 @@ impl Checker {
         self.inner.should_check()
     }
 
-    /// Hit GitHub, write the result to the cache, and return it.
-    /// Block on an ad-hoc tokio runtime — the caller is on a
-    /// regular OS thread spawned by `std::thread::spawn`.
-    pub fn check_and_save(&self) -> Result<kaishin::LatestRelease> {
+    /// Hit GitHub, write the result to the cache, and return the
+    /// release *only when it actually outranks the running binary*.
+    /// `Ok(None)` is "fetched fine, no update"; `Err` is "fetch
+    /// failed". Block on an ad-hoc tokio runtime — the caller is on
+    /// a regular OS thread spawned by `std::thread::spawn`.
+    pub fn check_and_save(&self) -> Result<Option<kaishin::LatestRelease>> {
         let rt = make_runtime()?;
         rt.block_on(async { self.inner.check_and_save().await })
     }
@@ -126,9 +128,12 @@ pub enum AutoUpdateHandle {
     },
     /// A background check is running on a worker thread; the receiver
     /// hands the result back to the main thread at shutdown.
+    /// `Ok(Ok(None))` means "fetch succeeded, no update" — distinct
+    /// from a timeout/error case, where we may still want to fall back
+    /// to the cached release.
     Pending {
         checker: Checker,
-        rx: std::sync::mpsc::Receiver<Result<kaishin::LatestRelease>>,
+        rx: std::sync::mpsc::Receiver<Result<Option<kaishin::LatestRelease>>>,
         cached_latest: Option<kaishin::LatestRelease>,
     },
 }
@@ -196,10 +201,14 @@ pub fn maybe_spawn_auto_update_check(cli_source: Option<&Utf8Path>) -> Option<Au
 /// Print the update banner (if any) before the binary exits. Waits
 /// up to one second for an in-flight background check to finish; on
 /// timeout, falls back to the previously-cached release so the user
-/// still gets the nudge. Skips the leading newline when the banner
-/// would be empty (e.g. kaishin returning a release that doesn't
-/// actually outrank the running version). (PR #76 review by
-/// gemini-code-assist.)
+/// still gets the nudge.
+///
+/// kaishin 0.4 made `check_and_save` return `Result<Option<_>>`, so
+/// the "fetched, no update" case (`Ok(Ok(None))`) is now distinct
+/// from a timeout/error: in that case we skip the banner entirely
+/// instead of falling back to cache, since the cache can't be newer
+/// than the fresh fetch we just completed. Timeout/error still falls
+/// back to cache so a slow GitHub doesn't suppress the nudge.
 pub fn finalize_auto_update_check(handle: AutoUpdateHandle) {
     let (checker, latest) = match handle {
         AutoUpdateHandle::CachedAvailable { checker, latest } => (checker, Some(latest)),
@@ -208,19 +217,16 @@ pub fn finalize_auto_update_check(handle: AutoUpdateHandle) {
             rx,
             cached_latest,
         } => {
-            let latest = rx
-                .recv_timeout(Duration::from_secs(1))
-                .ok()
-                .and_then(|r| r.ok())
-                .or(cached_latest);
+            let latest = match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(Ok(Some(latest))) => Some(latest),
+                Ok(Ok(None)) => None,
+                _ => cached_latest,
+            };
             (checker, latest)
         }
     };
     if let Some(latest) = latest {
-        let banner = checker.format_banner(&latest);
-        if !banner.is_empty() {
-            eprintln!("\n{banner}");
-        }
+        eprintln!("\n{}", checker.format_banner(&latest));
     }
 }
 

@@ -1756,9 +1756,9 @@ dependencies = [
 
 [[package]]
 name = "kaishin"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2c67a4da5995b60eac9904511d26cc49f03fd9b2103dce5c96d1d3313411bef"
+checksum = "337a1e0ca2d16f43e89e7f5009f4222401a3d2fcc365d11e10fd01e8e046f5c4"
 dependencies = [
  "anyhow",
  "console 0.16.3",
@@ -2484,9 +2484,9 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "reqwest"
-version = "0.13.3"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62e0021ea2c22aed41653bc7e1419abb2c97e038ff2c33d0e1309e49a97deec0"
+checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
