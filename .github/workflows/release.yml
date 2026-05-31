@@ -11,7 +11,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   # Cargo binary name derived from the GitHub repo so this template
-  # works unchanged for any yukimemi/* CLI without per-PJ patching.
+  # works unchanged for any CLI using these templates without per-PJ patching.
   # If your `[[bin]] name` in Cargo.toml differs from the repo name,
   # override this on the spot.
   BIN_NAME: ${{ github.event.repository.name }}
@@ -24,7 +24,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
           - target: x86_64-pc-windows-msvc
             os: windows-latest
@@ -38,7 +38,21 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      - name: install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get install -y musl-tools
       - run: cargo build --release --target ${{ matrix.target }}
+      # Run the `smoke` example on the same runner that produced the
+      # binary. The example's default body is a no-op (see
+      # `examples/smoke.rs` in the consumer crate); each crate is
+      # expected to override it with a real-world startup check
+      # (HTTPS handshake, I/O probe, etc.) so this step blocks a
+      # release before bad binaries reach users — `cargo test` runs
+      # only library code and missed shoka v0.10.0's rustls panic.
+      - name: smoke
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo run --release --target ${{ matrix.target }} --example smoke
       - name: package (unix)
         if: runner.os != 'Windows'
         run: |
