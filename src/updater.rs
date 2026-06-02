@@ -1,9 +1,14 @@
 //! Self-update support for yui, using the shared `kaishin` library.
 //!
-//! Thin sync facade around kaishin's async API so the rest of yui
-//! can stay synchronous. Same shape as renri's `src/updater.rs`;
-//! the only yui-specific bit is the hardcoded `(owner, repo, bin)`
-//! triple — yui's crate name is `yui-cli` (because crates.io's
+//! Facade around kaishin's async API. `run_self_update` drives it
+//! from a blocking `current_thread` runtime so that synchronous path
+//! stays simple; the background auto-update instead spawns a `tokio`
+//! task on `main`'s small `new_multi_thread` runtime so the fetch /
+//! install overlaps the command, then drains it at shutdown with a
+//! short, bounded `tokio::time::timeout`. Same shape as renri's
+//! `src/updater.rs`; the only yui-specific bit is the hardcoded
+//! `(owner, repo, bin)` triple — yui's crate name is `yui-cli`
+//! (because crates.io's
 //! `yui` is taken by an unrelated abandoned crate), but the repo
 //! and binary are both `yui`, so going through `env!("CARGO_PKG_NAME")`
 //! the way renri does would produce the wrong GitHub Release URL.
@@ -13,24 +18,65 @@
 //! - [`run_self_update`] — drives the `yui self-update` subcommand
 //!   (interactive / `--yes` / `--check`).
 //! - [`Checker`] + [`maybe_spawn_auto_update_check`] /
-//!   [`finalize_auto_update_check`] — the daily background banner
-//!   shown after every other subcommand, the way `rvpm` / `renri`
-//!   do it. `[ui] auto_update_check = false` in `config.toml` opts
-//!   out, and `[ui] update_check_interval = "..."` overrides the
-//!   default 24h cadence.
+//!   [`finalize_auto_update_check`] — the daily background
+//!   auto-update run after every other subcommand, the way `rvpm` /
+//!   `renri` do it. `[ui] auto_update` in `config.toml` picks the
+//!   mode (`off` / `notify` / `install`, default `install` = silent
+//!   background install applied on next launch), and `[ui]
+//!   update_check_interval = "..."` overrides the default 24h
+//!   cadence. The `YUI_NO_AUTOUPDATE` env var is a kill-switch that
+//!   disables all of it regardless of config.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
 use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::config;
+use crate::config::AutoUpdateMode;
 use crate::paths;
 use crate::vars::YuiVars;
 
 const OWNER: &str = "yukimemi";
 const REPO: &str = "yui";
 const BIN: &str = "yui";
+
+/// How long [`finalize_auto_update_check`] waits for an in-flight
+/// background install before giving up (silently). Keeps fast commands
+/// snappy.
+const INSTALL_FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long [`finalize_auto_update_check`] waits for an in-flight notify
+/// check before falling back to the cached release.
+const NOTIFY_FINALIZE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Resolve the transient update-check state file path:
+/// `<cache dir>/yui/last_update_check.json`. This is throttle / cache
+/// state that can be safely deleted and re-created, so it lives under
+/// the OS cache directory (XDG `cache_dir()`), not the persistent data
+/// directory that `kaishin::Checker::new` defaults to. Returns `None` if
+/// the cache dir can't be resolved (then auto-update is skipped —
+/// resilience).
+fn state_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join(BIN).join("last_update_check.json"))
+}
+
+/// Environment kill-switch for the background auto-update, taking
+/// precedence over `[ui] auto_update`. Disabled when
+/// `YUI_NO_AUTOUPDATE` is set to anything non-empty other than `"0"`
+/// / `"false"` (case-insensitive). The variable name is the
+/// uppercased binary name plus `_NO_AUTOUPDATE`, matching renri /
+/// rvpm's `<BIN>_NO_AUTOUPDATE` convention.
+fn auto_update_disabled_by_env() -> bool {
+    match std::env::var(format!("{}_NO_AUTOUPDATE", BIN.to_uppercase())) {
+        Ok(v) => {
+            let v = v.trim();
+            !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false")
+        }
+        Err(_) => false,
+    }
+}
 
 fn kaishin_opts() -> kaishin::KaishinOptions {
     kaishin::KaishinOptions::new(OWNER, REPO, BIN, env!("CARGO_PKG_VERSION"))
@@ -65,19 +111,28 @@ pub fn default_interval() -> Duration {
     kaishin::default_interval()
 }
 
-/// Blocking facade over `kaishin::Checker` — yui's main loop is
-/// synchronous, so the async `check_and_save` call goes through a
-/// fresh `current_thread` runtime each time. Same shape as renri.
+/// Thin wrapper over `kaishin::Checker`. The async methods
+/// ([`check_and_save`](Self::check_and_save) /
+/// [`auto_update`](Self::auto_update)) are meant to be driven as `tokio`
+/// tasks spawned on `main`'s runtime so they overlap command execution,
+/// rather than on a raw OS worker thread blocked at shutdown. The type
+/// is cheaply [`Clone`]able (kaishin's `Checker` is) so it can be moved
+/// into a spawned task. Same shape as renri.
+#[derive(Clone)]
 pub struct Checker {
     inner: kaishin::Checker,
 }
 
 impl Checker {
-    /// Build a checker pinned to yui's (owner, repo, bin) triple
-    /// and the running binary's version.
-    pub fn new() -> Result<Self> {
-        let inner = kaishin::Checker::new(BIN, kaishin_opts());
-        Ok(Self { inner })
+    /// Build a checker pinned to yui's (owner, repo, bin) triple and the
+    /// running binary's version. The throttle / cache state file is
+    /// pointed at the OS cache dir (`<cache>/yui/last_update_check.json`)
+    /// rather than kaishin's default data dir, since it is transient.
+    /// Returns `None` if the cache dir can't be resolved.
+    pub fn new() -> Option<Self> {
+        let path = state_path()?;
+        let inner = kaishin::Checker::new(BIN, kaishin_opts()).state_path(path);
+        Some(Self { inner })
     }
 
     /// Override the cadence between background checks. Pair with
@@ -97,11 +152,24 @@ impl Checker {
     /// Hit GitHub, write the result to the cache, and return the
     /// release *only when it actually outranks the running binary*.
     /// `Ok(None)` is "fetched fine, no update"; `Err` is "fetch
-    /// failed". Block on an ad-hoc tokio runtime — the caller is on
-    /// a regular OS thread spawned by `std::thread::spawn`.
-    pub fn check_and_save(&self) -> Result<Option<kaishin::LatestRelease>> {
-        let rt = make_runtime()?;
-        rt.block_on(async { self.inner.check_and_save().await })
+    /// failed". Driven on `main`'s tokio runtime as a spawned task.
+    pub async fn check_and_save(&self) -> Result<Option<kaishin::LatestRelease>> {
+        self.inner.check_and_save().await
+    }
+
+    /// Silently download + swap yui's own binary in the background
+    /// (the `install` mode). kaishin's `auto_update` is self-throttled
+    /// (it checks `should_check` internally), OS-advisory-locked
+    /// across concurrent processes, and skips dev builds. It returns
+    /// `Ok(Some(rel))` *only when it actually installed* a newer
+    /// release, `Ok(None)` when there was nothing to do (throttled,
+    /// already latest, lost the lock, or a dev build), and `Err` when
+    /// the GitHub fetch / install genuinely failed.
+    ///
+    /// Driven on `main`'s tokio runtime as a spawned task so it overlaps
+    /// command execution.
+    pub async fn auto_update(&self) -> Result<Option<kaishin::LatestRelease>> {
+        self.inner.auto_update().await
     }
 
     /// Latest release known from the last successful check; `None`
@@ -117,8 +185,16 @@ impl Checker {
     }
 }
 
+/// The latest-release payload a spawned background task resolves to.
+type UpdateResult = Result<Option<kaishin::LatestRelease>>;
+
 /// Handle for an ongoing or cached background update check.
-/// Mirrors renri's `AutoUpdateHandle`.
+///
+/// The in-flight variants carry a [`tokio::task::JoinHandle`] for a task
+/// spawned on `main`'s runtime at startup, so the network / IO overlaps
+/// the command instead of running on a raw OS worker thread. They are
+/// drained with a short, bounded `tokio::time::timeout` in
+/// [`finalize_auto_update_check`]. Mirrors renri's `AutoUpdateHandle`.
 pub enum AutoUpdateHandle {
     /// A newer version was found in the local cache from a previous
     /// run, and we don't need to hit GitHub again on this invocation.
@@ -126,32 +202,55 @@ pub enum AutoUpdateHandle {
         checker: Checker,
         latest: kaishin::LatestRelease,
     },
-    /// A background check is running on a worker thread; the receiver
-    /// hands the result back to the main thread at shutdown.
-    /// `Ok(Ok(None))` means "fetch succeeded, no update" — distinct
-    /// from a timeout/error case, where we may still want to fall back
-    /// to the cached release.
+    /// A background check is running as a spawned task; the join handle
+    /// hands the result back at shutdown. `Ok(Ok(None))` means "fetch
+    /// succeeded, no update" — distinct from a timeout / error case,
+    /// where we may still want to fall back to the cached release.
     Pending {
         checker: Checker,
-        rx: std::sync::mpsc::Receiver<Result<Option<kaishin::LatestRelease>>>,
+        handle: tokio::task::JoinHandle<UpdateResult>,
         cached_latest: Option<kaishin::LatestRelease>,
+    },
+    /// `install` mode: a background `auto_update` is running as a
+    /// spawned task. It hands back `Ok(Ok(Some(rel)))` *only when a new
+    /// version was actually installed*; everything else (no update, lost
+    /// lock, dev build, fetch error, timeout) stays silent.
+    Installing {
+        handle: tokio::task::JoinHandle<UpdateResult>,
     },
 }
 
-/// Spawn a background check on `std::thread::spawn` if the user
-/// hasn't opted out and the cache is older than the configured
-/// interval. The returned handle is consumed by
-/// [`finalize_auto_update_check`] at shutdown.
+/// Spawn the background auto-update work as a `tokio` task on `rt` so it
+/// overlaps command execution, honoring the `YUI_NO_AUTOUPDATE`
+/// kill-switch and the resolved `[ui] auto_update` mode. The returned
+/// handle is consumed by [`finalize_auto_update_check`] at shutdown.
 ///
 /// Source-repo discovery is best-effort: we read `[ui]` config to
-/// see whether the banner is disabled, but if the repo can't be
-/// located we just skip the banner rather than fail loudly. The
-/// banner is convenience; nothing else hangs off of it.
-pub fn maybe_spawn_auto_update_check(cli_source: Option<&Utf8Path>) -> Option<AutoUpdateHandle> {
+/// pick the mode + cadence, but if the repo can't be located we just
+/// skip the work rather than fail loudly. Auto-update is convenience;
+/// nothing else hangs off of it.
+///
+/// Modes:
+/// - `Off` → do nothing.
+/// - `Notify` → the original behavior: check (throttled / cached) and
+///   show a banner at exit if a newer release exists, never install.
+/// - `Install` → if the throttle window has elapsed, run kaishin's
+///   silent background install as a spawned task; print one line at
+///   exit only if it actually installed.
+pub fn maybe_spawn_auto_update_check(
+    rt: &tokio::runtime::Handle,
+    cli_source: Option<&Utf8Path>,
+) -> Option<AutoUpdateHandle> {
+    // Env kill-switch takes precedence over config.
+    if auto_update_disabled_by_env() {
+        return None;
+    }
+
     let source = detect_source(cli_source)?;
     let yui = YuiVars::detect(&source);
     let loaded = config::load(&source, &yui).ok()?;
-    if !loaded.ui.auto_update_check {
+    let mode = loaded.ui.update_mode();
+    if mode == AutoUpdateMode::Off {
         return None;
     }
 
@@ -175,58 +274,103 @@ pub fn maybe_spawn_auto_update_check(cli_source: Option<&Utf8Path>) -> Option<Au
         },
     };
 
-    let checker = Checker::new().ok()?.interval(interval);
+    let checker = Checker::new()?.interval(interval);
 
-    if !checker.should_check() {
-        if let Some(latest) = checker.cached_update() {
-            return Some(AutoUpdateHandle::CachedAvailable { checker, latest });
+    match mode {
+        AutoUpdateMode::Off => None,
+        AutoUpdateMode::Notify => {
+            if !checker.should_check() {
+                if let Some(latest) = checker.cached_update() {
+                    return Some(AutoUpdateHandle::CachedAvailable { checker, latest });
+                }
+                return None;
+            }
+
+            let cached_latest = checker.cached_update();
+            let task_checker = checker.clone();
+            let handle = rt.spawn(async move { task_checker.check_and_save().await });
+
+            Some(AutoUpdateHandle::Pending {
+                checker,
+                handle,
+                cached_latest,
+            })
         }
-        return None;
+        AutoUpdateMode::Install => {
+            // `auto_update` is itself self-throttled, but gating on
+            // `should_check` here avoids spawning a task (and the
+            // OS-lock dance) on every fast command inside the window.
+            if !checker.should_check() {
+                return None;
+            }
+            let handle = rt.spawn(async move { checker.auto_update().await });
+            Some(AutoUpdateHandle::Installing { handle })
+        }
     }
-
-    let cached_latest = checker.cached_update();
-    let (tx, rx) = std::sync::mpsc::channel();
-    let checker_clone = Checker::new().ok()?.interval(interval);
-    std::thread::spawn(move || {
-        let _ = tx.send(checker_clone.check_and_save());
-    });
-
-    Some(AutoUpdateHandle::Pending {
-        checker,
-        rx,
-        cached_latest,
-    })
 }
 
-/// Print the update banner (if any) before the binary exits. Waits
-/// up to one second for an in-flight background check to finish; on
-/// timeout, falls back to the previously-cached release so the user
-/// still gets the nudge.
+/// Finish the background auto-update work before the binary exits.
 ///
-/// kaishin 0.4 made `check_and_save` return `Result<Option<_>>`, so
-/// the "fetched, no update" case (`Ok(Ok(None))`) is now distinct
-/// from a timeout/error: in that case we skip the banner entirely
-/// instead of falling back to cache, since the cache can't be newer
-/// than the fresh fetch we just completed. Timeout/error still falls
-/// back to cache so a slow GitHub doesn't suppress the nudge.
-pub fn finalize_auto_update_check(handle: AutoUpdateHandle) {
-    let (checker, latest) = match handle {
-        AutoUpdateHandle::CachedAvailable { checker, latest } => (checker, Some(latest)),
+/// Each in-flight task is drained with a short, bounded
+/// `tokio::time::timeout` driven on `rt` — this never blocks an OS
+/// worker thread synchronously, and a still-running task is simply
+/// abandoned at process exit.
+///
+/// For `notify` mode (`CachedAvailable` / `Pending`) this prints the
+/// "new version available" banner, waiting up to one second for an
+/// in-flight check; on timeout it falls back to the previously-cached
+/// release so a slow GitHub doesn't suppress the nudge. The
+/// "fetched, no update" case (`Ok(Ok(None))`) is distinct from a
+/// timeout/error and skips the banner entirely, since the cache can't
+/// be newer than the fresh fetch we just completed.
+///
+/// For `install` mode (`Installing`) this waits a *short* bounded
+/// window (5s) for the background install and, only if a new version
+/// was actually installed, prints exactly one line. Every other
+/// outcome (timeout, error, nothing installed) stays silent — fast
+/// yui commands must never hang waiting on a slow download.
+pub fn finalize_auto_update_check(rt: &tokio::runtime::Handle, handle: AutoUpdateHandle) {
+    match handle {
+        AutoUpdateHandle::CachedAvailable { checker, latest } => {
+            eprintln!("\n{}", checker.format_banner(&latest));
+        }
         AutoUpdateHandle::Pending {
             checker,
-            rx,
+            handle,
             cached_latest,
         } => {
-            let latest = match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(Ok(Some(latest))) => Some(latest),
-                Ok(Ok(None)) => None,
-                _ => cached_latest,
-            };
-            (checker, latest)
+            let res =
+                rt.block_on(async { tokio::time::timeout(NOTIFY_FINALIZE_TIMEOUT, handle).await });
+            match res {
+                Ok(Ok(Ok(Some(latest)))) => {
+                    eprintln!("\n{}", checker.format_banner(&latest));
+                }
+                Ok(Ok(Ok(None))) => {
+                    // Fetched fine, no update — and no cache fallback needed.
+                }
+                _ => {
+                    // Timeout / join error / fetch error: fall back to cache.
+                    if let Some(latest) = cached_latest {
+                        eprintln!("\n{}", checker.format_banner(&latest));
+                    }
+                }
+            }
         }
-    };
-    if let Some(latest) = latest {
-        eprintln!("\n{}", checker.format_banner(&latest));
+        AutoUpdateHandle::Installing { handle } => {
+            // SHORT bounded wait: a fast command must not block on a
+            // slow download. Print a single line only on a real
+            // install; timeout / error / "nothing installed" stay
+            // silent (resilience).
+            let res =
+                rt.block_on(async { tokio::time::timeout(INSTALL_FINALIZE_TIMEOUT, handle).await });
+            if let Ok(Ok(Ok(Some(latest)))) = res {
+                eprintln!(
+                    "\u{2713} {} {} installed in the background — restart to apply.",
+                    BIN,
+                    latest.tag_name.trim_start_matches('v')
+                );
+            }
+        }
     }
 }
 

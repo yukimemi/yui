@@ -117,35 +117,121 @@ pub enum HookPhase {
     Post,
 }
 
-#[derive(Debug, Deserialize)]
+/// What yui does in the background when a newer release exists.
+///
+/// Background work runs once per `update_check_interval` (default
+/// 24h), only on a real installed binary (dev builds are skipped by
+/// kaishin), and is fully silent on any network / lock failure.
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoUpdateMode {
+    /// Do nothing — no check, no banner, no install.
+    Off,
+    /// Hit GitHub and show a banner at exit if a newer release is
+    /// available, but never install. The user runs `yui self-update`
+    /// themselves. (This was the 0.4.x default behavior.)
+    Notify,
+    /// Silently download + swap yui's own binary in the background;
+    /// the running process keeps the old binary and the new version
+    /// applies on next launch. Prints exactly one line on a real
+    /// install. This is the default (opt-out).
+    #[default]
+    Install,
+}
+
+#[derive(Debug, Deserialize, Default)]
 pub struct UiConfig {
     #[serde(default)]
     pub icons: IconsMode,
-    /// When true, yui spawns a background update check on every
-    /// non-self-update invocation and shows a banner at exit if a
-    /// newer release is available. Powered by `kaishin::Checker`;
-    /// mirrors renri / rvpm.
-    #[serde(default = "default_auto_update_check")]
-    pub auto_update_check: bool,
-    /// Cadence override for the background update check (e.g.
+    /// Background auto-update behavior: `"off"` / `"notify"` /
+    /// `"install"`. Default `install` (silent background install,
+    /// applied on next launch). Powered by `kaishin::Checker`;
+    /// mirrors renri / rvpm. The `YUI_NO_AUTOUPDATE` env var is a
+    /// kill-switch that overrides this regardless of mode.
+    ///
+    /// `None` means the key was omitted from `config.toml` — that is
+    /// kept distinct from an explicit `auto_update = "install"` so the
+    /// deprecated `auto_update_check` alias only kicks in when the user
+    /// gave no opinion here. [`UiConfig::update_mode`] resolves `None`
+    /// to the default ([`AutoUpdateMode::Install`]).
+    #[serde(default)]
+    pub auto_update: Option<AutoUpdateMode>,
+    /// DEPRECATED alias for `auto_update`, kept for backward
+    /// compatibility. `Some(true)` → `notify`, `Some(false)` → `off`,
+    /// `None` → no opinion (fall through to `auto_update` / default).
+    /// `auto_update` always wins when both are set. Resolved by
+    /// [`UiConfig::update_mode`], which emits a one-time migration
+    /// warning when this key is present.
+    #[serde(default)]
+    pub auto_update_check: Option<bool>,
+    /// Cadence override for the background update work (e.g.
     /// `"24h"`, `"1d"`, `"30m"`). Parsed by `kaishin::parse_interval`.
     /// `None` falls back to the kaishin default (24h).
     #[serde(default)]
     pub update_check_interval: Option<String>,
 }
 
-impl Default for UiConfig {
-    fn default() -> Self {
-        Self {
-            icons: IconsMode::default(),
-            auto_update_check: default_auto_update_check(),
-            update_check_interval: None,
+impl UiConfig {
+    /// Resolve the effective auto-update mode, honoring the deprecated
+    /// `auto_update_check` boolean alias.
+    ///
+    /// Precedence:
+    /// 1. an explicit `auto_update` (any value the user actually wrote)
+    ///    wins;
+    /// 2. else the deprecated `auto_update_check` maps `true → notify`,
+    ///    `false → off` (and emits a one-time migration warning);
+    /// 3. else the default (`install`).
+    ///
+    /// Because `auto_update` is `Option`, an explicit
+    /// `auto_update = "install"` is distinguishable from the omitted
+    /// default and unambiguously wins over a stale `auto_update_check`.
+    ///
+    /// This is a **pure** resolver with no side effects — it is safe to
+    /// call any number of times. The one-shot deprecation warning for
+    /// the legacy `auto_update_check` alias is emitted separately at
+    /// config load time (see [`load`] /
+    /// [`UiConfig::warn_deprecated_auto_update_check`]), so the resolver
+    /// stays a clean getter and the warning never duplicates or pollutes
+    /// test output.
+    pub fn update_mode(&self) -> AutoUpdateMode {
+        // An explicit `auto_update` always wins — `Option` lets us tell
+        // "user wrote auto_update = install" apart from the omitted
+        // default, so the deprecated bool only matters when the user
+        // gave no opinion here.
+        if let Some(mode) = self.auto_update {
+            return mode;
+        }
+        match self.auto_update_check {
+            Some(true) => AutoUpdateMode::Notify,
+            Some(false) => AutoUpdateMode::Off,
+            None => AutoUpdateMode::default(),
         }
     }
-}
 
-fn default_auto_update_check() -> bool {
-    true
+    /// Emit the one-line deprecation warning for the legacy
+    /// `auto_update_check` alias, but only when it is the key actually
+    /// driving the effective mode (i.e. `auto_update` is unset but
+    /// `auto_update_check` is present).
+    ///
+    /// Called exactly once from [`load`] at config-load time, so the
+    /// warning fires at most once per process and [`update_mode`] can
+    /// stay a pure getter.
+    ///
+    /// [`update_mode`]: Self::update_mode
+    pub fn warn_deprecated_auto_update_check(&self) {
+        if self.auto_update.is_some() {
+            return;
+        }
+        if let Some(legacy) = self.auto_update_check {
+            tracing::warn!(
+                "[ui] auto_update_check is deprecated; use \
+                 `auto_update = \"notify\"|\"off\"|\"install\"` instead \
+                 ({} maps to {})",
+                legacy,
+                if legacy { "notify" } else { "off" },
+            );
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -463,6 +549,12 @@ pub fn load(source: &Utf8Path, yui: &YuiVars) -> Result<Config> {
     let cfg: Config = toml::Value::Table(merged)
         .try_into()
         .map_err(|e| Error::Config(format!("schema: {e}")))?;
+
+    // Surface the legacy-alias deprecation warning once, here at load
+    // time, rather than as a side effect of the `update_mode` resolver.
+    // This keeps the resolver pure and avoids duplicate warnings.
+    cfg.ui.warn_deprecated_auto_update_check();
+
     Ok(cfg)
 }
 
@@ -972,5 +1064,83 @@ when_run = "onchange"
         // the third arg is `{{ script_path }}`, ready for the hook
         // executor to render with the real path.
         assert_eq!(cfg.hook[0].args, vec!["run", "-A", "{{ script_path }}"]);
+    }
+
+    // ========================================================
+    // [ui] auto_update mode resolution (kaishin 0.5.0)
+    // ========================================================
+
+    fn ui(body: &str) -> UiConfig {
+        toml::from_str::<UiConfig>(body).unwrap()
+    }
+
+    #[test]
+    fn auto_update_defaults_to_install() {
+        let u = ui("");
+        assert_eq!(u.auto_update, None);
+        assert_eq!(u.auto_update_check, None);
+        assert_eq!(u.update_mode(), AutoUpdateMode::Install);
+    }
+
+    #[test]
+    fn auto_update_explicit_off() {
+        let u = ui(r#"auto_update = "off""#);
+        assert_eq!(u.auto_update, Some(AutoUpdateMode::Off));
+        assert_eq!(u.update_mode(), AutoUpdateMode::Off);
+    }
+
+    #[test]
+    fn auto_update_explicit_notify() {
+        let u = ui(r#"auto_update = "notify""#);
+        assert_eq!(u.auto_update, Some(AutoUpdateMode::Notify));
+        assert_eq!(u.update_mode(), AutoUpdateMode::Notify);
+    }
+
+    #[test]
+    fn auto_update_explicit_install() {
+        let u = ui(r#"auto_update = "install""#);
+        assert_eq!(u.auto_update, Some(AutoUpdateMode::Install));
+        assert_eq!(u.update_mode(), AutoUpdateMode::Install);
+    }
+
+    #[test]
+    fn deprecated_auto_update_check_false_maps_to_off() {
+        let u = ui("auto_update_check = false");
+        assert_eq!(u.auto_update_check, Some(false));
+        assert_eq!(u.update_mode(), AutoUpdateMode::Off);
+    }
+
+    #[test]
+    fn deprecated_auto_update_check_true_maps_to_notify() {
+        let u = ui("auto_update_check = true");
+        assert_eq!(u.auto_update_check, Some(true));
+        assert_eq!(u.update_mode(), AutoUpdateMode::Notify);
+    }
+
+    #[test]
+    fn explicit_auto_update_wins_over_deprecated_bool() {
+        // user set both: the explicit `auto_update` always wins.
+        let u = ui(r#"auto_update = "off"
+auto_update_check = true"#);
+        assert_eq!(u.update_mode(), AutoUpdateMode::Off);
+
+        let u = ui(r#"auto_update = "notify"
+auto_update_check = false"#);
+        assert_eq!(u.update_mode(), AutoUpdateMode::Notify);
+
+        // The case the `Option` exists for: an explicit
+        // `auto_update = "install"` is distinguishable from the omitted
+        // default and so beats a stale `auto_update_check = false`
+        // (which would otherwise force `off`).
+        let u = ui(r#"auto_update = "install"
+auto_update_check = false"#);
+        assert_eq!(u.auto_update, Some(AutoUpdateMode::Install));
+        assert_eq!(u.update_mode(), AutoUpdateMode::Install);
+    }
+
+    #[test]
+    fn update_check_interval_still_parses() {
+        let u = ui(r#"update_check_interval = "12h""#);
+        assert_eq!(u.update_check_interval.as_deref(), Some("12h"));
     }
 }

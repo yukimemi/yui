@@ -36,12 +36,17 @@ base64 = "0.22.1"
 camino = { version = "1.2.2", features = ["serde1"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 clap_complete = "4.6.5"
+# OS cache dir resolution for the transient auto-update state file
+# (`<cache>/yui/last_update_check.json`). Matches renri.
+dirs = "6"
 globset = "0.4.18"
 ignore = "0.4.25"
 indicatif = "0.18.4"
 jiff = { version = "0.2.28", features = ["serde"] }
-# Shared self-update library (`yui self-update`). Pinned exact to
-# match rvpm / renri; kaishin's surface is still 0.x.
+# Shared self-update library (`yui self-update` + background
+# auto-update). Pinned to match rvpm / renri; kaishin's surface is
+# still 0.x. 0.5.0 adds `Checker::auto_update` (silent background
+# install).
 kaishin = "0.5.0"
 owo-colors = "4.3.0"
 same-file = "1.0.6"
@@ -51,12 +56,14 @@ sha2 = "0.11.0"
 similar = "3.1.1"
 tera = "1.20.1"
 thiserror = "2.0.18"
-# Minimal runtime needed by kaishin's async API; we drive it from a
-# blocking `current_thread` runtime in `updater::run_self_update`
-# so the rest of yui can stay sync. `rt` is the only feature we
-# need — `updater` doesn't use `#[tokio::main]` / `tokio::test` /
-# the `macros` family (PR #74 review by gemini-code-assist).
-tokio = { version = "1.52.3", features = ["rt"] }
+# Runtime needed by kaishin's async API. `run_self_update` drives it
+# from a blocking `current_thread` runtime so that path stays sync; the
+# background auto-update instead spawns a task on a small
+# `new_multi_thread` runtime in `main` so the fetch / install overlaps
+# the command, then drains it at shutdown with a bounded
+# `tokio::time::timeout` (mirrors renri / rvpm). `macros` is still
+# unused — `updater` doesn't use `#[tokio::main]` / `tokio::test`.
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "time"] }
 toml = "1.1.2"
 toml_edit = "0.25.12"
 tracing = "0.1.44"

@@ -447,6 +447,32 @@ Need to absorb a single file regardless of policy? `yui absorb
 `ascii` (CI-log-safe). The `[ui] icons = "..."` config key sets it
 globally.
 
+### Background auto-update (`[ui] auto_update`)
+
+After any command other than `self-update` / `completion`, yui can
+keep itself current in the background. `[ui] auto_update` picks the
+behavior:
+
+| value | behavior |
+| --- | --- |
+| `"install"` *(default)* | Silently download + swap yui's own binary in the background. The running process keeps the old binary; the new version applies on the **next launch**. Prints one line (`✓ yui <version> installed in the background — restart to apply.`) only when an install actually happened. |
+| `"notify"` | Hit GitHub and show a banner at exit if a newer release exists, but never install — you run `yui self-update` yourself. |
+| `"off"` | Do nothing. |
+
+The work runs at most once per `[ui] update_check_interval` (humantime
+format, e.g. `"24h"` / `"1d"` / `"30m"`; default `24h`), is skipped
+for dev builds, is serialized across concurrent processes, and stays
+silent on any network / lock failure.
+
+Set the `YUI_NO_AUTOUPDATE` environment variable (to anything other
+than empty / `0` / `false`) to disable auto-update entirely — it takes
+**precedence over the config**.
+
+The boolean `[ui] auto_update_check` is a **deprecated alias** kept for
+backward compatibility: `true` maps to `notify`, `false` maps to `off`.
+An explicit `auto_update` always wins; using `auto_update_check` emits a
+one-time migration warning.
+
 ## Status
 
 Used in production for the author's own ~/dotfiles. Known gaps:
