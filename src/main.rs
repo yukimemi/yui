@@ -16,16 +16,40 @@ fn main() -> Result<()> {
         cli.command,
         Command::SelfUpdate { .. } | Command::Completion { .. }
     );
+
+    // A small multi-threaded tokio runtime drives the background
+    // auto-update as a spawned task that overlaps the command (mirrors
+    // renri / rvpm). One worker is enough: the task is mostly network /
+    // IO-bound and is drained with a short, bounded timeout at shutdown.
+    // Built lazily so commands that never spawn an update (self-update /
+    // completions, or a disabled config) don't pay for it; `None` means
+    // we never needed a runtime.
+    let mut update_rt: Option<tokio::runtime::Runtime> = None;
     let update_check_handle = if banner_eligible {
-        updater::maybe_spawn_auto_update_check(cli.source.as_deref())
+        match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => {
+                let handle =
+                    updater::maybe_spawn_auto_update_check(rt.handle(), cli.source.as_deref());
+                if handle.is_some() {
+                    update_rt = Some(rt);
+                }
+                handle
+            }
+            // If even the runtime fails to build, silently skip auto-update.
+            Err(_) => None,
+        }
     } else {
         None
     };
 
     let result = cli.run();
 
-    if let Some(handle) = update_check_handle {
-        updater::finalize_auto_update_check(handle);
+    if let (Some(rt), Some(handle)) = (update_rt.as_ref(), update_check_handle) {
+        updater::finalize_auto_update_check(rt.handle(), handle);
     }
 
     result
