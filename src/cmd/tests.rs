@@ -1369,6 +1369,107 @@ recipients = ["{}"]
     );
 }
 
+/// `yui status` surfaces secret drift. The plaintext sibling is
+/// hardlinked into target (forced via `[link] file_mode` so Unix
+/// runners don't fall back to symlink and dodge the scenario), so
+/// editing it keeps the link itself in-sync (same inode) — only
+/// the `.age` comparison can catch the divergence, which status
+/// used to skip entirely.
+#[test]
+fn status_reports_secret_drift() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let identity_path = utf8(tmp.path().join("age.txt"));
+    let (secret_key, public) = secret::generate_x25519_keypair();
+    std::fs::write(&identity_path, format!("{secret_key}\n")).unwrap();
+
+    let recipient = secret::parse_x25519_recipient(&public).unwrap();
+    let cipher = secret::encrypt_x25519(b"v1 content\n", &[recipient]).unwrap();
+    std::fs::write(source.join("home/secret.age"), &cipher).unwrap();
+
+    let cfg = format!(
+        r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+
+[link]
+file_mode = "hardlink"
+
+[secrets]
+identity = "{}"
+recipients = ["{}"]
+"#,
+        toml_path(&target),
+        toml_path(&identity_path),
+        public
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    // Clean apply: decrypts the sibling and links everything.
+    apply(Some(source.clone()), false).unwrap();
+    status(Some(source.clone()), None, true).unwrap();
+
+    // Edit through the target link — the hardlinked pair stays
+    // in-sync, but the plaintext now diverges from the .age.
+    std::fs::write(target.join("secret"), "edited locally\n").unwrap();
+
+    let err = status(Some(source.clone()), None, true).unwrap_err();
+    assert!(
+        format!("{err}").contains("diverged"),
+        "expected status to flag secret drift, got: {err}"
+    );
+}
+
+/// Resilience: a configured-but-broken `[secrets]` identity must
+/// not kill `yui status` — the secret check downgrades to a
+/// warning and the rest of the report still works.
+#[test]
+fn status_survives_unreadable_identity() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(source.join("home/.bashrc"), "echo hi\n").unwrap();
+
+    let cfg = format!(
+        r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+        toml_path(&target)
+    );
+    std::fs::write(source.join("config.toml"), &cfg).unwrap();
+    apply(Some(source.clone()), false).unwrap();
+
+    // Now enable secrets pointing at an identity that doesn't
+    // exist — apply would fail here, status must not.
+    let (_secret_key, public) = secret::generate_x25519_keypair();
+    let cfg = format!(
+        r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+
+[secrets]
+identity = "{}"
+recipients = ["{}"]
+"#,
+        toml_path(&target),
+        toml_path(&utf8(tmp.path().join("missing-identity.txt"))),
+        public
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    status(Some(source), None, true).unwrap();
+}
+
 // -- append_recipient_to_config (PR #57 review: toml_edit) --
 
 #[test]
@@ -1864,6 +1965,54 @@ fn diff_render_drift_uses_rendered_output_not_raw_template() {
     );
 }
 
+/// `yui diff` for a secret-drifted sibling must diff the
+/// **decrypted** `.age` content against the on-disk plaintext, not
+/// the raw ciphertext — the twin of the render-drift test above.
+/// Pins `secret::decrypt_file`, the helper `print_unified_diff`
+/// uses for the source side of `SecretDrift` rows.
+#[test]
+fn diff_secret_drift_uses_decrypted_content_not_ciphertext() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let identity_path = utf8(tmp.path().join("age.txt"));
+    let (secret_key, public) = secret::generate_x25519_keypair();
+    std::fs::write(&identity_path, format!("{secret_key}\n")).unwrap();
+    let recipient = secret::parse_x25519_recipient(&public).unwrap();
+    let cipher = secret::encrypt_x25519(b"plain v1\n", &[recipient]).unwrap();
+    let cipher_path = source.join("home/secret.age");
+    std::fs::write(&cipher_path, &cipher).unwrap();
+
+    let cfg = format!(
+        r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+
+[secrets]
+identity = "{}"
+recipients = ["{}"]
+"#,
+        toml_path(&target),
+        toml_path(&identity_path),
+        public
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    let yui = YuiVars::detect(&source);
+    let config = config::load(&source, &yui).unwrap();
+
+    // The on-disk bytes are armored ciphertext…
+    let on_disk = std::fs::read(&cipher_path).unwrap();
+    assert!(on_disk.starts_with(b"age-encryption.org/v1\n"));
+    // …but the diff's source side sees the decrypted plaintext.
+    let decrypted = secret::decrypt_file(&cipher_path, &config).unwrap();
+    assert_eq!(decrypted, b"plain v1\n");
+}
+
 /// Regression for the path-resolution bug coderabbitai flagged
 /// on PR #53: `StatusItem.src` is a *relative-for-display*
 /// path, so reading it directly during diff rendering would
@@ -1892,6 +2041,17 @@ fn resolve_diff_src_absolutizes_link_rows() {
         resolve_diff_src(&render_item, source),
         Utf8PathBuf::from("/dot/home/foo.tera"),
     );
+    // SecretDrift rows carry the absolute `.age` path, same as
+    // RenderDrift carries the absolute `.tera` path.
+    let secret_item = StatusItem {
+        src: Utf8PathBuf::from("/dot/home/secret.age"),
+        dst: Utf8PathBuf::from("/dot/home/secret"),
+        state: StatusState::SecretDrift,
+    };
+    assert_eq!(
+        resolve_diff_src(&secret_item, source),
+        Utf8PathBuf::from("/dot/home/secret.age"),
+    );
 }
 
 #[test]
@@ -1905,6 +2065,7 @@ fn diff_classifier_skips_uninteresting_states() {
     assert!(diff_worth_printing(&StatusState::Link(AutoAbsorb)));
     assert!(diff_worth_printing(&StatusState::Link(NeedsConfirm)));
     assert!(diff_worth_printing(&StatusState::RenderDrift));
+    assert!(diff_worth_printing(&StatusState::SecretDrift));
 }
 
 // -----------------------------------------------------------------
