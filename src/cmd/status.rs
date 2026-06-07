@@ -20,7 +20,11 @@ use tracing::warn;
 /// and additionally surfaces any **render drift** — rendered files
 /// whose content has diverged from what the matching `.tera` template
 /// would produce now (i.e. the user edited the rendered file in place
-/// without reflecting the change back into the template).
+/// without reflecting the change back into the template) — and any
+/// **secret drift** — plaintext siblings that no longer match what
+/// their canonical `.age` decrypts to (i.e. the user edited the
+/// plaintext, usually through the target link, without re-encrypting
+/// via `yui secret encrypt`).
 ///
 /// Exits non-zero (via `anyhow::bail!`) when anything diverges, so
 /// `yui status && …` can gate workflows on a clean tree.
@@ -63,7 +67,29 @@ pub fn status(
         });
     }
 
-    // 2. Link drift — classify each src→dst pair under every mount.
+    // 2. Secret drift — decrypt every `.age` in dry-run mode and
+    //    surface plaintext siblings that no longer match the
+    //    ciphertext (the user edited the linked plaintext without
+    //    rolling it back via `yui secret encrypt`). Resilience
+    //    principle: status must keep working when apply would fail,
+    //    so a missing / unreadable identity downgrades to a warning
+    //    instead of bailing the whole report.
+    match crate::secret::decrypt_all(&source, &config, /* dry_run */ true) {
+        Ok(secret_report) => {
+            for plaintext in &secret_report.diverged {
+                // Show the `.age` as src — the canonical side the
+                // user re-encrypts into.
+                report.push(StatusItem {
+                    src: relative_for_display(&source, &crate::secret::age_sibling(plaintext)),
+                    dst: plaintext.clone(),
+                    state: StatusState::SecretDrift,
+                });
+            }
+        }
+        Err(e) => warn!("secret drift check skipped: {e}"),
+    }
+
+    // 3. Link drift — classify each src→dst pair under every mount.
     // Single nested-`.yuiignore` stack threaded across all mounts.
     // Seed the source-root layer so root rules apply from the start.
     let mut yuiignore = paths::YuiIgnoreStack::new();
@@ -125,6 +151,10 @@ pub(crate) enum StatusState {
     /// Rendered output diverges from current `.tera` template — user
     /// edited the rendered file directly without updating the template.
     RenderDrift,
+    /// Plaintext sibling diverges from the canonical `.age` — user
+    /// edited the decrypted file (usually through the target link)
+    /// without re-encrypting via `yui secret encrypt`.
+    SecretDrift,
 }
 
 impl StatusState {
@@ -353,6 +383,7 @@ fn state_label(s: StatusState) -> &'static str {
         StatusState::Link(NeedsConfirm) => "drift (anomaly)",
         StatusState::Link(Restore) => "missing",
         StatusState::RenderDrift => "render drift",
+        StatusState::SecretDrift => "secret drift",
     }
 }
 
@@ -365,6 +396,7 @@ fn state_icon(s: StatusState, icons: Icons) -> &'static str {
         StatusState::Link(NeedsConfirm) => icons.error,
         StatusState::Link(Restore) => icons.info,
         StatusState::RenderDrift => icons.error,
+        StatusState::SecretDrift => icons.error,
     }
 }
 
@@ -434,6 +466,7 @@ fn print_status_row(
         StatusState::Link(NeedsConfirm) => cell_state.red().to_string(),
         StatusState::Link(Restore) => cell_state.cyan().to_string(),
         StatusState::RenderDrift => cell_state.red().to_string(),
+        StatusState::SecretDrift => cell_state.red().to_string(),
     };
     let src_colored = cell_src.cyan().to_string();
     let arrow_colored = arrow.dimmed().to_string();

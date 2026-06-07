@@ -10,7 +10,7 @@ use anyhow::Result;
 use camino::{Utf8Path, Utf8PathBuf};
 
 /// `yui diff [--icons MODE] [--no-color]` — for every drifted entry
-/// (link or render), print a unified diff to stdout.
+/// (link, render, or secret), print a unified diff to stdout.
 ///
 /// Layered on top of the same drift detection `yui status` uses
 /// (`absorb::classify` + render dry-run), but actually emits the
@@ -74,6 +74,21 @@ pub fn diff(
         });
     }
 
+    // Secret drift too — same downgrade-to-warning semantics as
+    // cmd::status so a broken identity doesn't kill the diff.
+    match crate::secret::decrypt_all(&source, &config, /* dry_run */ true) {
+        Ok(secret_report) => {
+            for plaintext in &secret_report.diverged {
+                report.push(StatusItem {
+                    src: crate::secret::age_sibling(plaintext),
+                    dst: plaintext.clone(),
+                    state: StatusState::SecretDrift,
+                });
+            }
+        }
+        Err(e) => tracing::warn!("secret drift check skipped: {e}"),
+    }
+
     let mut printed = 0usize;
     for item in &report {
         if !diff_worth_printing(&item.state) {
@@ -112,12 +127,12 @@ pub fn diff(
 /// for table rendering. For `Link(_)` rows we have to re-absolutize
 /// before reading — otherwise the path resolves against the
 /// caller's cwd and we'd read an empty / wrong file. `RenderDrift`
-/// rows already carry an absolute `.tera` path (built from
-/// `render_report.diverged`, which the walker yields as absolute).
+/// and `SecretDrift` rows already carry an absolute path (built
+/// from the dry-run reports, which the walkers yield as absolute).
 /// (Caught in PR #53 review by coderabbitai.)
 pub(crate) fn resolve_diff_src(item: &StatusItem, source: &Utf8Path) -> Utf8PathBuf {
     match item.state {
-        StatusState::RenderDrift => item.src.clone(),
+        StatusState::RenderDrift | StatusState::SecretDrift => item.src.clone(),
         StatusState::Link(_) => source.join(&item.src),
     }
 }
@@ -130,6 +145,7 @@ pub(crate) fn diff_worth_printing(state: &StatusState) -> bool {
         StatusState::Link(RelinkOnly) => false, // content identical, only metadata drift
         StatusState::Link(_) => true,
         StatusState::RenderDrift => true,
+        StatusState::SecretDrift => true,
     }
 }
 
@@ -153,6 +169,7 @@ fn print_unified_diff(
 
     let header = match state {
         StatusState::RenderDrift => format!("--- render drift: {src} (template) vs {dst}"),
+        StatusState::SecretDrift => format!("--- secret drift: {src} (decrypted) vs {dst}"),
         _ => format!("--- {src} → {dst}"),
     };
     if color {
@@ -170,8 +187,25 @@ fn print_unified_diff(
     // Source side of the diff:
     //   - RenderDrift → re-render the .tera in memory (otherwise
     //     we'd surface raw Tera syntax as drift).
+    //   - SecretDrift → decrypt the .age in memory (diffing raw
+    //     ciphertext would be meaningless).
     //   - Link(_)     → read the source file from disk.
     let src_content = match state {
+        StatusState::SecretDrift => match crate::secret::decrypt_file(src, config) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(_) => {
+                    println!("(binary secret — diff skipped)");
+                    println!();
+                    return;
+                }
+            },
+            Err(e) => {
+                println!("(error decrypting {src}: {e})");
+                println!();
+                return;
+            }
+        },
         StatusState::RenderDrift => match render::render_to_string(src, source_root, config, yui) {
             Ok(Some(s)) => s,
             Ok(None) => {

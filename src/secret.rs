@@ -331,6 +331,24 @@ pub fn strip_age_suffix(path: &Utf8Path) -> Option<camino::Utf8PathBuf> {
     Some(parent.join(stem))
 }
 
+/// Inverse of [`strip_age_suffix`]: the canonical `.age` ciphertext
+/// path for a plaintext sibling. Used by `yui status` / `yui diff`
+/// to point the user at the file they'd re-encrypt into.
+pub fn age_sibling(plaintext: &Utf8Path) -> camino::Utf8PathBuf {
+    camino::Utf8PathBuf::from(format!("{plaintext}.age"))
+}
+
+/// Decrypt a single `*.age` file using the `[secrets]` identity
+/// from `config`. Used by `yui diff` to compute the expected
+/// plaintext of a drifted secret in memory (never written to disk).
+pub fn decrypt_file(cipher_path: &Utf8Path, config: &crate::config::Config) -> Result<Vec<u8>> {
+    let identity_path = crate::paths::expand_tilde(&config.secrets.identity);
+    let identity = load_x25519_identity(&identity_path)?;
+    let cipher_bytes = std::fs::read(cipher_path)
+        .map_err(|e| Error::Other(anyhow::anyhow!("read {cipher_path}: {e}")))?;
+    decrypt_x25519(&cipher_bytes, &identity)
+}
+
 /// Walk every `*.age` under `source`, decrypt to a sibling without
 /// the suffix, and report the plaintext paths so the caller can
 /// add them to the managed `.gitignore` section. Mirrors the
@@ -637,5 +655,13 @@ mod tests {
             None
         );
         assert_eq!(strip_age_suffix(Utf8PathBuf::from(".age").as_path()), None);
+    }
+
+    #[test]
+    fn age_sibling_round_trips_with_strip() {
+        let plain = Utf8PathBuf::from("home/.ssh/id_ed25519");
+        let cipher = age_sibling(&plain);
+        assert_eq!(cipher, Utf8PathBuf::from("home/.ssh/id_ed25519.age"));
+        assert_eq!(strip_age_suffix(&cipher), Some(plain));
     }
 }
