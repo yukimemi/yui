@@ -47,7 +47,7 @@ jiff = { version = "0.2.28", features = ["serde"] }
 # auto-update). Pinned to match rvpm / renri; kaishin's surface is
 # still 0.x. 0.5.0 adds `Checker::auto_update` (silent background
 # install).
-kaishin = "0.6.0"
+kaishin = "0.6.1"
 owo-colors = "4.3.0"
 same-file = "1.0.6"
 serde = { version = "1.0.228", features = ["derive"] }
