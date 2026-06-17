@@ -41,7 +41,7 @@ src/
     link.rs       — `yui link`
     unlink.rs     — `yui unlink`
     absorb.rs     — `yui absorb`
-    secret.rs     — `yui secret init/encrypt/store/unlock/wrap`
+    secret.rs     — `yui secret init/encrypt/store/unlock`
     init.rs       — `yui init`
     list.rs       — `yui list`
     unmanaged.rs  — `yui unmanaged`
