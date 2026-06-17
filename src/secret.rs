@@ -362,9 +362,12 @@ pub fn decrypt_file(cipher_path: &Utf8Path, config: &crate::config::Config) -> R
 /// here on purpose — apply must NOT trigger plugin / passkey
 /// prompts every run.
 ///
-/// Skips the `passkey_wrapped` ciphertext file: it's encrypted to
-/// passkey recipients (NOT the X25519), so trying to decrypt it
-/// here would fail loudly. The unlock path handles it instead.
+/// Every `*.age` file under `source` is decrypted in-place with the
+/// X25519 identity. A ciphertext encrypted *only* to passkey / plugin
+/// recipients (no X25519 stanza) would fail `decrypt_x25519` loudly
+/// rather than be skipped — by convention such files belong to
+/// out-of-band `age`-CLI flows and aren't kept in the managed source
+/// tree.
 pub fn decrypt_all(
     source: &Utf8Path,
     config: &crate::config::Config,
