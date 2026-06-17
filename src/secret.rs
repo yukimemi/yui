@@ -652,7 +652,7 @@ mod tests {
     #[test]
     fn encrypt_to_passkeys_with_no_recipients_errors() {
         let err = encrypt_to_passkeys(b"x", &[]).unwrap_err();
-        assert!(format!("{err}").contains("no passkey recipients"));
+        assert!(format!("{err}").contains("no recipients configured"));
     }
 
     #[test]
