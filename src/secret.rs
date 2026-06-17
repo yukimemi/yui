@@ -255,14 +255,16 @@ pub fn encrypt_x25519(plaintext: &[u8], recipients: &[age::x25519::Recipient]) -
 }
 
 /// Encrypt `plaintext` to one or more potentially-plugin
-/// recipients. Used by `yui secret wrap` to encrypt the X25519
-/// identity to passkey devices (Pixel + Bitwarden + …).
+/// recipients (passkey / YubiKey / FIDO2 / …). Used by
+/// `yui secret encrypt`, which parses `[secrets] recipients` with
+/// `parse_passkey_recipients` so a hand-written plugin recipient
+/// gets its own stanza alongside the X25519 one.
 pub fn encrypt_to_passkeys(plaintext: &[u8], recipients: &[BoxedRecipient]) -> Result<Vec<u8>> {
     if recipients.is_empty() {
         return Err(Error::Other(anyhow::anyhow!(
-            "no passkey recipients configured — add at least one to \
-             `[secrets] passkey_recipients` (each entry is the public \
-             key of a Pixel / Bitwarden / etc. device)"
+            "no recipients configured — add at least one to \
+             `[secrets] recipients` (an `age1…` X25519 key, or a plugin \
+             recipient like `age1yubikey1…` / `age1fido2-hmac1…`)"
         )));
     }
     let encryptor = age::Encryptor::with_recipients(
