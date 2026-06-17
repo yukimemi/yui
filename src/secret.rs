@@ -25,18 +25,28 @@
 //!    apply, must be friction-free, must NOT trigger device prompts.
 //!    Identities here are X25519 only by convention.
 //!
-//! 2. **passkey wrap of the X25519 secret itself** — the user's
-//!    `~/.config/yui/age.txt` (plain X25519) gets encrypted to one
-//!    or more passkey recipients (Pixel / Bitwarden / YubiKey, via
-//!    the `age-plugin-fido2-hmac` etc.) so it can travel with the
-//!    dotfiles repo as ciphertext. Used only by `yui secret wrap`
-//!    and `yui secret unlock` — never by apply. Plugin identities
-//!    appear ONLY here, so the apply path stays plugin-free.
+//! 2. **passkey / plugin recipients on `*.age` files** — a recipient
+//!    in `[secrets] recipients` doesn't have to be X25519. A
+//!    hand-written passkey / plugin entry (`age1yubikey1…`,
+//!    `age1fido2-hmac1…`, … via `age-plugin-fido2-hmac` etc.) gets its
+//!    own stanza in the ciphertext alongside the X25519 one when
+//!    `yui secret encrypt` runs. That gives the same `*.age` a parallel
+//!    decrypt path through the standalone `age` CLI (with the matching
+//!    `age-plugin-*` binary on `$PATH`), entirely out-of-band from yui.
+//!    apply never uses it — it decrypts with the X25519 in
+//!    `[secrets] identity` only, so the apply path stays plugin-free
+//!    and prompt-free.
+//!
+//! Cross-machine transport of the X25519 identity itself is a separate
+//! concern, handled by `[secrets] vault` (`yui secret store` /
+//! `yui secret unlock`, backed by Bitwarden / 1Password) — see
+//! `vault.rs`, not this module.
 //!
 //! Recipient strings split the same way: `age1…` for X25519 and
 //! `age1<plugin>1…` for plugin recipients. Multiple recipient types
-//! can mix in a single ciphertext — useful for wrap, where the
-//! user might want both Pixel and Bitwarden as recovery devices.
+//! can mix in a single ciphertext — useful when the user wants both a
+//! daily X25519 key and a passkey device (Pixel / Bitwarden / YubiKey)
+//! as an out-of-band recovery path.
 
 use std::io::{BufReader, Read as _, Write as _};
 use std::str::FromStr as _;
