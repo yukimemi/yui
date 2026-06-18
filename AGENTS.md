@@ -29,8 +29,27 @@ src/
   main.rs       — entry point, parses CLI and dispatches to lib::cli::Cli::run
   lib.rs        — module list + tracing init
   cli.rs        — clap definitions (Cli, Command enum, run())
-  cmd.rs        — one function per Command variant; each loads config,
-                  resolves vars, and orchestrates the underlying modules
+  cmd/          — one module per Command variant; each loads config,
+                  resolves vars, and orchestrates the underlying modules.
+                  `mod.rs` re-exports so `cli.rs` still calls `cmd::apply(…)`.
+    mod.rs        — module list + re-exports
+    common.rs     — shared command helpers (config load, engine/ctx setup)
+    apply.rs      — `yui apply`: decrypt → render → gitignore → link
+    status.rs     — `yui status` output
+    diff.rs       — `yui diff` (render + secret drift preview)
+    render.rs     — `yui render`
+    link.rs       — `yui link`
+    unlink.rs     — `yui unlink`
+    absorb.rs     — `yui absorb`
+    secret.rs     — `yui secret init/encrypt/store/unlock`
+    init.rs       — `yui init`
+    list.rs       — `yui list`
+    unmanaged.rs  — `yui unmanaged`
+    doctor.rs     — `yui doctor`
+    hooks.rs      — `yui hooks`
+    update.rs     — `yui update` (self-update)
+    gc_backup.rs  — `yui gc-backup`
+    tests.rs      — cmd-level unit tests
   config.rs     — TOML schema, loading + Tera pre-render + multi-file merge
   vars.rs       — built-in `yui.*` vars (os/arch/host/user/source)
   paths.rs      — backup-path mirroring + timestamp-suffix utilities
@@ -38,9 +57,15 @@ src/
   mount.rs      — `[[mount.entry]]` resolution (Tera dst, when filter)
   link.rs       — link mode resolution + cross-platform link/unlink
   render.rs     — Tera rendering of `*.tera` files + .gitignore management
+  template.rs   — shared Tera engine + context builders
   absorb.rs     — drift detection + auto/ask decision
   backup.rs     — backup creation under `$DOTFILES/.yui/backup/`
-  status.rs     — `yui status` output
+  secret.rs     — age decrypt-on-apply + secrets-pipeline crypto helpers
+  vault.rs      — Bitwarden / 1Password identity ferrying (secret store/unlock)
+  git.rs        — `git status --porcelain` shell-out (auto-absorb gating)
+  hook.rs       — `[[hook]]` script execution around apply
+  icons.rs      — terminal icon character sets (nerd-font / emoji / ascii)
+  updater.rs    — self-update facade over the `kaishin` library
   error.rs      — Error / Result types
 tests/
   cli.rs        — integration tests via `assert_cmd`
@@ -95,8 +120,36 @@ before reverting any of them.
   before TOML parse so conditionals on whole sections work.
 - **machine-local data is `config.local.toml` `[vars]`**, not a
   separate `data.toml`. Simpler and one less file to remember.
-- **No secret/encryption support in MVP.** If users need it, point
-  them at `1password` CLI or `pass` from inside a Tera template.
+- **Secrets are age-encrypted `*.age` files, decrypted on apply.** A
+  `*.age` file in source is decrypted to a plaintext sibling without the
+  `.age` suffix (`home/.netrc.age` → `home/.netrc`), and that sibling is
+  listed in the managed `.gitignore` section so the plaintext never gets
+  committed — same mechanism as `*.tera` rendered output, so the link
+  walk treats it as a regular file. The **apply path is X25519-only by
+  design**: it decrypts with the plain secret at `[secrets] identity`
+  (default `~/.config/yui/age.txt`) and must never trigger device /
+  plugin prompts. The commands are `yui secret init` (generate the
+  X25519 keypair, append the public key to `[secrets] recipients`) and
+  `yui secret encrypt <path>` (encrypt a plaintext to every
+  `[secrets] recipients` entry → `<path>.age`). `recipients` is normally
+  X25519, but hand-written passkey / plugin recipients
+  (`age1yubikey1…`, `age1fido2-hmac1…`, …) are honored too, giving the
+  ciphertext a parallel out-of-band decrypt path via the standalone
+  `age` CLI without ever touching the apply hot path. The X25519
+  identity itself travels between machines through `[secrets] vault`
+  (`yui secret store` / `yui secret unlock`, backed by Bitwarden or
+  1Password). See `src/secret.rs` and `src/vault.rs`. (Superseded the
+  original "no secrets in MVP" decision — shipped in PR #57 / #60, drift
+  detection added in #123.)
+- **Secret drift hard-bails; render drift is resolved interactively.**
+  When a `.tera` rendered file diverges from freshly-rendered output,
+  `apply` prompts `[o]verwrite / [s]kip / [q]uit`. When a `.age`
+  plaintext sibling diverges from the canonical ciphertext, `apply`
+  instead `bail!`s with a `yui secret encrypt <path>` hint. The
+  asymmetry is deliberate: re-rendering is cheap and idempotent, but
+  silently overwriting an edited plaintext would throw away a change
+  that has not yet been rolled back into the `.age` — re-encrypting is
+  the heavier, explicit action the user must take.
 - **Profiles are `[vars]` switches, not a `--profile` flag.** Branch on
   `vars.work_mode` or `vars.host` inside templates / `when` clauses.
   Single repo per user.
