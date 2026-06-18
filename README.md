@@ -442,7 +442,7 @@ Need to absorb a single file regardless of policy? `yui absorb
 | `yui hooks list` | show configured `[[hook]]` entries + last-run state |
 | `yui hooks run [<name>] [--force]` | run hooks on demand (bypassing `when_run` with `--force`) |
 | `yui secret <init\|encrypt\|store\|unlock>` | manage `*.age` secrets + the X25519 identity — see [Secrets](#secrets-age--opt-in) |
-| `yui self-update [--check] [--yes]` | replace yui's own binary with the latest GitHub release (`--check` only reports) |
+| `yui self-update [--check] [--yes] [--non-interactive]` | replace yui's own binary with the latest GitHub release (`--check` only reports; `--non-interactive` + `--yes` drives it from scripts) |
 | `yui completion <shell>` | print shell completion (bash / zsh / fish / powershell / elvish) |
 
 `--icons` accepts `unicode` (default), `nerd` (Nerd-Font glyphs),
