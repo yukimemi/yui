@@ -33,7 +33,7 @@ path = "src/lib.rs"
 age = { version = "0.11.3", features = ["cli-common", "plugin"] }
 anyhow = "1.0.103"
 base64 = "0.22.1"
-camino = { version = "1.2.3", features = ["serde1"] }
+camino = { version = "1.2.4", features = ["serde1"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 clap_complete = "4.6.5"
 # OS cache dir resolution for the transient auto-update state file
