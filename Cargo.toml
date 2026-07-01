@@ -41,7 +41,7 @@ clap_complete = "4.6.7"
 dirs = "6"
 globset = "0.4.18"
 ignore = "0.4.26"
-indicatif = "0.18.5"
+indicatif = "0.18.6"
 jiff = { version = "0.2.31", features = ["serde"] }
 # Shared self-update library (`yui self-update` + background
 # auto-update). Pinned to match rvpm / renri; kaishin's surface is
