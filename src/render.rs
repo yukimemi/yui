@@ -24,7 +24,7 @@ use std::time::SystemTime;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use tera::Context as TeraContext;
+use teravars::Context as TeraContext;
 
 use crate::config::{Config, RenderRule};
 use crate::paths;

@@ -8,7 +8,7 @@ use crate::vars::YuiVars;
 use anyhow::Result;
 use camino::{Utf8Path, Utf8PathBuf};
 use std::cell::Cell;
-use tera::Context as TeraContext;
+use teravars::Context as TeraContext;
 use tracing::{info, warn};
 
 /// Manually absorb a single target file back into source.

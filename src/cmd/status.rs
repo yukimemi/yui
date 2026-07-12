@@ -9,7 +9,7 @@ use crate::vars::YuiVars;
 use crate::{absorb, paths};
 use anyhow::Result;
 use camino::{Utf8Path, Utf8PathBuf};
-use tera::Context as TeraContext;
+use teravars::Context as TeraContext;
 use tracing::warn;
 
 /// Show every src→dst pair's drift state against the current host.
