@@ -64,7 +64,7 @@ thiserror = "2.0.18"
 # `tokio::time::timeout` (mirrors renri / rvpm). `macros` is still
 # unused — `updater` doesn't use `#[tokio::main]` / `tokio::test`.
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "time"] }
-toml = "1.1.2"
+toml = "1.1.3"
 toml_edit = "0.25.12"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
