@@ -12,7 +12,7 @@ use crate::{absorb, backup, paths};
 use anyhow::{Context as _, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use std::cell::Cell;
-use tera::Context as TeraContext;
+use teravars::Context as TeraContext;
 use tracing::{info, warn};
 
 pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {

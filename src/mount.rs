@@ -2,7 +2,7 @@
 //! Tera, evaluate `when`, drop disabled entries.
 
 use camino::{Utf8Path, Utf8PathBuf};
-use tera::Context;
+use teravars::Context;
 
 use crate::Result;
 use crate::config::{MountEntry, MountStrategy};

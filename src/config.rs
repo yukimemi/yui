@@ -658,7 +658,7 @@ fn resolve_vars_refs(
 fn render_strings_in_table(
     table: &mut toml::Table,
     engine: &mut template::Engine,
-    ctx: &tera::Context,
+    ctx: &teravars::Context,
     changed: &mut bool,
 ) -> Result<()> {
     for (_k, value) in table.iter_mut() {
@@ -670,7 +670,7 @@ fn render_strings_in_table(
 fn render_strings_in_value(
     value: &mut toml::Value,
     engine: &mut template::Engine,
-    ctx: &tera::Context,
+    ctx: &teravars::Context,
     changed: &mut bool,
 ) -> Result<()> {
     match value {

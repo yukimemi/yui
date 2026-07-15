@@ -6,46 +6,34 @@
 //!   - `template_context` — `yui.*` + `vars.*` + `env(…)`. Used to render
 //!     `*.tera` dotfiles after the merged config is known.
 
-use std::collections::HashMap;
-
 use serde::Serialize;
-use tera::{Context, Tera, Value};
+use teravars::{Context, Engine as TeraEngine, Kwargs, State, TeraError, TeraResult, Value};
 
 use crate::Result;
 use crate::vars::YuiVars;
 
 pub struct Engine {
-    tera: Tera,
+    tera: TeraEngine,
 }
 
 impl Engine {
     pub fn new() -> Self {
-        let mut tera = Tera::default();
+        // `new_minimal` = bare Tera with no teravars helpers; yui registers only
+        // its own `env` (below), which differs from teravars' built-in `env` by
+        // returning an empty string — rather than erroring — for an unset var.
+        let mut tera = TeraEngine::new_minimal();
         tera.register_function("env", env_fn);
         Self { tera }
     }
 
     pub fn render(&mut self, src: &str, ctx: &Context) -> Result<String> {
+        // teravars::Engine::render already flattens Tera's nested error chain
+        // into its message (the reason — `variable '…' not found in context`,
+        // etc. — reaches the user), so no manual source-walk is needed here.
         self.tera
-            .render_str(src, ctx)
-            .map_err(|e| crate::Error::Template(format_tera_error(&e)))
+            .render(src, ctx)
+            .map_err(|e| crate::Error::Template(e.to_string()))
     }
-}
-
-/// Tera's `Display` impl only emits the top-level message
-/// (`Failed to render '__tera_one_off'`), leaving the actual reason
-/// (`variable 'vars.home_root' not found in context` etc.) buried in
-/// the source chain. Walk the chain and join every level so the user
-/// sees something they can act on.
-fn format_tera_error(err: &tera::Error) -> String {
-    use std::error::Error as _;
-    let mut parts: Vec<String> = vec![err.to_string()];
-    let mut src = err.source();
-    while let Some(e) = src {
-        parts.push(e.to_string());
-        src = e.source();
-    }
-    parts.join(": ")
 }
 
 impl Default for Engine {
@@ -57,15 +45,14 @@ impl Default for Engine {
 /// `env(name="VAR", default="…")` — read an env var, return `default` (or empty
 /// string) when unset. Returning a string (rather than null) keeps `default`
 /// arg simple; callers can also chain Tera's `default` filter.
-fn env_fn(args: &HashMap<String, Value>) -> tera::Result<Value> {
-    let name = args
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| tera::Error::msg("env(name=…): missing or non-string 'name'"))?;
-    let default = args.get("default").cloned();
+fn env_fn(kwargs: Kwargs, _state: &State) -> TeraResult<Value> {
+    let name = kwargs
+        .get::<&str>("name")?
+        .ok_or_else(|| TeraError::message("env(name=…): missing or non-string 'name'"))?;
+    let default = kwargs.get::<Value>("default")?;
     match std::env::var(name) {
-        Ok(v) => Ok(Value::String(v)),
-        Err(_) => Ok(default.unwrap_or_else(|| Value::String(String::new()))),
+        Ok(v) => Ok(Value::from(v)),
+        Err(_) => Ok(default.unwrap_or_else(|| Value::from(""))),
     }
 }
 
@@ -164,6 +151,23 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out, "fallback");
+    }
+
+    #[test]
+    fn env_function_unset_without_default_is_empty() {
+        // The load-bearing reason yui keeps a custom `env` instead of teravars'
+        // built-in (which errors on an unset var): no `default` + unset must
+        // render to an empty string, so cross-platform configs referencing a
+        // var that only exists on another OS — e.g. `env(name='LOCALAPPDATA')`
+        // on Linux — don't fail the whole render.
+        // SAFETY: single-threaded test, no other env access in this case.
+        unsafe { std::env::remove_var("YUI_TEST_UNSET_NO_DEFAULT") };
+        let mut e = Engine::new();
+        let ctx = config_context(&vars());
+        let out = e
+            .render("[{{ env(name='YUI_TEST_UNSET_NO_DEFAULT') }}]", &ctx)
+            .unwrap();
+        assert_eq!(out, "[]");
     }
 
     #[test]

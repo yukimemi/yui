@@ -30,7 +30,7 @@ use std::process::Command;
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tera::Context as TeraContext;
+use teravars::Context as TeraContext;
 use tracing::info;
 
 use crate::config::{Config, HookConfig, HookPhase, WhenRun};
