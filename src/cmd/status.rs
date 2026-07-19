@@ -90,9 +90,9 @@ pub fn status(
     }
 
     // 3. Link drift — classify each src→dst pair under every mount.
-    // Single nested-`.yuiignore` stack threaded across all mounts.
-    // Seed the source-root layer so root rules apply from the start.
-    let mut yuiignore = paths::YuiIgnoreStack::new();
+    // Single nested ignore stack threaded across all mounts. Seed the
+    // source-root layer so root rules apply from the start.
+    let mut yuiignore = paths::YuiIgnoreStack::with_gitignore(config.mount.respect_gitignore);
     yuiignore.push_dir(&source)?;
     let walk_result = (|| -> Result<()> {
         for m in &mounts {
