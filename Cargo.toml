@@ -50,7 +50,7 @@ jiff = { version = "0.2.32", features = ["serde"] }
 kaishin = "0.6.3"
 owo-colors = "4.3.0"
 same-file = "1.0.6"
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"
 similar = "3.1.1"
