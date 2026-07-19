@@ -1148,6 +1148,42 @@ dst = "{}"
     );
 }
 
+/// A directory-only ignore rule (`sessions/`) must still bite on
+/// manual absorb when the directory exists in *target* but not yet in
+/// source — which is the normal manual-absorb case. Asking the
+/// non-existent source candidate whether it's a directory always
+/// answers "no", so the pattern would be skipped and yui would absorb
+/// the very tree the rule excludes. (Caught in PR #181 review by
+/// gemini-code-assist.)
+#[test]
+fn manual_absorb_honors_dir_only_gitignore_for_target_only_dir() {
+    let tmp = TempDir::new().unwrap();
+    let (source, target) = setup_minimal_dotfiles(&tmp);
+    std::fs::write(source.join(".gitignore"), "sessions/\n").unwrap();
+
+    // Exists in target, absent from source — `candidate.is_dir()`
+    // would be false here.
+    std::fs::create_dir_all(target.join("sessions")).unwrap();
+    std::fs::write(target.join("sessions/a.log"), "runtime junk").unwrap();
+
+    let err = absorb(
+        Some(source.clone()),
+        target.join("sessions"),
+        /* dry_run */ false,
+        /* yes */ true,
+    )
+    .unwrap_err();
+
+    assert!(
+        format!("{err}").contains("no mount entry"),
+        "dir-only gitignore rule should disqualify the candidate: {err}"
+    );
+    assert!(
+        !source.join("home/sessions").exists(),
+        "gitignored dir must not be absorbed into source"
+    );
+}
+
 #[test]
 fn manual_absorb_errors_when_target_outside_known_mounts() {
     let tmp = TempDir::new().unwrap();
@@ -1205,6 +1241,118 @@ fn yuiignore_negation_re_includes_file() {
     apply(Some(source.clone()), false).unwrap();
     assert!(target.join("keep.cache").exists());
     assert!(!target.join("drop.cache").exists());
+}
+
+/// Apps write runtime state (session logs, caches) straight into the
+/// source tree through the links; `.gitignore` already excludes it,
+/// so yui shouldn't be minting hardlinks for it or listing it in
+/// `status`. On by default via `mount.respect_gitignore`.
+#[test]
+fn gitignore_excludes_file_from_linking_by_default() {
+    let tmp = TempDir::new().unwrap();
+    let (source, target) = setup_minimal_dotfiles(&tmp);
+    std::fs::create_dir_all(source.join("home/app/sessions")).unwrap();
+    std::fs::write(source.join("home/app/config.toml"), "kept").unwrap();
+    std::fs::write(source.join("home/app/sessions/a.log"), "runtime junk").unwrap();
+    // The app's own .gitignore, nested — scoped to its subtree.
+    std::fs::write(source.join("home/app/.gitignore"), "sessions/\n").unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    assert!(target.join("app/config.toml").exists());
+    assert!(
+        !target.join("app/sessions").exists(),
+        "gitignored subtree should not be linked into target"
+    );
+}
+
+/// Opt-out: `respect_gitignore = false` restores the earlier
+/// behaviour of walking `.yuiignore` only.
+#[test]
+fn gitignore_opt_out_restores_linking() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(
+        source.join("config.toml"),
+        format!(
+            r#"
+[mount]
+respect_gitignore = false
+
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+            toml_path(&target)
+        ),
+    )
+    .unwrap();
+    std::fs::write(source.join("home/runtime.log"), "junk").unwrap();
+    std::fs::write(source.join(".gitignore"), "*.log\n").unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    assert!(
+        target.join("runtime.log").exists(),
+        "respect_gitignore=false must ignore .gitignore entirely"
+    );
+}
+
+/// The regression that makes `respect_gitignore` safe to default on:
+/// yui writes its *own* generated files (rendered `.tera` output,
+/// decrypted `.age` plaintext) into the managed `.gitignore` block,
+/// precisely because they're generated. Honouring those lines would
+/// make apply refuse to link the very files it just produced, so
+/// everything between the markers is stripped before matching.
+#[test]
+fn managed_gitignore_section_never_blocks_linking() {
+    let tmp = TempDir::new().unwrap();
+    let (source, target) = setup_minimal_dotfiles(&tmp);
+    std::fs::write(source.join("home/.gitconfig.tera"), "name = {{ yui.os }}\n").unwrap();
+    std::fs::write(source.join("home/user.log"), "runtime junk").unwrap();
+    // A user rule, in place before the first apply so it gets a fair
+    // shot at `user.log`; apply appends its managed block below it.
+    std::fs::write(source.join(".gitignore"), "*.log\n").unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    let gi = std::fs::read_to_string(source.join(".gitignore")).unwrap();
+    assert!(
+        gi.contains("home/.gitconfig"),
+        "managed section should list the rendered output: {gi}"
+    );
+    assert!(
+        target.join(".gitconfig").exists(),
+        "rendered output is gitignored by yui itself but must stay linked"
+    );
+    assert!(
+        !target.join("user.log").exists(),
+        "user rules outside the managed block still apply"
+    );
+}
+
+/// `.yuiignore` sits above `.gitignore` in the same directory, so a
+/// negation there can re-include something git excludes — the escape
+/// hatch for "git shouldn't track this, but yui should link it".
+#[test]
+fn yuiignore_negation_overrides_sibling_gitignore() {
+    let tmp = TempDir::new().unwrap();
+    let (source, target) = setup_minimal_dotfiles(&tmp);
+    std::fs::write(source.join("home/keep.log"), "wanted").unwrap();
+    std::fs::write(source.join("home/drop.log"), "junk").unwrap();
+    std::fs::write(source.join(".gitignore"), "*.log\n").unwrap();
+    std::fs::write(source.join(".yuiignore"), "!home/keep.log\n").unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    assert!(
+        target.join("keep.log").exists(),
+        ".yuiignore negation should win over the sibling .gitignore"
+    );
+    assert!(!target.join("drop.log").exists());
 }
 
 /// Issue #47: a `.yuiignore` placed in a nested subdirectory must

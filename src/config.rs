@@ -278,6 +278,13 @@ pub struct MountConfig {
     pub default_strategy: MountStrategy,
     #[serde(default = "default_marker_filename")]
     pub marker_filename: String,
+    /// Treat each directory's `.gitignore` as an ignore layer under
+    /// `.yuiignore` when walking the source tree. On by default: the
+    /// source *is* a git repo, so anything git already excludes is
+    /// runtime state rather than a dotfile worth linking. Yui's own
+    /// managed section is exempt — see `paths::YuiIgnoreStack`.
+    #[serde(default = "default_true")]
+    pub respect_gitignore: bool,
     #[serde(default)]
     pub entry: Vec<MountEntry>,
 }
@@ -287,6 +294,7 @@ impl Default for MountConfig {
         Self {
             default_strategy: MountStrategy::default(),
             marker_filename: default_marker_filename(),
+            respect_gitignore: true,
             entry: Vec::new(),
         }
     }

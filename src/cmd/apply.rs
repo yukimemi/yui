@@ -111,10 +111,10 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
         info!("dry-run: nothing will be written");
     }
 
-    // Nested `.yuiignore` stack — push on dir entry, pop on exit.
-    // Seed with the source-root layer so root-level rules apply from
-    // the start without `walk_and_link` having to special-case it.
-    let mut yuiignore = paths::YuiIgnoreStack::new();
+    // Nested ignore stack — push on dir entry, pop on exit. Seed
+    // with the source-root layer so root-level rules apply from the
+    // start without `walk_and_link` having to special-case it.
+    let mut yuiignore = paths::YuiIgnoreStack::with_gitignore(config.mount.respect_gitignore);
     yuiignore.push_dir(&source)?;
     let walk_result = (|| -> Result<()> {
         for m in &mounts {

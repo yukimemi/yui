@@ -84,7 +84,7 @@ pub fn resolve_mount_src_with(
     source.join(expanded)
 }
 
-/// One-shot `.yuiignore` test for a single path under `source`.
+/// One-shot ignore test for a single path under `source`.
 ///
 /// Builds a fresh `YuiIgnoreStack`, pushes every directory between
 /// `source` and `path.parent()` (so a deeply-nested `.yuiignore`
@@ -92,6 +92,10 @@ pub fn resolve_mount_src_with(
 /// single candidate path to check (e.g. manual `absorb`'s
 /// mount-derived candidate); for recursive walks, push/pop on the
 /// hot path with a single long-lived `YuiIgnoreStack` instead.
+///
+/// `respect_gitignore` layers `.gitignore` under `.yuiignore` — see
+/// [`YuiIgnoreStack::with_gitignore`] for the rationale and for how
+/// yui's own managed section is exempted.
 ///
 /// Patterns use full gitignore syntax: glob (`*`, `**`), negation
 /// (`!`), trailing-slash dir-only matching, comments (`#`). Paths
@@ -104,11 +108,16 @@ pub fn resolve_mount_src_with(
 /// Honouring inner whitelists here would let manual `absorb` pick a
 /// path that apply / status would never have linked. (Caught in PR
 /// #50 review.)
-pub fn is_ignored_at(source: &Utf8Path, path: &Utf8Path, is_dir: bool) -> crate::Result<bool> {
+pub fn is_ignored_at(
+    source: &Utf8Path,
+    path: &Utf8Path,
+    is_dir: bool,
+    respect_gitignore: bool,
+) -> crate::Result<bool> {
     let Ok(rel) = path.strip_prefix(source) else {
         return Ok(false);
     };
-    let mut stack = YuiIgnoreStack::new();
+    let mut stack = YuiIgnoreStack::with_gitignore(respect_gitignore);
     stack.push_dir(source)?;
     let mut cur = source.to_owned();
     for component in rel.components() {
@@ -155,9 +164,9 @@ pub fn source_walker(source: &Utf8Path) -> ignore::WalkBuilder {
     b
 }
 
-/// Stack of `.yuiignore` matchers for manual recursive walks. Each
-/// frame remembers the directory it was loaded from + the parsed
-/// matcher; testing a path walks innermost → outermost so a deeper
+/// Stack of ignore matchers for manual recursive walks. Each frame
+/// remembers the directory it was loaded from + that directory's
+/// matchers; testing a path walks innermost → outermost so a deeper
 /// `.yuiignore` overrides a shallower one (gitignore semantics).
 ///
 /// Walkers `push_dir(d)` before iterating `d`'s entries and
@@ -166,29 +175,63 @@ pub fn source_walker(source: &Utf8Path) -> ignore::WalkBuilder {
 /// the stack stays consistent across recursion.
 #[derive(Debug, Default)]
 pub struct YuiIgnoreStack {
-    layers: Vec<(Utf8PathBuf, ignore::gitignore::Gitignore)>,
+    /// Matchers for one directory, ordered most-specific-first:
+    /// `.yuiignore` before `.gitignore`, so a `.yuiignore` rule can
+    /// re-include (`!foo`) something the sibling `.gitignore` excluded.
+    layers: Vec<(Utf8PathBuf, Vec<ignore::gitignore::Gitignore>)>,
+    respect_gitignore: bool,
 }
 
 impl YuiIgnoreStack {
+    /// Stack that honours `.yuiignore` only.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Load `.yuiignore` from `dir` (if present) and push its rules
-    /// as a new layer. No-op when the file is absent.
+    /// Stack that additionally honours each directory's `.gitignore`
+    /// when `respect_gitignore` is set.
+    ///
+    /// Rationale: yui is target-as-truth, so the source tree *is* a
+    /// git repo and apps write runtime state (session logs, caches,
+    /// credentials) straight into it through the links. Those files
+    /// are already excluded from git; treating them as managed
+    /// link candidates only buys per-file hardlinks nobody wants and
+    /// a `yui status` drowned in noise.
+    ///
+    /// **Yui's own managed section is exempt.** `render.rs` lists
+    /// every rendered `.tera` output and decrypted `.age` plaintext
+    /// between the `# >>> yui rendered (auto-managed…) >>>` markers
+    /// — those files are gitignored precisely *because* yui
+    /// generates them, and they must still be linked. Lines inside
+    /// the markers are dropped before the matcher is built, so
+    /// enabling this can never stop apply from linking a generated
+    /// file.
+    pub fn with_gitignore(respect_gitignore: bool) -> Self {
+        Self {
+            layers: Vec::new(),
+            respect_gitignore,
+        }
+    }
+
+    /// Load `dir`'s ignore files (if present) and push them as one
+    /// layer. No-op when the directory has none.
     pub fn push_dir(&mut self, dir: &Utf8Path) -> crate::Result<()> {
-        let path = dir.join(".yuiignore");
-        if !path.is_file() {
-            return Ok(());
+        let mut matchers = Vec::new();
+        if let Some(gi) =
+            build_matcher(dir, &dir.join(".yuiignore"), /* strip_managed */ false)?
+        {
+            matchers.push(gi);
         }
-        let mut builder = ignore::gitignore::GitignoreBuilder::new(dir);
-        if let Some(e) = builder.add(path.as_std_path()) {
-            return Err(crate::Error::Config(format!("parsing {path}: {e}")));
+        if self.respect_gitignore {
+            if let Some(gi) =
+                build_matcher(dir, &dir.join(".gitignore"), /* strip_managed */ true)?
+            {
+                matchers.push(gi);
+            }
         }
-        let gi = builder
-            .build()
-            .map_err(|e| crate::Error::Config(format!("building {path}: {e}")))?;
-        self.layers.push((dir.to_owned(), gi));
+        if !matchers.is_empty() {
+            self.layers.push((dir.to_owned(), matchers));
+        }
         Ok(())
     }
 
@@ -202,22 +245,72 @@ impl YuiIgnoreStack {
     }
 
     /// Decide whether `path` should be ignored. Walks frames inside
-    /// → outside; the first decisive match (Ignore or Whitelist)
+    /// → outside (and within a frame, `.yuiignore` before
+    /// `.gitignore`); the first decisive match (Ignore or Whitelist)
     /// wins, so a deeper `.yuiignore` can both exclude *and*
     /// re-include paths the parent missed.
     pub fn is_ignored(&self, path: &Utf8Path, is_dir: bool) -> bool {
-        for (anchor, gi) in self.layers.iter().rev() {
+        for (anchor, matchers) in self.layers.iter().rev() {
             let Ok(rel) = path.strip_prefix(anchor) else {
                 continue;
             };
-            match gi.matched_path_or_any_parents(rel.as_std_path(), is_dir) {
-                ignore::Match::Ignore(_) => return true,
-                ignore::Match::Whitelist(_) => return false,
-                ignore::Match::None => continue,
+            for gi in matchers {
+                match gi.matched_path_or_any_parents(rel.as_std_path(), is_dir) {
+                    ignore::Match::Ignore(_) => return true,
+                    ignore::Match::Whitelist(_) => return false,
+                    ignore::Match::None => continue,
+                }
             }
         }
         false
     }
+}
+
+/// Parse one ignore file into a matcher anchored at `dir`, or `None`
+/// when the file doesn't exist.
+///
+/// `strip_managed` drops the lines yui itself wrote between the
+/// `.gitignore` managed-section markers — see
+/// [`YuiIgnoreStack::with_gitignore`]. Because that filtering happens
+/// line-by-line we feed the builder via `add_line` rather than
+/// `add`, which is also why blank lines and comments are passed
+/// straight through (the builder skips them itself).
+fn build_matcher(
+    dir: &Utf8Path,
+    path: &Utf8Path,
+    strip_managed: bool,
+) -> crate::Result<Option<ignore::gitignore::Gitignore>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(path.as_std_path())
+        .map_err(|e| crate::Error::Config(format!("reading {path}: {e}")))?;
+
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(dir);
+    let mut in_managed = false;
+    for line in text.lines() {
+        if strip_managed {
+            let trimmed = line.trim();
+            if trimmed == crate::render::GITIGNORE_BEGIN {
+                in_managed = true;
+                continue;
+            }
+            if trimmed == crate::render::GITIGNORE_END {
+                in_managed = false;
+                continue;
+            }
+            if in_managed {
+                continue;
+            }
+        }
+        builder
+            .add_line(Some(path.as_std_path().to_owned()), line)
+            .map_err(|e| crate::Error::Config(format!("parsing {path}: {e}")))?;
+    }
+    let gi = builder
+        .build()
+        .map_err(|e| crate::Error::Config(format!("building {path}: {e}")))?;
+    Ok(Some(gi))
 }
 
 /// Mirror an absolute target path into a backup directory, dropping the drive
@@ -475,7 +568,7 @@ mod tests {
         std::fs::write(keepers.join(".yuiignore"), "!wanted.lock\n").unwrap();
         // The walkers never descend into keepers/, so manual absorb
         // must agree the file is ignored.
-        assert!(is_ignored_at(&root, &keepers.join("wanted.lock"), false).unwrap());
+        assert!(is_ignored_at(&root, &keepers.join("wanted.lock"), false, false).unwrap());
     }
 
     #[test]
@@ -487,12 +580,42 @@ mod tests {
         std::fs::create_dir_all(&leaf).unwrap();
         std::fs::write(mid.join(".yuiignore"), "secret*\n").unwrap();
         // mid/.yuiignore must be picked up when checking leaf/secret.txt
-        assert!(is_ignored_at(&root, &leaf.join("secret.txt"), false).unwrap());
-        assert!(!is_ignored_at(&root, &leaf.join("public.txt"), false).unwrap());
+        assert!(is_ignored_at(&root, &leaf.join("secret.txt"), false, false).unwrap());
+        assert!(!is_ignored_at(&root, &leaf.join("public.txt"), false, false).unwrap());
         // Path outside the source root is not ignored.
         let outside =
             Utf8PathBuf::from_path_buf(tmp.path().parent().unwrap().to_path_buf()).unwrap();
-        assert!(!is_ignored_at(&root, &outside.join("anywhere"), false).unwrap());
+        assert!(!is_ignored_at(&root, &outside.join("anywhere"), false, false).unwrap());
+    }
+
+    #[test]
+    fn is_ignored_at_respects_gitignore() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let mid = root.join("mid");
+        let leaf = mid.join("leaf");
+        std::fs::create_dir_all(&leaf).unwrap();
+
+        // Write .gitignore excluding secret.txt
+        std::fs::write(mid.join(".gitignore"), "secret.txt\n").unwrap();
+
+        // When respect_gitignore is false, it's not ignored
+        assert!(!is_ignored_at(&root, &leaf.join("secret.txt"), false, false).unwrap());
+        // When respect_gitignore is true, it is ignored
+        assert!(is_ignored_at(&root, &leaf.join("secret.txt"), false, true).unwrap());
+
+        // Test that yui's auto-managed section in .gitignore is exempt
+        let gitignore_content = format!(
+            "ignored.txt\n{}\nexempt.txt\n{}\n",
+            crate::render::GITIGNORE_BEGIN,
+            crate::render::GITIGNORE_END
+        );
+        std::fs::write(mid.join(".gitignore"), gitignore_content).unwrap();
+
+        // ignored.txt is ignored
+        assert!(is_ignored_at(&root, &mid.join("ignored.txt"), false, true).unwrap());
+        // exempt.txt is inside the markers, so it should not be ignored
+        assert!(!is_ignored_at(&root, &mid.join("exempt.txt"), false, true).unwrap());
     }
 
     #[test]

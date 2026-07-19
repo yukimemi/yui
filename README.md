@@ -232,6 +232,37 @@ shallower ones, `!negation` re-includes paths, and rules apply only to
 the subtree below the file. Put repo-wide rules at `$DOTFILES/.yuiignore`
 and per-tree rules where they belong.
 
+### `.gitignore` is honored too
+
+Because yui is target-as-truth, your source tree *is* the live config —
+so apps write runtime state (session logs, caches, credentials) straight
+into it through the links. That state is already excluded from git, and
+by default yui excludes it as well: every directory's `.gitignore` is
+layered underneath its `.yuiignore` during the walk.
+
+Without this, a tool that keeps a few hundred session files under
+`~/.some-app/` would mint a hardlink per file and bury `yui status` in
+noise it can do nothing about.
+
+Two things to know:
+
+- **`.yuiignore` wins.** It's checked first in each directory, so
+  `!home/keep.log` re-includes a file that the sibling `.gitignore`
+  excluded — the escape hatch for "git shouldn't track this, but yui
+  should still link it".
+- **yui's own generated files are exempt.** Rendered `.tera` output and
+  decrypted `.age` plaintext are listed in the auto-managed block of
+  `$DOTFILES/.gitignore` precisely *because* yui generates them. Lines
+  between the `# >>> yui rendered … >>>` markers are skipped, so this
+  can never stop apply from linking a file it just produced.
+
+Opt out to restore `.yuiignore`-only walking:
+
+```toml
+[mount]
+respect_gitignore = false
+```
+
 ## Secrets (`*.age` — opt-in)
 
 Files ending in `.age` are encrypted with [age]; on every `apply` the

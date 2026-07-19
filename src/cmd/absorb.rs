@@ -221,11 +221,24 @@ fn find_source_for_target(
         if let Ok(rel) = target.strip_prefix(&dst_root) {
             let src_str = engine.render(entry.src.as_str(), tera_ctx)?;
             let candidate = paths::resolve_mount_src(source, src_str.trim()).join(rel);
-            // Honor `.yuiignore` even on manual absorb — if you've
-            // ignored a path, you've explicitly opted out of yui's
-            // managing it. One-shot stack walk along the candidate's
-            // parents picks up nested `.yuiignore` files too.
-            if paths::is_ignored_at(source, &candidate, candidate.is_dir())? {
+            // Honor the ignore rules even on manual absorb — if
+            // you've ignored a path, you've explicitly opted out of
+            // yui's managing it. One-shot stack walk along the
+            // candidate's parents picks up nested ignore files too.
+            //
+            // `is_dir` comes from `target`, not `candidate`: absorbing
+            // something that doesn't exist in source yet is the normal
+            // case, and a non-existent `candidate.is_dir()` is always
+            // false — which would silently skip every directory-only
+            // pattern (`sessions/`, `cache/`) and absorb the very trees
+            // the ignore rules exclude. `target` is the thing being
+            // absorbed, so it's the authority on directory-ness.
+            if paths::is_ignored_at(
+                source,
+                &candidate,
+                target.is_dir(),
+                config.mount.respect_gitignore,
+            )? {
                 continue;
             }
             return Ok(Some(candidate));

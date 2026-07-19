@@ -39,7 +39,7 @@ pub fn diff(
 
     // Reuse classify_walk to enumerate every src→dst pair.
     let mut report: Vec<StatusItem> = Vec::new();
-    let mut yuiignore = paths::YuiIgnoreStack::new();
+    let mut yuiignore = paths::YuiIgnoreStack::with_gitignore(config.mount.respect_gitignore);
     yuiignore.push_dir(&source)?;
     let walk_result = (|| -> Result<()> {
         for m in &mounts {

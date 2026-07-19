@@ -32,8 +32,12 @@ use crate::template::{self, Engine};
 use crate::vars::YuiVars;
 use crate::{Error, Result};
 
-const GITIGNORE_BEGIN: &str = "# >>> yui rendered (auto-managed, do not edit) >>>";
-const GITIGNORE_END: &str = "# <<< yui rendered (auto-managed) <<<";
+/// Markers around yui's managed `.gitignore` block. Visible to the
+/// crate because `paths::build_matcher` must skip the lines between
+/// them — they name yui's own generated files, which stay linkable
+/// even when `mount.respect_gitignore` is on.
+pub(crate) const GITIGNORE_BEGIN: &str = "# >>> yui rendered (auto-managed, do not edit) >>>";
+pub(crate) const GITIGNORE_END: &str = "# <<< yui rendered (auto-managed) <<<";
 
 /// A render-drift case: the on-disk rendered file's content differs
 /// from what the template would produce now. Carries the template
