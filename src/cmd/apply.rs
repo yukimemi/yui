@@ -1137,7 +1137,11 @@ fn merge_resolve_file_conflict(
 /// path to whole directories so a chezmoi-style migrated `~/.config/`
 /// keeps every file the user actually had instead of stranding most
 /// of them in `.yui/backup/...`.
-fn absorb_target_dir_into_source(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>) -> Result<()> {
+pub(crate) fn absorb_target_dir_into_source(
+    src: &Utf8Path,
+    dst: &Utf8Path,
+    ctx: &ApplyCtx<'_>,
+) -> Result<()> {
     info!("absorb dir: {dst} → {src}");
     backup_existing(src, ctx.backup_root, /* is_dir */ true)?;
     merge_dir_target_into_source(dst, src, ctx)?;
@@ -1217,6 +1221,9 @@ fn handle_anomaly_dir(
 }
 
 fn backup_existing(target: &Utf8Path, backup_root: &Utf8Path, is_dir: bool) -> Result<()> {
+    if !target.exists() {
+        return Ok(());
+    }
     let abs_target = absolutize(target)?;
     let ts = backup::current_timestamp("%Y%m%d_%H%M%S%3f")?;
     let bp = paths::append_timestamp(&paths::mirror_into_backup(backup_root, &abs_target), &ts);

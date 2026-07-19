@@ -1111,6 +1111,44 @@ dst = "{}"
 }
 
 #[test]
+fn manual_absorb_command_pulls_target_dir_into_source() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    let cfg = format!(
+        r#"
+[absorb]
+on_anomaly = "skip"
+
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+        toml_path(&target)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    // Create a subdirectory that exists in target but not in source
+    std::fs::create_dir_all(target.join("kimi-code")).unwrap();
+    std::fs::write(target.join("kimi-code/file.txt"), "kimi content").unwrap();
+
+    absorb(
+        Some(source.clone()),
+        target.join("kimi-code"),
+        /* dry_run */ false,
+        /* yes */ true,
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(source.join("home/kimi-code/file.txt")).unwrap(),
+        "kimi content"
+    );
+}
+
+#[test]
 fn manual_absorb_errors_when_target_outside_known_mounts() {
     let tmp = TempDir::new().unwrap();
     let (source, _target) = setup_minimal_dotfiles(&tmp);

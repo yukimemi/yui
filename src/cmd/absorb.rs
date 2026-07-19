@@ -33,7 +33,8 @@ pub fn absorb(
     let source = resolve_source(source)?;
     let target = absolutize(&target)?;
     let yui = YuiVars::detect(&source);
-    let config = config::load(&source, &yui)?;
+    let mut config = config::load(&source, &yui)?;
+    config.absorb.on_anomaly = config::AnomalyAction::Force;
 
     let mut engine = template::Engine::new();
     let tera_ctx = template::template_context(&yui, &config.vars);
@@ -88,7 +89,11 @@ pub fn absorb(
 
     // Manual absorb is an explicit user request — bypass `auto`,
     // `require_clean_git`, and `on_anomaly` policy entirely.
-    absorb_target_into_source(&src_path, &target, &ctx)
+    if target.is_dir() {
+        absorb_target_dir_into_source(&src_path, &target, &ctx)
+    } else {
+        absorb_target_into_source(&src_path, &target, &ctx)
+    }
 }
 
 /// Stderr-print a unified diff between `src` (file or dir) and `dst`
