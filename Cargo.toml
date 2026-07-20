@@ -51,7 +51,7 @@ kaishin = "0.6.3"
 owo-colors = "4.3.0"
 same-file = "1.0.6"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.150"
+serde_json = "1.0.151"
 sha2 = "0.11.0"
 similar = "3.1.1"
 teravars = { version = "0.2.1", default-features = false }
