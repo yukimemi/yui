@@ -363,6 +363,23 @@ pub fn append_timestamp(path: &Utf8Path, ts: &str) -> Utf8PathBuf {
     parent.join(new_name)
 }
 
+/// Normalize a path by eliminating redundant `.` components without accessing
+/// the filesystem, preserving `..` to maintain symlink semantics.
+pub fn normalize(path: &Utf8Path) -> Utf8PathBuf {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Utf8Component::CurDir => {}
+            _ => components.push(component),
+        }
+    }
+    if components.is_empty() {
+        Utf8PathBuf::from(".")
+    } else {
+        components.into_iter().collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,5 +651,19 @@ mod tests {
             expand_tilde_with("/foo/~/bar", home),
             Utf8PathBuf::from("/foo/~/bar")
         );
+    }
+
+    #[test]
+    fn normalize_paths() {
+        assert_eq!(
+            normalize(Utf8Path::new("home/.config/gcal/./credentials.json")),
+            Utf8PathBuf::from("home/.config/gcal/credentials.json")
+        );
+        assert_eq!(
+            normalize(Utf8Path::new("a/b/./c/./d")),
+            Utf8PathBuf::from("a/b/c/d")
+        );
+        assert_eq!(normalize(Utf8Path::new("./foo")), Utf8PathBuf::from("foo"));
+        assert_eq!(normalize(Utf8Path::new(".")), Utf8PathBuf::from("."));
     }
 }

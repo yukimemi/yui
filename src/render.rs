@@ -379,10 +379,13 @@ pub fn add_to_managed_section(source: &Utf8Path, plaintext_abs_path: &Utf8Path) 
         Err(e) => return Err(Error::Template(format!("read {gi_path}: {e}"))),
     };
 
-    let new_entry = plaintext_abs_path
-        .strip_prefix(source)
+    let norm_source = crate::paths::normalize(source);
+    let norm_plaintext = crate::paths::normalize(plaintext_abs_path);
+
+    let new_entry = norm_plaintext
+        .strip_prefix(&norm_source)
         .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|_| plaintext_abs_path.as_str().to_string())
+        .unwrap_or_else(|_| norm_plaintext.as_str().to_string())
         .replace('\\', "/");
 
     let mut managed = parse_managed_section(&existing);
@@ -426,10 +429,16 @@ fn update_gitignore(source: &Utf8Path, rendered_abs_paths: &[Utf8PathBuf]) -> Re
         Err(e) => return Err(Error::Template(format!("read {gi_path}: {e}"))),
     };
 
+    let norm_source = crate::paths::normalize(source);
+
     let mut managed: Vec<String> = rendered_abs_paths
         .iter()
-        .filter_map(|p| p.strip_prefix(source).ok())
-        .map(|p| p.as_str().replace('\\', "/"))
+        .map(|p| crate::paths::normalize(p))
+        .filter_map(|p| {
+            p.strip_prefix(&norm_source)
+                .ok()
+                .map(|rel| rel.as_str().replace('\\', "/"))
+        })
         .collect();
     managed.sort();
     managed.dedup();
@@ -865,6 +874,17 @@ mod tests {
             !gi.contains("home\\.config"),
             "managed section should not carry backslashes: {gi}"
         );
+    }
+
+    #[test]
+    fn add_to_managed_normalises_dot_components() {
+        let tmp = TempDir::new().unwrap();
+        let r = root(&tmp);
+        let plain = r.join("home/.config/gcal/./credentials.json");
+        add_to_managed_section(&r, &plain).unwrap();
+        let gi = std::fs::read_to_string(r.join(".gitignore")).unwrap();
+        assert!(gi.contains("home/.config/gcal/credentials.json"));
+        assert!(!gi.contains("home/.config/gcal/./credentials.json"));
     }
 
     #[test]

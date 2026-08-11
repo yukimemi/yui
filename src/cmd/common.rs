@@ -67,10 +67,10 @@ pub(crate) fn absolutize(p: &Utf8Path) -> Result<Utf8PathBuf> {
     // Expand `~` first so callers can pass `--source ~/dotfiles` directly.
     let expanded = paths::expand_tilde(p.as_str());
     if expanded.is_absolute() {
-        return Ok(expanded);
+        return Ok(crate::paths::normalize(&expanded));
     }
     let cwd = current_dir_utf8()?;
-    Ok(cwd.join(expanded))
+    Ok(crate::paths::normalize(&cwd.join(expanded)))
 }
 
 pub(crate) fn current_dir_utf8() -> Result<Utf8PathBuf> {

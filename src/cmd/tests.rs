@@ -2677,3 +2677,36 @@ fn link_file_with_backup_short_circuits_when_quit_requested() {
         "no backup should be produced when quit is requested"
     );
 }
+
+#[test]
+fn secret_encrypt_with_relative_dot_path_updates_gitignore_cleanly() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let gcal_dir = source.join("home/.config/gcal");
+    std::fs::create_dir_all(&gcal_dir).unwrap();
+
+    let (_secret_key, public) = secret::generate_x25519_keypair();
+    let cfg = format!(
+        r#"
+[secrets]
+recipients = ["{public}"]
+"#
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    let plain_file = gcal_dir.join("credentials.json");
+    std::fs::write(&plain_file, "{ \"test\": true }").unwrap();
+
+    let rel_dot_path = source.join("home/.config/gcal/./credentials.json");
+    secret_encrypt(Some(source.clone()), rel_dot_path, false, false).unwrap();
+
+    let gi = std::fs::read_to_string(source.join(".gitignore")).unwrap();
+    assert!(
+        gi.contains("home/.config/gcal/credentials.json"),
+        ".gitignore should contain normalized entry: {gi}"
+    );
+    assert!(
+        !gi.contains("home/.config/gcal/./credentials.json"),
+        ".gitignore should NOT contain dot component: {gi}"
+    );
+}
