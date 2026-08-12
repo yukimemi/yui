@@ -68,7 +68,7 @@ toml = "1.1.4"
 toml_edit = "0.25.13"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-whoami = "2"
+whoami = "2.1.3"
 
 [target.'cfg(windows)'.dependencies]
 junction = "2.0.0"
