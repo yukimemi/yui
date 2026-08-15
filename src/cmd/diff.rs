@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::{self, Config, IconsMode};
 use crate::icons::Icons;
+use crate::links::LinkPlan;
 use crate::mount;
 use crate::render;
 use crate::template;
@@ -41,6 +42,7 @@ pub fn diff(
     let mut report: Vec<StatusItem> = Vec::new();
     let mut yuiignore = paths::YuiIgnoreStack::with_gitignore(config.mount.respect_gitignore);
     yuiignore.push_dir(&source)?;
+    let plan = LinkPlan::from_config(&source, &config.link)?;
     let walk_result = (|| -> Result<()> {
         for m in &mounts {
             let src_root = m.src.clone();
@@ -51,6 +53,7 @@ pub fn diff(
                 &src_root,
                 &m.dst,
                 &config,
+                &plan,
                 m.strategy,
                 &mut engine,
                 &tera_ctx,

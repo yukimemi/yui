@@ -115,10 +115,23 @@ dst  = "{{ env(name='APPDATA') }}"
 when = "yui.os == 'windows'"
 ```
 
-Add files under `home/` and they'll link into `~`. Add a `.yuilink`
-file to a directory to junction the whole directory as one unit (so
-files an app creates inside that dir land back in source
-automatically).
+Add files under `home/` and they'll link into `~`. Directory-level
+linking — junction the whole directory as one unit, so files an app
+creates inside it land back in source automatically — is declared with a
+`[[link]]` entry, either centrally in `config.toml` or as a `.yuilink`
+marker in the directory itself. See
+[Explicit links (`[[link]]`)](#explicit-links-link).
+
+Link *mechanism* is `[mount]`'s business:
+
+```toml
+[mount]
+file_mode = "auto"   # auto | symlink | hardlink
+dir_mode  = "auto"   # auto | symlink | junction
+```
+
+`auto` is symlink on Unix, hardlink (files) + junction (dirs) on
+Windows — the pair that needs no Developer Mode or admin.
 
 `src` is the path *to* yui's source for that mount; it accepts
 relative paths (resolved against `$DOTFILES`), absolute paths, `~`
@@ -149,29 +162,45 @@ loads after `config.*.toml` so its values win.
 
 [Tera]: https://keats.github.io/tera/
 
-## One source → many targets
+## Explicit links (`[[link]]`)
 
-If you want the same source directory linked to different places on
-different OSes — common for editor configs (`~/.config/nvim` on Unix,
-`%LOCALAPPDATA%\nvim` on Windows) — drop a `.yuilink` with content:
+A `[[link]]` entry says "link *this* source path to *that* target". It
+covers the two things mount entries can't express: a directory linked as
+one unit, and a target outside the mount's dst root (`%LOCALAPPDATA%`,
+`Documents/PowerShell`, …).
+
+Entries live in either of two places, with the same schema:
+
+| where | `src` | when to prefer it |
+|-------|-------|-------------------|
+| `$DOTFILES/config.toml` | **required**, relative to `$DOTFILES` | everything in one file; nothing extra in the tree, nothing extra visible from the target side |
+| `<dir>/.yuilink` | optional, relative to the marker's dir; omitted = the marker's dir | the declaration travels with the directory — rename or delete it and the rule goes too |
 
 ```toml
-# $DOTFILES/home/.config/nvim/.yuilink
+# $DOTFILES/config.toml — central table
 [[link]]
-dst = "~/.config/nvim"
+src = "home/.config/nvim"
+dst = "{{ env(name='LOCALAPPDATA') }}/nvim"
+when = "yui.os == 'windows'"
+```
 
+```toml
+# $DOTFILES/home/.config/nvim/.yuilink — same rule, declared in place
 [[link]]
 dst = "{{ env(name='LOCALAPPDATA') }}/nvim"
 when = "yui.os == 'windows'"
 ```
 
+An empty `.yuilink` is shorthand for "link this dir at the mount's
+natural dst" — the one thing the central table has no spelling for,
+since it always names its `dst` explicitly.
+
 `yui list` shows each link and which `when` would activate it.
 
-### Stacking markers and file-level entries
+### One source → many targets
 
-Markers compose. A parent `.yuilink` no longer stops the walker, so
-you can junction a whole `~/.config` and *also* layer extra dsts onto
-specific subdirs:
+Entries stack. Nothing stops the walker, so a whole `~/.config` can be
+one junction while individual subdirs add extra dsts on top:
 
 ```toml
 # $DOTFILES/home/.config/.yuilink — junction the whole .config dir
@@ -187,12 +216,15 @@ when = "yui.os == 'windows'"
 ```
 
 Both links land — the parent takes care of the natural placement, the
-child adds its OS-specific alternate.
+child adds its OS-specific alternate. Central entries join the same
+stack; an entry that duplicates a marker exactly (same `src`, `dst` and
+`when`) collapses into it instead of doubling the `list` / `status` rows.
 
-A `[[link]]` may also carry a `src = "<filename>"` to scope the link to
-a single sibling file rather than the directory itself. Useful for
-paths that don't follow `~/.config/<app>/` conventions, like the
-PowerShell profile on Windows:
+### File-scoped entries
+
+A `src` naming a file scopes the link to that file rather than its
+directory. Useful for paths that don't follow `~/.config/<app>/`
+conventions, like the PowerShell profile on Windows:
 
 ```toml
 # $DOTFILES/home/.config/powershell/.yuilink
@@ -202,10 +234,27 @@ dst = "{{ env(name='USERPROFILE') }}/Documents/PowerShell/Microsoft.PowerShell_p
 when = "yui.os == 'windows'"
 ```
 
-`src` must be a single filename (no path separators); the file lives
-right next to the marker. The rest of the directory still falls
+File scope doesn't claim the directory, so the rest of it still falls
 through to whatever placement an ancestor (or the parent mount)
 provides.
+
+### Rules for `src`
+
+- Relative, and it has to stay inside its base: `..`, absolute paths and
+  `.` are rejected. Subdirectories are fine (`src = "sub/profile.ps1"`).
+- In a `.yuilink`, `src` names a **file**. Directory scope is what the
+  marker itself means, so pointing one at a subdirectory is an error
+  that tells you to put a marker there (or use the central table).
+- A central `src` may name a file **or** a directory. Existence is
+  checked when the walk reaches it, after `when` — `*.tera` output and
+  `*.age` plaintext siblings don't exist until `apply` has run, so a
+  load-time check would fail `list` / `status` on a fresh clone.
+- A central entry whose directory lies outside every mount's subtree
+  can't be reached by any walk. `apply` / `status` warn about it rather
+  than linking nothing in silence.
+- Markers are only read when the mount's strategy is `marker` (the
+  default). Central entries are explicit instructions and apply under
+  `per-file` too.
 
 ## `.yuiignore` — exclude paths from being linked
 

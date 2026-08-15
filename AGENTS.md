@@ -54,6 +54,8 @@ src/
   vars.rs       — built-in `yui.*` vars (os/arch/host/user/source)
   paths.rs      — backup-path mirroring + timestamp-suffix utilities
   marker.rs     — `.yuilink` marker detection
+  links.rs      — `[[link]]` entry schema shared by `config.toml` +
+                  `.yuilink`, plus the per-dir plan the walkers consult
   mount.rs      — `[[mount.entry]]` resolution (Tera dst, when filter)
   link.rs       — link mode resolution + cross-platform link/unlink
   render.rs     — Tera rendering of `*.tera` files + .gitignore management
@@ -85,11 +87,27 @@ before reverting any of them.
   Windows: hardlink for files + junction for dirs. The Windows defaults
   avoid requiring Developer Mode / admin. `symlink` is opt-in for
   Windows users who do want it.
-- **`.yuilink` marker decides where junctions land.** A directory
-  containing the marker is junctioned as a unit and recursion stops.
-  Without the marker, `yui` recurses and hardlinks individual files.
-  This is so apps creating new files inside a junctioned dir land
-  directly in source (no "untracked" detection needed for that case).
+- **`[[link]]` decides where dir-level links land**, declared either in
+  `config.toml`'s central table (`src` required, relative to
+  `$DOTFILES`) or in a `<dir>/.yuilink` marker (`src` optional, relative
+  to the marker's dir). A dir-scoped entry links that directory as a
+  unit; without one, `yui` recurses and links individual files. The
+  point of dir-level linking is that apps creating new files inside the
+  linked dir land directly in source (no "untracked" detection needed
+  for that case). Both spellings exist on purpose: the central table
+  keeps the tree free of marker files (which are also visible from the
+  target side once the dir is junctioned), while a marker travels with
+  its directory and can't rot into a dangling entry.
+- **Markers do not stop the walk (v0.6+).** It keeps descending and
+  aggregates entries, so a descendant *adds* destinations on top of its
+  ancestors. Exact duplicates (same `src` / `dst` / `when`) collapse so
+  declaring one mapping twice doesn't double the work or the report
+  rows. Marker discovery is gated on `MountStrategy::Marker`; central
+  entries are explicit instructions and apply under `per-file` too.
+- **Link modes live in `[mount]`** (`file_mode` / `dir_mode`). They used
+  to be a `[link]` table; that key is now the `[[link]]` array, and
+  `config::load` intercepts the old table shape with a migration error
+  rather than letting serde emit a type error about a sequence.
 - **Templates are `*.tera` files; rendered output goes to the *same
   directory* as the template.** `home/.gitconfig.tera` →
   `home/.gitconfig`. Rendered files are listed in a managed section

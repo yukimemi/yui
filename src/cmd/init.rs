@@ -173,12 +173,12 @@ const SKELETON_CONFIG: &str = r#"# yui config — see https://github.com/yukimem
 [vars]
 # user-defined values; templates can reference these as {{ vars.foo }}
 
-# [link]
-# file_mode = "auto"   # auto | symlink | hardlink
-# dir_mode  = "auto"   # auto | symlink | junction
-
 [mount]
 default_strategy = "marker"
+# How links are made. `auto` = symlink on Unix, hardlink (files) +
+# junction (dirs) on Windows, which needs no Developer Mode / admin.
+# file_mode = "auto"   # auto | symlink | hardlink
+# dir_mode  = "auto"   # auto | symlink | junction
 
 [[mount.entry]]
 src = "home"
@@ -190,6 +190,14 @@ dst = "~"
 # dst  = "{{ env(name='APPDATA') }}"
 # # NOTE: write `when` as a *bare* expression (no `{{ … }}`) so it survives
 # # config.toml's whole-file Tera render and shows up cleanly in `yui list`.
+# when = "yui.os == 'windows'"
+
+# Explicit links, declared centrally instead of with a `.yuilink`
+# marker file in the tree. `src` is relative to $DOTFILES and may name
+# a directory (linked as one unit) or a single file.
+# [[link]]
+# src = "home/.config/nvim"
+# dst = "{{ env(name='LOCALAPPDATA') }}/nvim"
 # when = "yui.os == 'windows'"
 "#;
 

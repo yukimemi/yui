@@ -8,6 +8,7 @@ pub mod git;
 pub mod hook;
 pub mod icons;
 pub mod link;
+pub mod links;
 pub mod marker;
 pub mod mount;
 pub mod paths;

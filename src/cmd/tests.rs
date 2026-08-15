@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::{self, Config};
 use crate::link::{resolve_dir_mode, resolve_file_mode};
+use crate::links::LinkPlan;
 use crate::render;
 use crate::secret;
 use crate::vars::YuiVars;
@@ -1556,7 +1557,7 @@ recipients = ["{}"]
 }
 
 /// `yui status` surfaces secret drift. The plaintext sibling is
-/// hardlinked into target (forced via `[link] file_mode` so Unix
+/// hardlinked into target (forced via `[mount] file_mode` so Unix
 /// runners don't fall back to symlink and dodge the scenario), so
 /// editing it keeps the link itself in-sync (same inode) — only
 /// the `.age` comparison can catch the divergence, which status
@@ -1583,7 +1584,7 @@ fn status_reports_secret_drift() {
 src = "home"
 dst = "{}"
 
-[link]
+[mount]
 file_mode = "hardlink"
 
 [secrets]
@@ -1908,6 +1909,317 @@ dst = "{}"
 
     let err = apply(Some(source.clone()), false).unwrap_err();
     assert!(format!("{err:#}").contains("missing.ps1"));
+}
+
+// -----------------------------------------------------------------
+// central [[link]] table (config.toml)
+// -----------------------------------------------------------------
+
+/// A central `[[link]]` naming a directory links it as one unit — the
+/// same result a `.yuilink` in that directory produces, without the
+/// marker file. Proof is behavioural: a file created on the target side
+/// after apply shows up in source, which only happens when the dir
+/// itself is the link (per-file links would leave the new file behind).
+#[test]
+fn central_link_links_dir_as_one_unit() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("home"));
+    std::fs::create_dir_all(source.join("home/.omp/agent")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(source.join("home/.omp/agent/config.yml"), "model: opus\n").unwrap();
+
+    let cfg = format!(
+        r#"
+[[mount.entry]]
+src = "home"
+dst = "{0}"
+
+[[link]]
+src = "home/.omp"
+dst = "{0}/.omp"
+"#,
+        toml_path(&target)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    assert!(target.join(".omp/agent/config.yml").exists());
+    // App writes a brand-new file into the target dir → it lands in
+    // source because the directory is linked as a unit.
+    std::fs::write(target.join(".omp/sessions.json"), "[]").unwrap();
+    assert!(
+        source.join("home/.omp/sessions.json").exists(),
+        "target-side file must land in source through the dir link"
+    );
+}
+
+/// `src` may name a single file, which keys the entry on its parent
+/// directory so the rest of that directory keeps its default placement.
+#[test]
+fn central_link_targets_specific_file() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let parent_target = utf8(tmp.path().join("home"));
+    let docs_target = utf8(tmp.path().join("docs"));
+    std::fs::create_dir_all(source.join("home/.config/powershell")).unwrap();
+    std::fs::create_dir_all(&parent_target).unwrap();
+    std::fs::create_dir_all(&docs_target).unwrap();
+    std::fs::write(
+        source.join("home/.config/powershell/profile.ps1"),
+        "# profile\n",
+    )
+    .unwrap();
+    std::fs::write(source.join("home/.config/powershell/extra.txt"), "extra\n").unwrap();
+
+    let cfg = format!(
+        r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+
+[[link]]
+src = "home/.config/powershell/profile.ps1"
+dst = "{}/Microsoft.PowerShell_profile.ps1"
+"#,
+        toml_path(&parent_target),
+        toml_path(&docs_target)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    assert!(
+        docs_target
+            .join("Microsoft.PowerShell_profile.ps1")
+            .exists()
+    );
+    // File-level scope doesn't claim the dir, so default placement
+    // still covers every file in it.
+    assert!(
+        parent_target
+            .join(".config/powershell/profile.ps1")
+            .exists()
+    );
+    assert!(parent_target.join(".config/powershell/extra.txt").exists());
+}
+
+/// A central entry and a marker declaring different dsts stack, exactly
+/// as two markers would.
+#[test]
+fn central_link_stacks_with_marker() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let parent_target = utf8(tmp.path().join("home"));
+    let extra_target = utf8(tmp.path().join("extra"));
+    std::fs::create_dir_all(source.join("home/.config/nvim")).unwrap();
+    std::fs::create_dir_all(&parent_target).unwrap();
+    std::fs::create_dir_all(&extra_target).unwrap();
+    std::fs::write(source.join("home/.config/nvim/init.lua"), "-- cfg\n").unwrap();
+    // Marker claims the natural placement…
+    std::fs::write(source.join("home/.config/nvim/.yuilink"), "").unwrap();
+
+    // …and the central table adds an OS-specific alternate.
+    let cfg = format!(
+        r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+
+[[link]]
+src = "home/.config/nvim"
+dst = "{}/nvim"
+"#,
+        toml_path(&parent_target),
+        toml_path(&extra_target)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    assert!(parent_target.join(".config/nvim/init.lua").exists());
+    assert!(extra_target.join("nvim/init.lua").exists());
+}
+
+/// `default_strategy = "per-file"` turns marker discovery off, but a
+/// central entry is an explicit instruction — silently dropping it
+/// would be the worse surprise.
+#[test]
+fn central_link_applies_under_per_file_strategy() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("home"));
+    let marker_target = utf8(tmp.path().join("marker-dst"));
+    std::fs::create_dir_all(source.join("home/.omp")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(source.join("home/.omp/config.yml"), "model: opus\n").unwrap();
+    // Marker with its *own* dst, so the two declarations can't be
+    // confused for each other: if markers were read under `per-file`,
+    // `marker_target` would exist.
+    std::fs::write(
+        source.join("home/.omp/.yuilink"),
+        format!("[[link]]\ndst = \"{}\"\n", toml_path(&marker_target)),
+    )
+    .unwrap();
+
+    let cfg = format!(
+        r#"
+[mount]
+default_strategy = "per-file"
+
+[[mount.entry]]
+src = "home"
+dst = "{0}"
+
+[[link]]
+src = "home/.omp"
+dst = "{0}/.omp"
+"#,
+        toml_path(&target)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    std::fs::write(target.join(".omp/sessions.json"), "[]").unwrap();
+    assert!(
+        source.join("home/.omp/sessions.json").exists(),
+        "central entry must link the dir even when markers are off"
+    );
+    assert!(
+        !marker_target.exists(),
+        "marker dst must not be linked under per-file strategy"
+    );
+}
+
+/// A central `src` that doesn't exist fails when the walk reaches it —
+/// same point (and same message shape) as a marker's, quoting `src` as
+/// the user wrote it rather than the bare file name.
+#[test]
+fn central_link_missing_src_errors() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("home"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let cfg = format!(
+        r#"
+[[mount.entry]]
+src = "home"
+dst = "{0}"
+
+[[link]]
+src = "home/.nope"
+dst = "{0}/.nope"
+"#,
+        toml_path(&target)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    let err = apply(Some(source.clone()), false).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("home/.nope"), "got {msg}");
+    assert!(msg.contains("not found"), "got {msg}");
+}
+
+/// `when = false` + a `src` that isn't there is not an error: the entry
+/// is inactive on this host, so the walk skips it before looking at the
+/// filesystem. Same order markers use.
+#[test]
+fn central_link_inactive_entry_ignores_missing_src() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("home"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(source.join("home/.bashrc"), "x\n").unwrap();
+
+    let cfg = format!(
+        r#"
+[[mount.entry]]
+src = "home"
+dst = "{0}"
+
+[[link]]
+src = "home/.nope"
+dst = "{0}/.nope"
+when = "yui.os == 'no-such-os'"
+"#,
+        toml_path(&target)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+    assert!(target.join(".bashrc").exists());
+    assert!(!target.join(".nope").exists());
+}
+
+/// A central entry may legitimately name a file that only exists after
+/// `apply` — `*.tera` output is gitignored and rendered on demand. So
+/// `yui list` on a fresh clone must not fail just because the rendered
+/// sibling isn't there yet.
+#[test]
+fn central_link_to_rendered_output_does_not_break_list() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("home"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(source.join("home/.gitconfig.tera"), "[user]\nname = x\n").unwrap();
+
+    let cfg = format!(
+        r#"
+[[mount.entry]]
+src = "home"
+dst = "{0}"
+
+[[link]]
+src = "home/.gitconfig"
+dst = "{0}/.gitconfig-alt"
+"#,
+        toml_path(&target)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    // Rendered output doesn't exist yet — listing must still work.
+    assert!(!source.join("home/.gitconfig").exists());
+    list(Some(source.clone()), false, None, true).unwrap();
+
+    // And after apply (which renders first) the link lands.
+    apply(Some(source.clone()), false).unwrap();
+    assert!(target.join(".gitconfig-alt").exists());
+}
+
+/// The pre-0.11 `[link] file_mode / dir_mode` table now collides with
+/// the `[[link]]` array. Serde's own type error says nothing about
+/// where the keys went, so `load` intercepts the old shape.
+#[test]
+fn legacy_link_mode_table_errors_with_migration_hint() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("home"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let cfg = format!(
+        r#"
+[link]
+file_mode = "hardlink"
+
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+        toml_path(&target)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    let err = apply(Some(source.clone()), false).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("[mount]"), "got {msg}");
+    assert!(msg.contains("file_mode"), "got {msg}");
 }
 
 // -----------------------------------------------------------------
@@ -2527,12 +2839,12 @@ fn gc_backup_prune_handles_directory_snapshot() {
 /// owns the `Config` + paths so the borrow in `ApplyCtx` is valid
 /// for the test scope. Callers can mutate the `Cell` fields in
 /// place.
-fn ctx_for_test(tmp: &TempDir) -> (Config, Utf8PathBuf, Utf8PathBuf) {
+fn ctx_for_test(tmp: &TempDir) -> (Config, Utf8PathBuf, Utf8PathBuf, LinkPlan) {
     let source = utf8(tmp.path().join("src"));
     let backup_root = source.join(".yui/backup");
     std::fs::create_dir_all(&source).unwrap();
     let cfg = Config::default();
-    (cfg, source, backup_root)
+    (cfg, source, backup_root, LinkPlan::default())
 }
 
 #[test]
@@ -2542,7 +2854,7 @@ fn prompt_anomaly_short_circuits_on_quit_requested() {
     // in-flight dir merge) returns `Quit` immediately so we don't
     // re-prompt or block on stdin during teardown.
     let tmp = TempDir::new().unwrap();
-    let (cfg, source, backup_root) = ctx_for_test(&tmp);
+    let (cfg, source, backup_root, plan) = ctx_for_test(&tmp);
     let src_file = source.join("a");
     let dst_file = utf8(tmp.path().join("dst"));
     std::fs::write(&src_file, "X").unwrap();
@@ -2551,8 +2863,9 @@ fn prompt_anomaly_short_circuits_on_quit_requested() {
     let ctx = ApplyCtx {
         config: &cfg,
         source: &source,
-        file_mode: resolve_file_mode(cfg.link.file_mode),
-        dir_mode: resolve_dir_mode(cfg.link.dir_mode),
+        plan: &plan,
+        file_mode: resolve_file_mode(cfg.mount.file_mode),
+        dir_mode: resolve_dir_mode(cfg.mount.dir_mode),
         backup_root: &backup_root,
         dry_run: false,
         sticky_anomaly: Cell::new(None),
@@ -2570,7 +2883,7 @@ fn prompt_anomaly_short_circuits_on_sticky_choice() {
     // re-prompting. We verify by pre-setting the cell and calling the
     // prompt with stdin/stderr that would otherwise prompt.
     let tmp = TempDir::new().unwrap();
-    let (cfg, source, backup_root) = ctx_for_test(&tmp);
+    let (cfg, source, backup_root, plan) = ctx_for_test(&tmp);
     let src_file = source.join("a");
     let dst_file = utf8(tmp.path().join("dst"));
     std::fs::write(&src_file, "X").unwrap();
@@ -2579,8 +2892,9 @@ fn prompt_anomaly_short_circuits_on_sticky_choice() {
     let ctx = ApplyCtx {
         config: &cfg,
         source: &source,
-        file_mode: resolve_file_mode(cfg.link.file_mode),
-        dir_mode: resolve_dir_mode(cfg.link.dir_mode),
+        plan: &plan,
+        file_mode: resolve_file_mode(cfg.mount.file_mode),
+        dir_mode: resolve_dir_mode(cfg.mount.dir_mode),
         backup_root: &backup_root,
         dry_run: false,
         sticky_anomaly: Cell::new(Some(AnomalyChoice::Overwrite)),
@@ -2598,7 +2912,7 @@ fn overwrite_source_into_target_replaces_target_and_backs_up() {
     // target's old content is preserved under backup so it is
     // recoverable.
     let tmp = TempDir::new().unwrap();
-    let (cfg, source, backup_root) = ctx_for_test(&tmp);
+    let (cfg, source, backup_root, plan) = ctx_for_test(&tmp);
     let src_file = source.join("a");
     let dst_file = utf8(tmp.path().join("dst"));
     std::fs::write(&src_file, "from source").unwrap();
@@ -2607,8 +2921,9 @@ fn overwrite_source_into_target_replaces_target_and_backs_up() {
     let ctx = ApplyCtx {
         config: &cfg,
         source: &source,
-        file_mode: resolve_file_mode(cfg.link.file_mode),
-        dir_mode: resolve_dir_mode(cfg.link.dir_mode),
+        plan: &plan,
+        file_mode: resolve_file_mode(cfg.mount.file_mode),
+        dir_mode: resolve_dir_mode(cfg.mount.dir_mode),
         backup_root: &backup_root,
         dry_run: false,
         sticky_anomaly: Cell::new(None),
@@ -2645,7 +2960,7 @@ fn link_file_with_backup_short_circuits_when_quit_requested() {
     // on_anomaly=force, which would otherwise absorb) and verify
     // nothing changed.
     let tmp = TempDir::new().unwrap();
-    let (mut cfg, source, backup_root) = ctx_for_test(&tmp);
+    let (mut cfg, source, backup_root, plan) = ctx_for_test(&tmp);
     cfg.absorb.on_anomaly = crate::config::AnomalyAction::Force;
 
     let src_file = source.join("a");
@@ -2660,8 +2975,9 @@ fn link_file_with_backup_short_circuits_when_quit_requested() {
     let ctx = ApplyCtx {
         config: &cfg,
         source: &source,
-        file_mode: resolve_file_mode(cfg.link.file_mode),
-        dir_mode: resolve_dir_mode(cfg.link.dir_mode),
+        plan: &plan,
+        file_mode: resolve_file_mode(cfg.mount.file_mode),
+        dir_mode: resolve_dir_mode(cfg.mount.dir_mode),
         backup_root: &backup_root,
         dry_run: false,
         sticky_anomaly: Cell::new(None),

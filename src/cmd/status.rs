@@ -1,7 +1,7 @@
 use super::*;
 use crate::config::{self, Config, IconsMode, MountStrategy};
 use crate::icons::Icons;
-use crate::marker::{self, MarkerSpec};
+use crate::links::LinkPlan;
 use crate::mount;
 use crate::render;
 use crate::template;
@@ -94,6 +94,8 @@ pub fn status(
     // source-root layer so root rules apply from the start.
     let mut yuiignore = paths::YuiIgnoreStack::with_gitignore(config.mount.respect_gitignore);
     yuiignore.push_dir(&source)?;
+    let plan = LinkPlan::from_config(&source, &config.link)?;
+    plan.warn_unreachable(mounts.iter().map(|m| m.src.as_path()));
     let walk_result = (|| -> Result<()> {
         for m in &mounts {
             let src_root = m.src.clone();
@@ -105,6 +107,7 @@ pub fn status(
                 &src_root,
                 &m.dst,
                 &config,
+                &plan,
                 m.strategy,
                 &mut engine,
                 &tera_ctx,
@@ -168,6 +171,7 @@ pub(crate) fn classify_walk(
     src_dir: &Utf8Path,
     dst_dir: &Utf8Path,
     config: &Config,
+    plan: &LinkPlan,
     strategy: MountStrategy,
     engine: &mut template::Engine,
     tera_ctx: &TeraContext,
@@ -179,6 +183,7 @@ pub(crate) fn classify_walk(
         src_dir,
         dst_dir,
         config,
+        plan,
         strategy,
         engine,
         tera_ctx,
@@ -194,6 +199,7 @@ fn classify_walk_inner(
     src_dir: &Utf8Path,
     dst_dir: &Utf8Path,
     config: &Config,
+    plan: &LinkPlan,
     strategy: MountStrategy,
     engine: &mut template::Engine,
     tera_ctx: &TeraContext,
@@ -212,6 +218,7 @@ fn classify_walk_inner(
         src_dir,
         dst_dir,
         config,
+        plan,
         strategy,
         engine,
         tera_ctx,
@@ -229,6 +236,7 @@ fn classify_walk_inner_body(
     src_dir: &Utf8Path,
     dst_dir: &Utf8Path,
     config: &Config,
+    plan: &LinkPlan,
     strategy: MountStrategy,
     engine: &mut template::Engine,
     tera_ctx: &TeraContext,
@@ -240,56 +248,57 @@ fn classify_walk_inner_body(
     let marker_filename = &config.mount.marker_filename;
     let mut covered = parent_covered;
 
-    if strategy == MountStrategy::Marker {
-        match marker::read_spec(src_dir, marker_filename)? {
-            None => {}
-            Some(MarkerSpec::PassThrough) => {
-                let decision = absorb::classify(src_dir, dst_dir)?;
-                report.push(StatusItem {
-                    src: relative_for_display(source_root, src_dir),
-                    dst: dst_dir.to_path_buf(),
-                    state: StatusState::Link(decision),
-                });
-                covered = true;
-            }
-            Some(MarkerSpec::Explicit { links }) => {
-                let mut emitted_dir_link = false;
-                for link in &links {
-                    if let Some(when) = &link.when {
-                        if !template::eval_truthy(when, engine, tera_ctx)? {
-                            continue;
-                        }
-                    }
-                    let dst_str = engine.render(&link.dst, tera_ctx)?;
-                    let dst = paths::expand_tilde(dst_str.trim());
-                    if let Some(filename) = &link.src {
-                        let file_src = src_dir.join(filename);
-                        if !file_src.is_file() {
-                            anyhow::bail!(
-                                "marker at {src_dir}: [[link]] src={filename:?} \
-                                 not found"
-                            );
-                        }
-                        let decision = absorb::classify(&file_src, &dst)?;
-                        report.push(StatusItem {
-                            src: relative_for_display(source_root, &file_src),
-                            dst,
-                            state: StatusState::Link(decision),
-                        });
-                    } else {
-                        let decision = absorb::classify(src_dir, &dst)?;
-                        report.push(StatusItem {
-                            src: relative_for_display(source_root, src_dir),
-                            dst,
-                            state: StatusState::Link(decision),
-                        });
-                        emitted_dir_link = true;
-                    }
-                }
-                if emitted_dir_link {
-                    covered = true;
+    let spec = plan.dir_spec(src_dir, marker_filename, strategy == MountStrategy::Marker)?;
+    if spec.passthrough {
+        let decision = absorb::classify(src_dir, dst_dir)?;
+        report.push(StatusItem {
+            src: relative_for_display(source_root, src_dir),
+            dst: dst_dir.to_path_buf(),
+            state: StatusState::Link(decision),
+        });
+        covered = true;
+    }
+    if !spec.links.is_empty() {
+        let mut emitted_dir_link = false;
+        for link in &spec.links {
+            if let Some(when) = &link.when {
+                if !template::eval_truthy(when, engine, tera_ctx)? {
+                    continue;
                 }
             }
+            let dst_str = engine.render(&link.dst, tera_ctx)?;
+            let dst = paths::expand_tilde(dst_str.trim());
+            match &link.rel {
+                Some(rel) => {
+                    let file_src = src_dir.join(rel);
+                    if !file_src.is_file() {
+                        // Resilience principle: status has to keep
+                        // reporting when apply would fail. `apply` bails
+                        // on this (it's about to write), but here one bad
+                        // declaration must not suppress every other row.
+                        warn!("{} not found", link.describe(src_dir));
+                        continue;
+                    }
+                    let decision = absorb::classify(&file_src, &dst)?;
+                    report.push(StatusItem {
+                        src: relative_for_display(source_root, &file_src),
+                        dst,
+                        state: StatusState::Link(decision),
+                    });
+                }
+                None => {
+                    let decision = absorb::classify(src_dir, &dst)?;
+                    report.push(StatusItem {
+                        src: relative_for_display(source_root, src_dir),
+                        dst,
+                        state: StatusState::Link(decision),
+                    });
+                    emitted_dir_link = true;
+                }
+            }
+        }
+        if emitted_dir_link {
+            covered = true;
         }
     }
 
@@ -313,6 +322,7 @@ fn classify_walk_inner_body(
                 &src_path,
                 &dst_path,
                 config,
+                plan,
                 strategy,
                 engine,
                 tera_ctx,
