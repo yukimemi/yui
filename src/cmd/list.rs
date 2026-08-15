@@ -1,7 +1,7 @@
 use super::*;
 use crate::config::{self, Config, IconsMode};
 use crate::icons::Icons;
-use crate::marker::{self, MarkerSpec};
+use crate::links::LinkPlan;
 use crate::paths;
 use crate::template;
 use crate::vars::YuiVars;
@@ -83,43 +83,22 @@ fn collect_list_items(source: &Utf8Path, config: &Config, yui: &YuiVars) -> Resu
         });
     }
 
-    // 2. .yuilink overrides under source
-    let walker = paths::source_walker(source).build();
+    // 2. `[[link]]` declarations — central entries from config.toml plus
+    //    every `.yuilink` under source. Both normalize to the same
+    //    shape, so one loop covers both.
+    let plan = LinkPlan::from_config(source, &config.link)?;
     let marker_filename = &config.mount.marker_filename;
-    for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+    for dir in plan.declared_dirs(source, marker_filename) {
+        let spec = plan.dir_spec(&dir, marker_filename, true)?;
+        // PassThrough markers are already implied by the mount entry.
+        if spec.links.is_empty() {
             continue;
         }
-        if entry.path().file_name().and_then(|n| n.to_str()) != Some(marker_filename.as_str()) {
-            continue;
-        }
-        let dir = match entry.path().parent() {
-            Some(d) => d,
-            None => continue,
-        };
-        let dir_utf8 = match Utf8PathBuf::from_path_buf(dir.to_path_buf()) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        // .yuiignore filtering happens in `source_walker` via
-        // `add_custom_ignore_filename` — markers under ignored
-        // subtrees never reach here.
-        let spec = match marker::read_spec(&dir_utf8, marker_filename)? {
-            Some(s) => s,
-            None => continue,
-        };
-        let MarkerSpec::Explicit { links } = spec else {
-            continue; // PassThrough markers are already implied by mount entry
-        };
-        let rel = dir_utf8
+        let rel = dir
             .strip_prefix(source)
             .map(Utf8PathBuf::from)
-            .unwrap_or(dir_utf8);
-        for link in &links {
+            .unwrap_or_else(|_| dir.clone());
+        for link in &spec.links {
             let active = match &link.when {
                 None => true,
                 Some(w) => template::eval_truthy(w, &mut engine, &tera_ctx)?,
@@ -128,12 +107,12 @@ fn collect_list_items(source: &Utf8Path, config: &Config, yui: &YuiVars) -> Resu
                 .render(&link.dst, &tera_ctx)
                 .map(|s| paths::expand_tilde(s.trim()).to_string())
                 .unwrap_or_else(|_| link.dst.clone());
-            // File-level entry (`[[link]] src = "<filename>"`) targets a
-            // single file inside the marker dir; show that file path
-            // instead of the bare dir so `yui list` makes the scope
-            // obvious at a glance.
-            let src_display = match &link.src {
-                Some(filename) => rel.join(filename),
+            // File-scoped entry (`[[link]] src = "<path>"`) targets a
+            // single file inside the dir; show that file path instead of
+            // the bare dir so `yui list` makes the scope obvious at a
+            // glance.
+            let src_display = match &link.rel {
+                Some(r) => rel.join(r),
                 None => rel.clone(),
             };
             items.push(ListItem {

@@ -1,7 +1,7 @@
 use super::*;
 use crate::config::{self, Config};
 use crate::link::{resolve_dir_mode, resolve_file_mode};
-use crate::marker::{self, MarkerSpec};
+use crate::links::LinkPlan;
 use crate::paths;
 use crate::template;
 use crate::vars::YuiVars;
@@ -76,11 +76,13 @@ pub fn absorb(
     }
 
     let backup_root = source.join(&config.backup.dir);
+    let plan = LinkPlan::from_config(&source, &config.link)?;
     let ctx = ApplyCtx {
         config: &config,
         source: &source,
-        file_mode: resolve_file_mode(config.link.file_mode),
-        dir_mode: resolve_dir_mode(config.link.dir_mode),
+        plan: &plan,
+        file_mode: resolve_file_mode(config.mount.file_mode),
+        dir_mode: resolve_dir_mode(config.mount.dir_mode),
         backup_root: &backup_root,
         dry_run: false,
         sticky_anomaly: Cell::new(None),
@@ -199,9 +201,9 @@ fn prompt_yes_no(question: &str) -> Result<bool> {
     Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
-/// Walk mount entries + `.yuilink` Override markers to find the source
-/// file/dir that the given target maps back to. Returns `None` when no
-/// mount or marker claims the path.
+/// Walk mount entries + every `[[link]]` declaration (central table and
+/// `.yuilink` markers) to find the source file/dir that the given target
+/// maps back to. Returns `None` when nothing claims the path.
 fn find_source_for_target(
     source: &Utf8Path,
     config: &Config,
@@ -245,40 +247,16 @@ fn find_source_for_target(
         }
     }
 
-    // 2. `.yuilink` Override markers — walk source, parse, render each
-    //    `[[link]] dst`, see if target is the rendered dst (or nested
-    //    inside a junction'd dir). `source_walker` skips `.yui/` and
-    //    honours nested `.yuiignore` files automatically, so markers
-    //    inside ignored subtrees never reach this loop.
-    let walker = paths::source_walker(source).build();
+    // 2. `[[link]]` declarations — render each `dst`, see if target is
+    //    that dst (or nested inside a junction'd dir). Marker discovery
+    //    goes through `source_walker`, which skips `.yui/` and honours
+    //    nested `.yuiignore` files, so declarations under ignored
+    //    subtrees stay invisible here too.
+    let plan = LinkPlan::from_config(source, &config.link)?;
     let marker_filename = &config.mount.marker_filename;
-    for ent in walker {
-        let ent = match ent {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if !ent.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            continue;
-        }
-        if ent.path().file_name().and_then(|n| n.to_str()) != Some(marker_filename.as_str()) {
-            continue;
-        }
-        let dir = match ent.path().parent() {
-            Some(d) => d,
-            None => continue,
-        };
-        let dir_utf8 = match Utf8PathBuf::from_path_buf(dir.to_path_buf()) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let spec = match marker::read_spec(&dir_utf8, marker_filename)? {
-            Some(s) => s,
-            None => continue,
-        };
-        let MarkerSpec::Explicit { links } = spec else {
-            continue;
-        };
-        for link in &links {
+    for dir in plan.declared_dirs(source, marker_filename) {
+        let spec = plan.dir_spec(&dir, marker_filename, true)?;
+        for link in &spec.links {
             if let Some(when) = &link.when {
                 if !template::eval_truthy(when, engine, tera_ctx)? {
                     continue;
@@ -286,30 +264,28 @@ fn find_source_for_target(
             }
             let dst_str = engine.render(&link.dst, tera_ctx)?;
             let dst = paths::expand_tilde(dst_str.trim());
-            // File-level entry: dst points at a single file, so a match
-            // resolves directly to `<marker-dir>/<src filename>`. Mirror
-            // the existence check that apply / status do so a missing
-            // sibling produces the same clear message regardless of
-            // entry point — consistent with the `marker at … src=… not
-            // found` shape users already see from those flows.
-            if let Some(filename) = &link.src {
-                let file_src = dir_utf8.join(filename);
+            // File-scoped entry: dst points at a single file, so a match
+            // resolves directly to `<dir>/<rel>`. Test the target first —
+            // this is a *search* over every declaration, so a stale entry
+            // elsewhere in the config must not abort the lookup for the
+            // path the user actually asked about. Once it matches, mirror
+            // the existence check apply / status do so the message shape
+            // is the same from every entry point.
+            if let Some(rel) = &link.rel {
+                if target != dst {
+                    continue;
+                }
+                let file_src = dir.join(rel);
                 if !file_src.is_file() {
-                    anyhow::bail!(
-                        "marker at {dir_utf8}: [[link]] src={filename:?} \
-                         not found"
-                    );
+                    anyhow::bail!("{} not found", link.describe(&dir));
                 }
-                if target == dst {
-                    return Ok(Some(file_src));
-                }
-                continue;
+                return Ok(Some(file_src));
             }
             if target == dst {
-                return Ok(Some(dir_utf8));
+                return Ok(Some(dir));
             }
             if let Ok(rel) = target.strip_prefix(&dst) {
-                return Ok(Some(dir_utf8.join(rel)));
+                return Ok(Some(dir.join(rel)));
             }
         }
     }

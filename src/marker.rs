@@ -16,9 +16,9 @@
 //! when = "yui.os == 'windows'"
 //! ```
 //!
-//! Each `[[link]]` may carry an optional `src = "<filename>"` that scopes
-//! the link to a specific file inside the marker's directory rather than
-//! the directory itself:
+//! Each `[[link]]` may carry an optional `src` — a relative path to a
+//! file inside the marker's directory — that scopes the link to that
+//! file rather than the directory itself:
 //!
 //! ```toml
 //! # $DOTFILES/home/.config/powershell/.yuilink
@@ -27,6 +27,13 @@
 //! dst = "{{ env(name='USERPROFILE') }}/Documents/PowerShell/Microsoft.PowerShell_profile.ps1"
 //! when = "yui.os == 'windows'"
 //! ```
+//!
+//! `src` may descend (`src = "sub/profile.ps1"`) but never escape: `..`
+//! and absolute paths are rejected, and a `src` naming a *directory* is
+//! rejected too — directory scope is what the marker itself means, so
+//! put a marker in that directory or declare it in `config.toml`'s
+//! central `[[link]]` table (see [`crate::links`], which owns the
+//! shared entry schema).
 //!
 //! Stacking semantics (v0.6+): a marker no longer stops the walker. The
 //! walker keeps descending past markers and aggregates link entries from
@@ -43,15 +50,16 @@
 //!   - **Directory-scoped `[[link]]`** (no `src`) — fully defines the
 //!     directory's placement. The parent mount's natural dst is *not*
 //!     implied; only what's listed here is linked at this dir.
-//!   - **File-scoped `[[link]]`** (with `src = "<filename>"`) — applies
-//!     only to the named sibling file. It does *not* claim
-//!     directory-level coverage, so per-file defaults from the parent
-//!     mount still apply to the rest of the dir (and to the same file
-//!     too, in addition to the explicit dst).
+//!   - **File-scoped `[[link]]`** (with `src`) — applies only to the
+//!     named file. It does *not* claim directory-level coverage, so
+//!     per-file defaults from the parent mount still apply to the rest
+//!     of the dir (and to the same file too, in addition to the
+//!     explicit dst).
 
 use camino::Utf8Path;
 use serde::Deserialize;
 
+use crate::links::{self, LinkEntry};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone)]
@@ -60,26 +68,13 @@ pub enum MarkerSpec {
     PassThrough,
     /// Explicit links. Each entry maps the marker's directory (or a
     /// specific file inside it via `src`) to a destination.
-    Explicit { links: Vec<MarkerLink> },
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct MarkerLink {
-    /// Optional file scope. When set, this entry links the file at
-    /// `<marker-dir>/<src>` to `dst` instead of the directory itself.
-    /// Must be a single component (no path separators) so it stays a
-    /// sibling file of the marker.
-    #[serde(default)]
-    pub src: Option<String>,
-    pub dst: String,
-    #[serde(default)]
-    pub when: Option<String>,
+    Explicit { links: Vec<LinkEntry> },
 }
 
 #[derive(Deserialize)]
 struct MarkerFile {
     #[serde(default)]
-    link: Vec<MarkerLink>,
+    link: Vec<LinkEntry>,
 }
 
 /// Read and parse a `.yuilink` from `dir`.
@@ -106,18 +101,15 @@ pub fn read_spec(dir: &Utf8Path, marker_filename: &str) -> Result<Option<MarkerS
     }
     for link in &parsed.link {
         if let Some(src) = &link.src {
-            // Reject anything that isn't a plain sibling file. `.` /
-            // `..` would point at the marker dir itself or its parent,
-            // and path separators would let the entry escape the dir
-            // entirely — neither matches the "single filename" promise.
-            if src.is_empty()
-                || src == "."
-                || src == ".."
-                || src.contains('/')
-                || src.contains('\\')
-            {
+            links::validate_src(src, &format!("parse {path}: [[link]]"))?;
+            // A marker's `src` scopes the entry to a file. Directory
+            // scope is what the marker itself expresses (omit `src`),
+            // so pointing one at a subdirectory would give the same dst
+            // two owners with different coverage rules. Say so instead.
+            if dir.join(src).is_dir() {
                 return Err(Error::Config(format!(
-                    "parse {path}: [[link]] src must be a single filename (no path separators or `.`/`..`), got {src:?}"
+                    "parse {path}: [[link]] src={src} is a directory — put a \
+                     {marker_filename} in it, or declare it as a [[link]] in config.toml"
                 )));
             }
         }
@@ -214,7 +206,7 @@ when = "yui.os == 'windows'"
         match spec {
             MarkerSpec::Explicit { links } => {
                 assert_eq!(links.len(), 1);
-                assert_eq!(links[0].src.as_deref(), Some("profile.ps1"));
+                assert_eq!(links[0].src.as_deref(), Some(Utf8Path::new("profile.ps1")));
                 assert_eq!(
                     links[0].dst,
                     "~/Documents/PowerShell/Microsoft.PowerShell_profile.ps1"
@@ -224,8 +216,10 @@ when = "yui.os == 'windows'"
         }
     }
 
+    /// v0.11+: `src` may descend into a subdirectory. It only has to
+    /// stay inside the marker's directory.
     #[test]
-    fn marker_src_with_path_separator_errors() {
+    fn marker_src_with_path_separator_parses() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join(".yuilink"),
@@ -236,15 +230,21 @@ dst = "/anywhere"
 "#,
         )
         .unwrap();
-        let err = read_spec(&root(&tmp), ".yuilink").unwrap_err();
-        assert!(format!("{err}").contains("single filename"));
+        let spec = read_spec(&root(&tmp), ".yuilink").unwrap().unwrap();
+        match spec {
+            MarkerSpec::Explicit { links } => {
+                assert_eq!(links[0].src.as_deref(), Some(Utf8Path::new("sub/file.txt")));
+            }
+            _ => panic!("expected Explicit"),
+        }
     }
 
     #[test]
-    fn marker_src_dot_or_dotdot_errors() {
-        // `.` / `..` would silently escape the marker dir or point at
-        // the dir itself; neither is what `[[link]] src` is for.
-        for bad in [".", ".."] {
+    fn marker_src_escaping_the_dir_errors() {
+        // `.` points at the marker dir itself (that's what omitting
+        // `src` means) and `..` / absolute paths leave the subtree the
+        // marker is supposed to describe.
+        for bad in [".", "..", "../outside.txt"] {
             let tmp = TempDir::new().unwrap();
             std::fs::write(
                 tmp.path().join(".yuilink"),
@@ -259,10 +259,25 @@ dst = "/anywhere"
             .unwrap();
             let err = read_spec(&root(&tmp), ".yuilink").unwrap_err();
             assert!(
-                format!("{err}").contains("single filename"),
+                format!("{err}").contains("relative path"),
                 "expected rejection for src = {bad:?}, got {err}"
             );
         }
+    }
+
+    /// Directory scope is what the marker itself expresses, so a `src`
+    /// naming a subdirectory is a config bug with a clear fix.
+    #[test]
+    fn marker_src_naming_a_directory_errors() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("nvim")).unwrap();
+        std::fs::write(
+            tmp.path().join(".yuilink"),
+            "[[link]]\nsrc = \"nvim\"\ndst = \"/anywhere\"\n",
+        )
+        .unwrap();
+        let err = read_spec(&root(&tmp), ".yuilink").unwrap_err();
+        assert!(format!("{err}").contains("is a directory"), "got {err}");
     }
 
     #[test]

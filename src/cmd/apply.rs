@@ -2,7 +2,7 @@ use super::*;
 use crate::config::{self, Config, HookPhase, MountStrategy};
 use crate::hook;
 use crate::link::{self, EffectiveDirMode, EffectiveFileMode, resolve_dir_mode, resolve_file_mode};
-use crate::marker::{self, MarkerSpec};
+use crate::links::{self, LinkPlan};
 use crate::mount::{self, ResolvedMount};
 use crate::render::{self, RenderReport};
 use crate::secret;
@@ -94,11 +94,14 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     )?;
 
     let backup_root = source.join(&config.backup.dir);
+    let plan = links::LinkPlan::from_config(&source, &config.link)?;
+    plan.warn_unreachable(mounts.iter().map(|m| m.src.as_path()));
     let ctx = ApplyCtx {
         config: &config,
         source: &source,
-        file_mode: resolve_file_mode(config.link.file_mode),
-        dir_mode: resolve_dir_mode(config.link.dir_mode),
+        plan: &plan,
+        file_mode: resolve_file_mode(config.mount.file_mode),
+        dir_mode: resolve_dir_mode(config.mount.dir_mode),
         backup_root: &backup_root,
         dry_run,
         sticky_anomaly: Cell::new(None),
@@ -213,6 +216,9 @@ pub(crate) struct ApplyCtx<'a> {
     pub(crate) config: &'a Config,
     /// Source repo root — needed for git-clean checks during absorb.
     pub(crate) source: &'a Utf8Path,
+    /// Central `[[link]]` declarations from `config.toml`, keyed by the
+    /// source dir the walk has to reach for them to fire.
+    pub(crate) plan: &'a LinkPlan,
     pub(crate) file_mode: EffectiveFileMode,
     pub(crate) dir_mode: EffectiveDirMode,
     pub(crate) backup_root: &'a Utf8Path,
@@ -293,58 +299,57 @@ fn walk_and_link_body(
     let marker_filename = &ctx.config.mount.marker_filename;
     let mut covered = parent_covered;
 
-    if strategy == MountStrategy::Marker {
-        match marker::read_spec(src_dir, marker_filename)? {
-            None => {} // no marker — fall through to recursive walk
-            Some(MarkerSpec::PassThrough) => {
-                // Empty marker = junction this dir at the natural
-                // mount-derived dst. Subsequent recursion keeps going so
-                // descendant markers can layer on extra dsts.
-                link_dir_with_backup(src_dir, dst_dir, ctx)?;
-                covered = true;
-            }
-            Some(MarkerSpec::Explicit { links }) => {
-                let mut emitted_dir_link = false;
-                let mut emitted_any = false;
-                for link in &links {
-                    // Nested ifs (not let-chains) so the crate's MSRV
-                    // (rust-version = "1.85") stays buildable.
-                    if let Some(when) = &link.when {
-                        if !template::eval_truthy(when, engine, tera_ctx)? {
-                            continue;
-                        }
-                    }
-                    let dst_str = engine.render(&link.dst, tera_ctx)?;
-                    let dst = paths::expand_tilde(dst_str.trim());
-                    if let Some(filename) = &link.src {
-                        let file_src = src_dir.join(filename);
-                        if !file_src.is_file() {
-                            anyhow::bail!(
-                                "marker at {src_dir}: [[link]] src={filename:?} \
-                                 not found"
-                            );
-                        }
-                        link_file_with_backup(&file_src, &dst, ctx)?;
-                    } else {
-                        link_dir_with_backup(src_dir, &dst, ctx)?;
-                        emitted_dir_link = true;
-                    }
-                    emitted_any = true;
-                }
-                if !emitted_any {
-                    // v0.6+ semantics: with no active links, the walker
-                    // still descends and per-file defaults still apply.
-                    // Phrase it so users don't read "skipping" as
-                    // "subtree blocked" (the v0.5 behaviour).
-                    info!(
-                        "marker at {src_dir} had no active links \
-                         — falling back to defaults"
-                    );
-                }
-                if emitted_dir_link {
-                    covered = true;
+    // `[[link]]` declarations for this dir: the `.yuilink` marker (only
+    // when the mount honours markers) merged with the central entries
+    // keyed here. A central entry is an explicit instruction rather than
+    // a discovered marker, so `per-file` mounts still honour it.
+    let spec = ctx
+        .plan
+        .dir_spec(src_dir, marker_filename, strategy == MountStrategy::Marker)?;
+    if spec.passthrough {
+        // Empty marker = junction this dir at the natural mount-derived
+        // dst. Subsequent recursion keeps going so descendant markers
+        // can layer on extra dsts.
+        link_dir_with_backup(src_dir, dst_dir, ctx)?;
+        covered = true;
+    }
+    if !spec.links.is_empty() {
+        let mut emitted_dir_link = false;
+        let mut emitted_any = false;
+        for link in &spec.links {
+            // Nested ifs (not let-chains) so the crate's MSRV
+            // (rust-version = "1.85") stays buildable.
+            if let Some(when) = &link.when {
+                if !template::eval_truthy(when, engine, tera_ctx)? {
+                    continue;
                 }
             }
+            let dst_str = engine.render(&link.dst, tera_ctx)?;
+            let dst = paths::expand_tilde(dst_str.trim());
+            match &link.rel {
+                Some(rel) => {
+                    let file_src = src_dir.join(rel);
+                    if !file_src.is_file() {
+                        anyhow::bail!("{} not found", link.describe(src_dir));
+                    }
+                    link_file_with_backup(&file_src, &dst, ctx)?;
+                }
+                None => {
+                    link_dir_with_backup(src_dir, &dst, ctx)?;
+                    emitted_dir_link = true;
+                }
+            }
+            emitted_any = true;
+        }
+        if !emitted_any {
+            // v0.6+ semantics: with no active links, the walker
+            // still descends and per-file defaults still apply.
+            // Phrase it so users don't read "skipping" as
+            // "subtree blocked" (the v0.5 behaviour).
+            info!("no active [[link]] for {src_dir} — falling back to defaults");
+        }
+        if emitted_dir_link {
+            covered = true;
         }
     }
 

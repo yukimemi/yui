@@ -14,6 +14,7 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
 
+use crate::links::LinkEntry;
 use crate::vars::YuiVars;
 use crate::{Error, Result, template};
 
@@ -22,8 +23,11 @@ pub struct Config {
     #[serde(default)]
     pub vars: toml::Table,
 
+    /// Central `[[link]]` table — explicit source→target declarations
+    /// that would otherwise need a `.yuilink` marker in the tree. See
+    /// [`crate::links`] for the shared schema.
     #[serde(default)]
-    pub link: LinkConfig,
+    pub link: Vec<LinkEntry>,
 
     #[serde(default)]
     pub mount: MountConfig,
@@ -246,14 +250,6 @@ pub enum IconsMode {
     Ascii,
 }
 
-#[derive(Debug, Deserialize, Default)]
-pub struct LinkConfig {
-    #[serde(default)]
-    pub file_mode: FileLinkMode,
-    #[serde(default)]
-    pub dir_mode: DirLinkMode,
-}
-
 #[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum FileLinkMode {
@@ -285,6 +281,14 @@ pub struct MountConfig {
     /// managed section is exempt — see `paths::YuiIgnoreStack`.
     #[serde(default = "default_true")]
     pub respect_gitignore: bool,
+    /// How a *file* is linked into the target: `auto` (Unix symlink /
+    /// Windows hardlink), `symlink`, or `hardlink`.
+    #[serde(default)]
+    pub file_mode: FileLinkMode,
+    /// How a *directory* is linked into the target: `auto` (Unix
+    /// symlink / Windows junction), `symlink`, or `junction`.
+    #[serde(default)]
+    pub dir_mode: DirLinkMode,
     #[serde(default)]
     pub entry: Vec<MountEntry>,
 }
@@ -295,6 +299,8 @@ impl Default for MountConfig {
             default_strategy: MountStrategy::default(),
             marker_filename: default_marker_filename(),
             respect_gitignore: true,
+            file_mode: FileLinkMode::default(),
+            dir_mode: DirLinkMode::default(),
             entry: Vec::new(),
         }
     }
@@ -552,6 +558,20 @@ pub fn load(source: &Utf8Path, yui: &YuiVars) -> Result<Config> {
             deep_merge_table(&mut vars_acc, file_vars.clone());
         }
         deep_merge_table(&mut merged, parsed);
+    }
+
+    // `[link]` used to be a single table holding `file_mode` /
+    // `dir_mode`; it is now the array-of-tables that declares links.
+    // Deserializing a table into `Vec<LinkEntry>` fails anyway, but with
+    // a serde type error that says nothing about where the keys went.
+    if let Some(toml::Value::Table(t)) = merged.get("link") {
+        return Err(Error::Config(format!(
+            "`[link]` is now the array-of-tables that declares links \
+             (`[[link]]` with src / dst / when). The link *modes* moved to \
+             `[mount]`: rewrite `[link]` {} as `[mount] file_mode` / \
+             `[mount] dir_mode`",
+            t.keys().map(String::as_str).collect::<Vec<_>>().join(" / ")
+        )));
     }
 
     let cfg: Config = toml::Value::Table(merged)
