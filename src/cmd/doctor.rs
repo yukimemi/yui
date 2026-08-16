@@ -1,10 +1,15 @@
 use super::*;
-use crate::config::{self, IconsMode};
+use crate::config::{self, Config, IconsMode, MountStrategy};
 use crate::icons::Icons;
+use crate::link::{EffectiveDirMode, resolve_dir_mode};
+use crate::links::LinkPlan;
+use crate::mount;
 use crate::paths;
+use crate::template;
 use crate::vars::YuiVars;
 use anyhow::Result;
 use camino::{Utf8Path, Utf8PathBuf};
+use std::collections::BTreeSet;
 
 pub fn doctor(
     source: Option<Utf8PathBuf>,
@@ -104,6 +109,15 @@ pub fn doctor(
     } else {
         probes.push(Probe::ok("default mode", "files=symlink, dirs=symlink"));
     }
+    if let (Ok(s), Some(c)) = (&resolved_source, cfg) {
+        // Resilience principle: a config yui can't fully resolve
+        // (unrenderable mount dst, bad `[[link]]` src) must not take
+        // the rest of doctor down — degrade this one probe instead.
+        match undeclared_dir_link_probes(s, c, &yui) {
+            Ok(found) => probes.extend(found),
+            Err(e) => probes.push(Probe::warn("dir links", format!("check skipped — {e}"))),
+        }
+    }
 
     // ── hooks ─────────────────────────────────────────────────
     if have_source {
@@ -185,8 +199,160 @@ pub fn doctor(
     Ok(())
 }
 
+/// Target-side directory links that no `[[link]]` declaration asks for.
+///
+/// A junction / symlink pointing back into the source tree is
+/// load-bearing: *everything* under the source directory — tracked or
+/// not — is visible from the target through it. When nothing declares
+/// it, nothing recreates it, and no other command notices: both sides
+/// resolve to the same inode *through* that very link, so
+/// [`crate::absorb::classify`] reports the files inside as `in-sync`
+/// forever. Remove the link (new machine, `yui unlink`, a manual
+/// cleanup) and `apply` faithfully rebuilds the target as a plain
+/// directory holding per-file links of only the tracked files; the
+/// rest of the source directory silently stops being visible from the
+/// target side.
+///
+/// Warn, never error: the link is not broken *now*, it is
+/// unreproducible — and doctor exists to say that before `apply` does
+/// something surprising.
+pub(crate) fn undeclared_dir_link_probes(
+    source: &Utf8Path,
+    config: &Config,
+    yui: &YuiVars,
+) -> Result<Vec<Probe>> {
+    let mut engine = template::Engine::new();
+    let tera_ctx = template::template_context(yui, &config.vars);
+    let mounts = mount::resolve(
+        source,
+        &config.mount.entry,
+        config.mount.default_strategy,
+        &mut engine,
+        &tera_ctx,
+    )?;
+    let plan = LinkPlan::from_config(source, &config.link)?;
+    let marker_filename = &config.mount.marker_filename;
+
+    // Declaration roots: `$DOTFILES` plus any mount `src` living
+    // outside it (an absolute `src` is how a separate private clone
+    // participates), so a `.yuilink` out there still counts as a
+    // declaration.
+    let mut roots: Vec<Utf8PathBuf> = vec![source.to_path_buf()];
+    for m in &mounts {
+        if !roots.iter().any(|r| m.src.starts_with(r)) {
+            roots.push(m.src.clone());
+        }
+    }
+
+    // Every target path some declaration names. Rendered and
+    // tilde-expanded exactly like the apply walk does it, so the
+    // comparison below is against the path apply would create.
+    let mut declared: BTreeSet<Utf8PathBuf> = BTreeSet::new();
+    for root in &roots {
+        for dir in plan.declared_dirs(root, marker_filename) {
+            // Markers only count where the mount honours them — same
+            // gate the apply walk applies.
+            let honor_markers = mounts
+                .iter()
+                .find(|m| dir.starts_with(&m.src))
+                .is_none_or(|m| m.strategy == MountStrategy::Marker);
+            let spec = plan.dir_spec(&dir, marker_filename, honor_markers)?;
+            if spec.passthrough {
+                for m in &mounts {
+                    if let Ok(rel) = dir.strip_prefix(&m.src) {
+                        declared.insert(paths::normalize(&m.dst.join(rel)));
+                    }
+                }
+            }
+            for link in &spec.links {
+                if let Some(when) = &link.when {
+                    if !template::eval_truthy(when, &mut engine, &tera_ctx)? {
+                        continue;
+                    }
+                }
+                let rendered = engine.render(&link.dst, &tera_ctx)?;
+                declared.insert(paths::normalize(&paths::expand_tilde(rendered.trim())));
+            }
+        }
+    }
+
+    // A target link only concerns yui when it resolves back into a
+    // tree yui manages; an unrelated symlink (`/home/u` → `/mnt/u`)
+    // is somebody else's business.
+    let canonical_roots: Vec<std::path::PathBuf> = roots
+        .iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .collect();
+
+    // Name the mechanism the *config* asks for, not the platform
+    // default: `[mount] dir_mode = "symlink"` is opt-in on Windows, and
+    // a warning that says "junction" about a symlink misdescribes both
+    // what is on disk and what apply would rebuild.
+    let kind = match resolve_dir_mode(config.mount.dir_mode) {
+        EffectiveDirMode::Junction => "junction",
+        EffectiveDirMode::Symlink => "symlink",
+    };
+    let mut probes = Vec::new();
+    for m in &mounts {
+        if !m.src.is_dir() {
+            continue;
+        }
+        for ent in paths::source_walker(&m.src).build() {
+            let Ok(ent) = ent else { continue };
+            if !ent.file_type().is_some_and(|t| t.is_dir()) {
+                continue;
+            }
+            let Ok(src_dir) = Utf8PathBuf::from_path_buf(ent.into_path()) else {
+                continue;
+            };
+            let Ok(rel) = src_dir.strip_prefix(&m.src) else {
+                continue;
+            };
+            let dst = paths::normalize(&m.dst.join(rel));
+            if declared.contains(&dst) {
+                continue;
+            }
+            let is_link =
+                std::fs::symlink_metadata(&dst).is_ok_and(|md| md.file_type().is_symlink());
+            if !is_link {
+                continue;
+            }
+            let Ok(canonical) = std::fs::canonicalize(&dst) else {
+                continue;
+            };
+            if !canonical_roots.iter().any(|r| canonical.starts_with(r)) {
+                continue;
+            }
+            // Gitignore is only layered in here, on the handful of
+            // candidates that got this far: `source_walker` honours
+            // `.yuiignore` itself, and rebuilding the gitignore
+            // matchers for every directory in the tree would cost far
+            // more than it can ever save.
+            if paths::is_ignored_at(source, &src_dir, true, config.mount.respect_gitignore)? {
+                continue;
+            }
+            probes.push(Probe::warn(
+                "undeclared dir link",
+                format!(
+                    "{dst} → {src_dir} — the target is a {kind} into the source tree \
+                     but no [[link]] declares it; apply would rebuild it as a plain \
+                     directory with per-file links"
+                ),
+            ));
+        }
+    }
+
+    if probes.is_empty() {
+        probes.push(Probe::ok(
+            "dir links",
+            "every target-side directory link is declared",
+        ));
+    }
+    Ok(probes)
+}
+
 #[derive(Debug)]
-enum Probe {
+pub(crate) enum Probe {
     /// Section divider (just a heading, no severity).
     Group(&'static str),
     Ok {
