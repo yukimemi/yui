@@ -1214,7 +1214,7 @@ fn unstage(staged: &Utf8Path, dst: &Utf8Path) -> Result<()> {
 /// content-classified per file, so re-running it over an
 /// already-merged tree is a no-op rather than a second overwrite.
 fn recover_staged(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>) -> Result<()> {
-    for (staged, kind) in paths::scan_staged(dst)? {
+    for (staged, kind) in paths::scan_staged(dst) {
         if ctx.dry_run {
             info!("[dry-run] finish interrupted {kind:?} staging: {staged}");
             continue;

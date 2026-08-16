@@ -3081,7 +3081,7 @@ fn absorb_dir_stages_target_aside_and_cleans_up() {
         "target must end up linked to source"
     );
     assert!(
-        paths::scan_staged(&dst_dir).unwrap().is_empty(),
+        paths::scan_staged(&dst_dir).is_empty(),
         "staging must be swept once the merge succeeded"
     );
 }

@@ -2,6 +2,7 @@
 //! cross-platform tilde expansion.
 
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
+use tracing::warn;
 
 /// Expand a leading `~` or `~/...` to the user's home directory.
 ///
@@ -414,18 +415,25 @@ pub fn staged_path(dst: &Utf8Path, kind: StagedKind, ts: &str) -> Option<Utf8Pat
 /// sorted by name (so same-target leftovers are recovered oldest
 /// first — the timestamp suffix makes name order time order).
 ///
-/// A missing or unreadable parent yields an empty list rather than an
-/// error: recovery is a best-effort sweep in front of the real work,
-/// and a target whose parent we can't read has bigger problems that
-/// the link step itself will report.
-pub fn scan_staged(dst: &Utf8Path) -> crate::Result<Vec<(Utf8PathBuf, StagedKind)>> {
+/// Never fails. An unreadable parent — gone, permission denied, a
+/// directory entry that won't stat — yields whatever was readable
+/// instead of an error, because this is a best-effort sweep in front
+/// of the real work: aborting it would take down a `link_dir_with_backup`
+/// call that has every chance of succeeding, and a target whose parent
+/// we genuinely can't read fails again a few lines later with a much
+/// better message. Anything skipped is warned about, so a leftover
+/// that recovery could not see is still visible in the log.
+pub fn scan_staged(dst: &Utf8Path) -> Vec<(Utf8PathBuf, StagedKind)> {
     let (Some(parent), Some(name)) = (dst.parent(), dst.file_name()) else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     let entries = match std::fs::read_dir(parent) {
         Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            warn!("cannot scan {parent} for interrupted staging ({e}) — skipping recovery");
+            return Vec::new();
+        }
     };
 
     let prefixes = [
@@ -441,7 +449,13 @@ pub fn scan_staged(dst: &Utf8Path) -> crate::Result<Vec<(Utf8PathBuf, StagedKind
 
     let mut found = Vec::new();
     for entry in entries {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("skipping unreadable entry under {parent} while scanning staging ({e})");
+                continue;
+            }
+        };
         let raw = entry.file_name();
         let Some(entry_name) = raw.to_str() else {
             continue;
@@ -457,7 +471,7 @@ pub fn scan_staged(dst: &Utf8Path) -> crate::Result<Vec<(Utf8PathBuf, StagedKind
         }
     }
     found.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(found)
+    found
 }
 
 /// Normalize a path by eliminating redundant `.` components without accessing
@@ -806,7 +820,7 @@ mod tests {
         std::fs::create_dir_all(root.join("nvim-backup")).unwrap();
         std::fs::create_dir_all(root.join("other.yui-absorb.20260101_000000000")).unwrap();
 
-        let got = scan_staged(&dst).unwrap();
+        let got = scan_staged(&dst);
         assert_eq!(
             got,
             vec![
@@ -827,6 +841,6 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         let dst = root.join("gone/nvim");
-        assert!(scan_staged(&dst).unwrap().is_empty());
+        assert!(scan_staged(&dst).is_empty());
     }
 }
