@@ -79,6 +79,27 @@ marker is consent for the *whole-tree* merge, but a single file
 where the source side is newer is still a real anomaly worth
 surfacing.
 
+A whole-directory absorb is ordered for crash safety, which matters
+once the tree is a real `~/.config`. The target is moved aside with a
+single same-volume rename, the link goes up immediately, and only then
+does the slow work — merging content into source, deleting the moved
+tree — run against the staged copy. So the expensive steps happen
+while the live path already resolves to source: pull the power in the
+middle and you are left with a working target plus a
+`<target>.yui-absorb.<timestamp>` directory beside it, never a
+half-deleted config dir.
+
+That leftover is also its own retry plan — the name says what is still
+owed, so no journal file is involved. The next `apply` sweeps it
+before doing anything else: `.yui-absorb.` trees are merged into
+source and then removed (they may hold the only copy of a target-side
+edit), `.yui-discard.` trees are removed unread (their content already
+reached `$DOTFILES/.yui/backup/` before the rename). Recovery runs
+ahead of the classifier on purpose — a relinked target reads `InSync`,
+so classification alone would walk right past the leftover. If the
+rename itself is refused — a file held open inside the tree on
+Windows, say — `yui` warns and falls back to deleting in place.
+
 ## Install
 
 ```sh

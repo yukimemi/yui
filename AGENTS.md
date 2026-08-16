@@ -177,6 +177,28 @@ before reverting any of them.
   - source newer + content differs → anomaly, diff + ask (or skip/force per `[absorb] on_anomaly`)
   - source repo dirty (uncommitted) and `require_clean_git=true` → escalate "auto-absorb" to "ask"
   - target missing → restore from source
+- **Dir-level relinks stage the target aside; they never delete in
+  place.** `absorb_target_dir_into_source` /
+  `overwrite_source_dir_into_target` rename the target to a sibling
+  (`<name>.yui-absorb.<ts>` / `<name>.yui-discard.<ts>`), put the link
+  up immediately, and only then merge / `remove_dir_all` the staged
+  tree. Rationale: `remove_dir_all` on a real `~/.config` is O(tree)
+  and non-atomic, so the old "merge → delete → link" order left a
+  half-deleted target and no link if it was interrupted. Sibling
+  placement is mandatory — `rename` is only atomic within one volume,
+  which is also why the staging dir is not under `.yui/backup/`.
+  A refused rename (open handles on Windows) warns and falls back to
+  the in-place teardown.
+- **The staging name is the crash journal.** `Absorb` means "content
+  may not have reached source yet → merge, then delete"; `Discard`
+  means "already in `.yui/backup/` → delete unread". Each invariant is
+  established by the rename itself (the overwrite path backs up
+  *before* staging precisely so `Discard` holds), so recovery needs no
+  state file. `recover_staged` runs at the top of
+  `link_dir_with_backup`, **before `absorb::classify`** — a recovered
+  target reads `InSync`, so classifying first would strand the
+  leftover. Recovery is idempotent: re-merging an already-merged tree
+  is per-file content-classified, hence a no-op.
 - **backup path scheme**: mirror absolute target into
   `$DOTFILES/.yui/backup/<abs-path>` with the drive colon stripped on
   Windows (`C:\…` → `C/…`), then suffix the basename with the timestamp.
