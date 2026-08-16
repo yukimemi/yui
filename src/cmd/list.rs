@@ -1,7 +1,7 @@
 use super::*;
 use crate::config::{self, Config, IconsMode};
 use crate::icons::Icons;
-use crate::links::LinkPlan;
+use crate::links::{LinkMode, LinkPlan};
 use crate::paths;
 use crate::template;
 use crate::vars::YuiVars;
@@ -58,6 +58,10 @@ struct ListItem {
     dst: String,
     when: Option<String>,
     active: bool,
+    /// Per-entry `mode` override, if the entry declares one. `None`
+    /// means "whatever `[mount]` says", which is the common case — the
+    /// column only appears when something actually overrides.
+    mode: Option<&'static str>,
 }
 
 fn collect_list_items(source: &Utf8Path, config: &Config, yui: &YuiVars) -> Result<Vec<ListItem>> {
@@ -80,6 +84,7 @@ fn collect_list_items(source: &Utf8Path, config: &Config, yui: &YuiVars) -> Resu
             dst,
             when: entry.when.clone(),
             active,
+            mode: None,
         });
     }
 
@@ -120,6 +125,7 @@ fn collect_list_items(source: &Utf8Path, config: &Config, yui: &YuiVars) -> Resu
                 dst,
                 when: link.when.clone(),
                 active,
+                mode: link.mode.map(LinkMode::as_str),
             });
         }
     }
@@ -141,15 +147,23 @@ fn print_list_table(items: &[&ListItem], icons: Icons, color: bool) {
         .max()
         .unwrap_or(0)
         .max("DST".len());
+    // The MODE column only exists when something overrides `[mount]`.
+    // Most repos never do, and an always-empty column is just noise.
+    let mode_w = items
+        .iter()
+        .filter_map(|i| i.mode)
+        .map(|m| m.chars().count())
+        .max()
+        .map(|w| w.max("MODE".len()));
 
     let status_w = "STATUS".len();
     let arrow_w = icons.arrow.chars().count();
 
     // Header
-    print_header(status_w, src_w, arrow_w, dst_w, color);
+    print_header(status_w, src_w, arrow_w, dst_w, mode_w, color);
 
     // Separator
-    let sep = render_separator(icons.sep, status_w, src_w, arrow_w, dst_w);
+    let sep = render_separator(icons.sep, status_w, src_w, arrow_w, dst_w, mode_w);
     if color {
         use owo_colors::OwoColorize as _;
         println!("{}", sep.dimmed());
@@ -159,18 +173,29 @@ fn print_list_table(items: &[&ListItem], icons: Icons, color: bool) {
 
     // Rows
     for item in items {
-        print_row(item, icons, status_w, src_w, arrow_w, dst_w, color);
+        print_row(item, icons, status_w, src_w, arrow_w, dst_w, mode_w, color);
     }
 }
 
-fn print_header(status_w: usize, src_w: usize, arrow_w: usize, dst_w: usize, color: bool) {
+fn print_header(
+    status_w: usize,
+    src_w: usize,
+    arrow_w: usize,
+    dst_w: usize,
+    mode_w: Option<usize>,
+    color: bool,
+) {
     use owo_colors::OwoColorize as _;
     let mut line = String::new();
     let _ = write!(
         &mut line,
-        "  {:<status_w$}  {:<src_w$}  {:<arrow_w$}  {:<dst_w$}  WHEN",
+        "  {:<status_w$}  {:<src_w$}  {:<arrow_w$}  {:<dst_w$}",
         "STATUS", "SRC", "", "DST"
     );
+    if let Some(w) = mode_w {
+        let _ = write!(&mut line, "  {:<w$}", "MODE");
+    }
+    let _ = write!(&mut line, "  WHEN");
     if color {
         println!("{}", line.bold());
     } else {
@@ -184,18 +209,24 @@ fn render_separator(
     src_w: usize,
     arrow_w: usize,
     dst_w: usize,
+    mode_w: Option<usize>,
 ) -> String {
     let bar = |n: usize| sep_ch.to_string().repeat(n);
-    format!(
-        "  {}  {}  {}  {}  {}",
+    let mut out = format!(
+        "  {}  {}  {}  {}",
         bar(status_w),
         bar(src_w),
         bar(arrow_w),
         bar(dst_w),
-        bar("WHEN".len())
-    )
+    );
+    if let Some(w) = mode_w {
+        let _ = write!(&mut out, "  {}", bar(w));
+    }
+    let _ = write!(&mut out, "  {}", bar("WHEN".len()));
+    out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_row(
     item: &ListItem,
     icons: Icons,
@@ -203,6 +234,7 @@ fn print_row(
     src_w: usize,
     arrow_w: usize,
     dst_w: usize,
+    mode_w: Option<usize>,
     color: bool,
 ) {
     use owo_colors::OwoColorize as _;
@@ -231,29 +263,41 @@ fn print_row(
     let cell_src = format!("{:<src_w$}", src);
     let cell_arrow = format!("{:<arrow_w$}", arrow);
     let cell_dst = format!("{:<dst_w$}", dst);
+    // Entries without an override show `-`: the column exists because
+    // *some* entry overrides, and a blank cell would read as missing
+    // data rather than "the default applies".
+    let cell_mode = mode_w.map(|w| format!("{:<w$}", item.mode.unwrap_or("-")));
 
     if !color {
-        println!("  {cell_status}  {cell_src}  {cell_arrow}  {cell_dst}  {when_str}");
+        let mut line = format!("  {cell_status}  {cell_src}  {cell_arrow}  {cell_dst}");
+        if let Some(cell) = &cell_mode {
+            let _ = write!(&mut line, "  {cell}");
+        }
+        let _ = write!(&mut line, "  {when_str}");
+        println!("{line}");
         return;
     }
 
-    if item.active {
-        println!(
-            "  {}  {}  {}  {}  {}",
+    let mut line = if item.active {
+        format!(
+            "  {}  {}  {}  {}",
             cell_status.green(),
             cell_src.cyan(),
             cell_arrow.dimmed(),
             cell_dst.green(),
-            when_str.dimmed()
-        );
+        )
     } else {
-        println!(
-            "  {}  {}  {}  {}  {}",
+        format!(
+            "  {}  {}  {}  {}",
             cell_status.red().dimmed(),
             cell_src.dimmed(),
             cell_arrow.dimmed(),
             cell_dst.dimmed(),
-            when_str.dimmed()
-        );
+        )
+    };
+    if let Some(cell) = &cell_mode {
+        let _ = write!(&mut line, "  {}", cell.yellow());
     }
+    let _ = write!(&mut line, "  {}", when_str.dimmed());
+    println!("{line}");
 }

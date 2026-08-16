@@ -259,6 +259,34 @@ File scope doesn't claim the directory, so the rest of it still falls
 through to whatever placement an ancestor (or the parent mount)
 provides.
 
+### Per-entry `mode`
+
+`[mount] file_mode` / `dir_mode` set the mechanism for the whole repo.
+One entry can opt out with `mode`:
+
+```toml
+[[link]]
+src = "home/.config/someapp"
+dst = "~/.config/someapp"
+mode = "symlink"        # this dir only; everything else stays junction
+```
+
+That matters on Windows, where flipping `dir_mode` globally means every
+directory link needs Developer Mode or admin — a single app that refuses
+to work through a junction shouldn't cost the other twenty links their
+privilege-free default.
+
+Legal values depend on what the entry links, and a mismatch is a config
+error at declaration time rather than a surprise at link time:
+
+| entry links | `mode` | default (`auto`) |
+|---|---|---|
+| a directory | `auto` \| `symlink` \| `junction` | symlink on Unix, junction on Windows |
+| a file | `auto` \| `symlink` \| `hardlink` | symlink on Unix, hardlink on Windows |
+
+`yui list` grows a `MODE` column as soon as any entry overrides, so the
+odd one out is visible without reading the config.
+
 ### Rules for `src`
 
 - Relative, and it has to stay inside its base: `..`, absolute paths and

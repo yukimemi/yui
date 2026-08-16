@@ -2192,6 +2192,195 @@ dst = "{0}/.gitconfig-alt"
     assert!(target.join(".gitconfig-alt").exists());
 }
 
+/// A file entry can pick its mechanism without dragging the rest of the
+/// repo along. `hardlink` is the cross-platform choice to assert on:
+/// forcing a *symlink* on Windows would need Developer Mode, which is
+/// exactly the global-flip cost this feature exists to avoid.
+#[test]
+fn per_entry_mode_overrides_the_global_file_mode() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("home"));
+    let alt = utf8(tmp.path().join("alt"));
+    std::fs::create_dir_all(source.join("home/app")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::create_dir_all(&alt).unwrap();
+    std::fs::write(source.join("home/app/keep.conf"), "body\n").unwrap();
+
+    let cfg = format!(
+        r#"
+[mount]
+file_mode = "symlink"
+
+[[mount.entry]]
+src = "home"
+dst = "{}"
+
+[[link]]
+src = "home/app/keep.conf"
+dst = "{}/keep.conf"
+mode = "hardlink"
+"#,
+        toml_path(&target),
+        toml_path(&alt)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    // The overriding entry is a hardlink: same inode, and NOT a symlink.
+    let linked = alt.join("keep.conf");
+    let meta = std::fs::symlink_metadata(&linked).unwrap();
+    assert!(
+        !meta.file_type().is_symlink(),
+        "entry asked for hardlink, got a symlink"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&linked).unwrap(),
+        "body\n",
+        "hardlink should expose the source content"
+    );
+    // Writing through the link reaches source — that's what makes it a
+    // link rather than a copy.
+    std::fs::write(&linked, "edited\n").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(source.join("home/app/keep.conf")).unwrap(),
+        "edited\n"
+    );
+}
+
+/// `yui absorb <target>` re-links after copying, so it has to use the
+/// mechanism the claiming declaration asked for. Relinking with the
+/// global mode would quietly undo the override — and `classify`
+/// compares by identity, not mechanism, so a later `apply` would read
+/// InSync and never put it back.
+#[test]
+fn manual_absorb_honours_the_entry_mode() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("home"));
+    let alt = utf8(tmp.path().join("alt"));
+    std::fs::create_dir_all(source.join("home/app")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::create_dir_all(&alt).unwrap();
+    std::fs::write(source.join("home/app/keep.conf"), "from source\n").unwrap();
+
+    let cfg = format!(
+        r#"
+[mount]
+file_mode = "symlink"
+
+[[mount.entry]]
+src = "home"
+dst = "{}"
+
+[[link]]
+src = "home/app/keep.conf"
+dst = "{}/keep.conf"
+mode = "hardlink"
+"#,
+        toml_path(&target),
+        toml_path(&alt)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    // Target-side content that diverged from source — the thing manual
+    // absorb exists to pull back in.
+    let dst_file = alt.join("keep.conf");
+    std::fs::write(&dst_file, "edited on the target side\n").unwrap();
+
+    absorb(
+        Some(source.clone()),
+        dst_file.clone(),
+        /* dry_run */ false,
+        /* yes */ true,
+    )
+    .unwrap();
+
+    // Content came back…
+    assert_eq!(
+        std::fs::read_to_string(source.join("home/app/keep.conf")).unwrap(),
+        "edited on the target side\n"
+    );
+    // …and the relink used the entry's hardlink, not `[mount]`'s symlink.
+    let meta = std::fs::symlink_metadata(&dst_file).unwrap();
+    assert!(
+        !meta.file_type().is_symlink(),
+        "absorb relinked with the global symlink mode, dropping the entry's mode = \"hardlink\""
+    );
+    std::fs::write(&dst_file, "written through the link\n").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(source.join("home/app/keep.conf")).unwrap(),
+        "written through the link\n",
+        "target and source should share an inode after the relink"
+    );
+}
+
+/// The mode is rejected where it is declared, so a bad combination
+/// never reaches the link call.
+#[test]
+fn per_entry_mode_rejects_impossible_combination() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("home"));
+    std::fs::create_dir_all(source.join("home/app")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let cfg = format!(
+        r#"
+[[mount.entry]]
+src = "home"
+dst = "{0}"
+
+[[link]]
+src = "home/app"
+dst = "{0}/app"
+mode = "hardlink"
+"#,
+        toml_path(&target)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    let err = apply(Some(source.clone()), false).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("cannot link a directory"), "got {msg}");
+}
+
+/// A `.yuilink` entry carries `mode` with the same rules — the schema
+/// is shared, so a marker gets the feature for free.
+#[test]
+fn marker_entry_mode_is_validated_too() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("home"));
+    std::fs::create_dir_all(source.join("home/app")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(
+        source.join("home/app/.yuilink"),
+        format!(
+            "[[link]]\ndst = \"{}/app\"\nmode = \"hardlink\"\n",
+            toml_path(&target)
+        ),
+    )
+    .unwrap();
+
+    let cfg = format!(
+        r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+        toml_path(&target)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    let err = apply(Some(source.clone()), false).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("cannot link a directory"),
+        "got {err:#}"
+    );
+}
+
 /// The pre-0.11 `[link] file_mode / dir_mode` table now collides with
 /// the `[[link]]` array. Serde's own type error says nothing about
 /// where the keys went, so `load` intercepts the old shape.
@@ -3101,7 +3290,7 @@ fn overwrite_source_into_target_replaces_target_and_backs_up() {
         unresolved: RefCell::new(Vec::new()),
     };
 
-    overwrite_source_into_target(&src_file, &dst_file, &ctx).unwrap();
+    overwrite_source_into_target(&src_file, &dst_file, &ctx, ctx.file_mode).unwrap();
 
     // Target now matches source.
     assert_eq!(std::fs::read_to_string(&dst_file).unwrap(), "from source");
@@ -3156,7 +3345,7 @@ fn link_file_with_backup_short_circuits_when_quit_requested() {
         unresolved: RefCell::new(Vec::new()),
     };
 
-    link_file_with_backup(&src_file, &dst_file, &ctx).unwrap();
+    link_file_with_backup(&src_file, &dst_file, &ctx, ctx.file_mode).unwrap();
 
     assert_eq!(std::fs::read_to_string(&dst_file).unwrap(), dst_before);
     assert_eq!(std::fs::read_to_string(&src_file).unwrap(), src_before);
@@ -3241,7 +3430,7 @@ fn absorb_dir_stages_target_aside_and_cleans_up() {
     std::fs::write(dst_dir.join("lua/only-in-target.lua"), "T").unwrap();
 
     let ctx = dir_ctx!(cfg, plan, backup_root);
-    absorb_target_dir_into_source(&src_dir, &dst_dir, &ctx).unwrap();
+    absorb_target_dir_into_source(&src_dir, &dst_dir, &ctx, ctx.dir_mode).unwrap();
 
     assert_eq!(
         std::fs::read_to_string(src_dir.join("lua/only-in-target.lua")).unwrap(),
@@ -3280,7 +3469,7 @@ fn interrupted_absorb_staging_is_resumed_before_classify() {
     std::fs::write(staged.join("lua/rescued.lua"), "R").unwrap();
 
     let ctx = dir_ctx!(cfg, plan, backup_root);
-    link_dir_with_backup(&src_dir, &dst_dir, &ctx).unwrap();
+    link_dir_with_backup(&src_dir, &dst_dir, &ctx, ctx.dir_mode).unwrap();
 
     assert_eq!(
         std::fs::read_to_string(src_dir.join("lua/rescued.lua")).unwrap(),
@@ -3314,7 +3503,7 @@ fn interrupted_overwrite_staging_is_discarded_not_merged() {
     std::fs::write(staged.join("ghost.lua"), "G").unwrap();
 
     let ctx = dir_ctx!(cfg, plan, backup_root);
-    link_dir_with_backup(&src_dir, &dst_dir, &ctx).unwrap();
+    link_dir_with_backup(&src_dir, &dst_dir, &ctx, ctx.dir_mode).unwrap();
 
     assert!(!staged.exists(), "discard staging is swept");
     assert!(
@@ -3345,7 +3534,7 @@ fn dry_run_recovery_leaves_staging_untouched() {
 
     let mut ctx = dir_ctx!(cfg, plan, backup_root);
     ctx.dry_run = true;
-    link_dir_with_backup(&src_dir, &dst_dir, &ctx).unwrap();
+    link_dir_with_backup(&src_dir, &dst_dir, &ctx, ctx.dir_mode).unwrap();
 
     assert!(staged.exists(), "dry-run must not sweep staging");
     assert!(!src_dir.join("kept.lua").exists(), "dry-run must not merge");
@@ -3377,7 +3566,7 @@ fn quit_during_dir_absorb_restores_the_target() {
 
     let mut ctx = dir_ctx!(cfg, plan, backup_root);
     ctx.quit_requested = Cell::new(true);
-    absorb_target_dir_into_source(&src_dir, &dst_dir, &ctx).unwrap();
+    absorb_target_dir_into_source(&src_dir, &dst_dir, &ctx, ctx.dir_mode).unwrap();
 
     assert!(
         paths::scan_staged(&dst_dir).is_empty(),
