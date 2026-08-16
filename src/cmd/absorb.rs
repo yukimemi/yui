@@ -1,7 +1,7 @@
 use super::*;
 use crate::config::{self, Config};
 use crate::link::{resolve_dir_mode, resolve_file_mode};
-use crate::links::LinkPlan;
+use crate::links::{LinkMode, LinkPlan};
 use crate::paths;
 use crate::template;
 use crate::vars::YuiVars;
@@ -39,9 +39,11 @@ pub fn absorb(
     let mut engine = template::Engine::new();
     let tera_ctx = template::template_context(&yui, &config.vars);
 
-    let src_path = match find_source_for_target(&source, &config, &target, &mut engine, &tera_ctx)?
-    {
-        Some(s) => s,
+    let TargetMatch {
+        src: src_path,
+        mode,
+    } = match find_source_for_target(&source, &config, &target, &mut engine, &tera_ctx)? {
+        Some(m) => m,
         None => anyhow::bail!(
             "no mount entry / .yuilink override claims target {target}; \
                  pass a path inside a known dst"
@@ -93,11 +95,16 @@ pub fn absorb(
     };
 
     // Manual absorb is an explicit user request — bypass `auto`,
-    // `require_clean_git`, and `on_anomaly` policy entirely.
+    // `require_clean_git`, and `on_anomaly` policy entirely. The
+    // mechanism still follows the declaration that claims this target:
+    // relinking with the global mode would quietly undo a per-entry
+    // `mode`, and `classify` compares by identity rather than
+    // mechanism, so a later `apply` would see InSync and never put it
+    // back.
     if target.is_dir() {
-        absorb_target_dir_into_source(&src_path, &target, &ctx)
+        absorb_target_dir_into_source(&src_path, &target, &ctx, ctx.dir_mode_for(mode))
     } else {
-        absorb_target_into_source(&src_path, &target, &ctx)
+        absorb_target_into_source(&src_path, &target, &ctx, ctx.file_mode_for(mode))
     }
 }
 
@@ -204,6 +211,14 @@ fn prompt_yes_no(question: &str) -> Result<bool> {
     Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
+/// What claims a target: the source path it maps back to, plus the
+/// mechanism the claiming declaration asked for (`None` = whatever
+/// `[mount]` says).
+pub(crate) struct TargetMatch {
+    pub(crate) src: Utf8PathBuf,
+    pub(crate) mode: Option<LinkMode>,
+}
+
 /// Walk mount entries + every `[[link]]` declaration (central table and
 /// `.yuilink` markers) to find the source file/dir that the given target
 /// maps back to. Returns `None` when nothing claims the path.
@@ -213,7 +228,7 @@ fn find_source_for_target(
     target: &Utf8Path,
     engine: &mut template::Engine,
     tera_ctx: &TeraContext,
-) -> Result<Option<Utf8PathBuf>> {
+) -> Result<Option<TargetMatch>> {
     // 1. Mount entries — render dst, see if target is inside it.
     for entry in &config.mount.entry {
         if let Some(when) = &entry.when {
@@ -246,7 +261,11 @@ fn find_source_for_target(
             )? {
                 continue;
             }
-            return Ok(Some(candidate));
+            // A mount entry carries no mechanism of its own.
+            return Ok(Some(TargetMatch {
+                src: candidate,
+                mode: None,
+            }));
         }
     }
 
@@ -282,13 +301,25 @@ fn find_source_for_target(
                 if !file_src.is_file() {
                     anyhow::bail!("{} not found", link.describe(&dir));
                 }
-                return Ok(Some(file_src));
+                return Ok(Some(TargetMatch {
+                    src: file_src,
+                    mode: link.mode,
+                }));
             }
             if target == dst {
-                return Ok(Some(dir));
+                return Ok(Some(TargetMatch {
+                    src: dir,
+                    mode: link.mode,
+                }));
             }
             if let Ok(rel) = target.strip_prefix(&dst) {
-                return Ok(Some(dir.join(rel)));
+                // A path *inside* a dir-scoped link: what gets relinked
+                // is that file, so the directory's mechanism doesn't
+                // apply to it. Fall back to the file default.
+                return Ok(Some(TargetMatch {
+                    src: dir.join(rel),
+                    mode: None,
+                }));
             }
         }
     }

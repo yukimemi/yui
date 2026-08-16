@@ -2,7 +2,7 @@ use super::*;
 use crate::config::{self, Config, HookPhase, MountStrategy};
 use crate::hook;
 use crate::link::{self, EffectiveDirMode, EffectiveFileMode, resolve_dir_mode, resolve_file_mode};
-use crate::links::{self, LinkPlan};
+use crate::links::{self, LinkMode, LinkPlan};
 use crate::mount::{self, ResolvedMount};
 use crate::render::{self, RenderReport};
 use crate::secret;
@@ -278,6 +278,25 @@ pub(crate) struct ApplyCtx<'a> {
     pub(crate) unresolved: RefCell<Vec<Utf8PathBuf>>,
 }
 
+impl ApplyCtx<'_> {
+    /// Effective file mode for one `[[link]]` entry: its own `mode`
+    /// when it declares one, the `[mount]` default otherwise. The
+    /// entry's value was validated against its kind at declaration
+    /// time, so a `junction` can't reach here.
+    pub(crate) fn file_mode_for(&self, mode: Option<LinkMode>) -> EffectiveFileMode {
+        mode.and_then(|m| m.as_file())
+            .map(resolve_file_mode)
+            .unwrap_or(self.file_mode)
+    }
+
+    /// Directory counterpart of [`Self::file_mode_for`].
+    pub(crate) fn dir_mode_for(&self, mode: Option<LinkMode>) -> EffectiveDirMode {
+        mode.and_then(|m| m.as_dir())
+            .map(resolve_dir_mode)
+            .unwrap_or(self.dir_mode)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_mount(
     m: &ResolvedMount,
@@ -356,7 +375,7 @@ fn walk_and_link_body(
         // Empty marker = junction this dir at the natural mount-derived
         // dst. Subsequent recursion keeps going so descendant markers
         // can layer on extra dsts.
-        link_dir_with_backup(src_dir, dst_dir, ctx)?;
+        link_dir_with_backup(src_dir, dst_dir, ctx, ctx.dir_mode)?;
         covered = true;
     }
     if !spec.links.is_empty() {
@@ -378,10 +397,10 @@ fn walk_and_link_body(
                     if !file_src.is_file() {
                         anyhow::bail!("{} not found", link.describe(src_dir));
                     }
-                    link_file_with_backup(&file_src, &dst, ctx)?;
+                    link_file_with_backup(&file_src, &dst, ctx, ctx.file_mode_for(link.mode))?;
                 }
                 None => {
-                    link_dir_with_backup(src_dir, &dst, ctx)?;
+                    link_dir_with_backup(src_dir, &dst, ctx, ctx.dir_mode_for(link.mode))?;
                     emitted_dir_link = true;
                 }
             }
@@ -431,7 +450,7 @@ fn walk_and_link_body(
             // (and on Windows might land at a path that's already
             // hard-linked through the parent).
             if !covered {
-                link_file_with_backup(&src_path, &dst_path, ctx)?;
+                link_file_with_backup(&src_path, &dst_path, ctx, ctx.file_mode)?;
             }
         }
     }
@@ -442,6 +461,7 @@ pub(crate) fn link_file_with_backup(
     src: &Utf8Path,
     dst: &Utf8Path,
     ctx: &ApplyCtx<'_>,
+    mode: EffectiveFileMode,
 ) -> Result<()> {
     use absorb::AbsorbDecision::*;
 
@@ -463,7 +483,7 @@ pub(crate) fn link_file_with_backup(
         }
         Restore => {
             info!("link: {src} → {dst}");
-            link::link_file(src, dst, ctx.file_mode)?;
+            link::link_file(src, dst, mode)?;
             Ok(())
         }
         RelinkOnly => {
@@ -471,7 +491,7 @@ pub(crate) fn link_file_with_backup(
             // editor's atomic save). Re-link without touching source.
             info!("relink: {src} → {dst}");
             link::unlink(dst)?;
-            link::link_file(src, dst, ctx.file_mode)?;
+            link::link_file(src, dst, mode)?;
             Ok(())
         }
         AutoAbsorb => {
@@ -482,6 +502,7 @@ pub(crate) fn link_file_with_backup(
                     src,
                     dst,
                     ctx,
+                    mode,
                     "absorb.auto = false; treating divergence as anomaly",
                 );
             }
@@ -490,15 +511,17 @@ pub(crate) fn link_file_with_backup(
                     src,
                     dst,
                     ctx,
+                    mode,
                     "source repo is dirty; deferring auto-absorb",
                 );
             }
-            absorb_target_into_source(src, dst, ctx)
+            absorb_target_into_source(src, dst, ctx, mode)
         }
         NeedsConfirm => handle_anomaly(
             src,
             dst,
             ctx,
+            mode,
             "anomaly: source equals/newer than target but content differs",
         ),
     }
@@ -511,12 +534,13 @@ pub(crate) fn absorb_target_into_source(
     src: &Utf8Path,
     dst: &Utf8Path,
     ctx: &ApplyCtx<'_>,
+    mode: EffectiveFileMode,
 ) -> Result<()> {
     info!("absorb: {dst} → {src}");
     backup_existing(src, ctx.backup_root, /* is_dir */ false)?;
     std::fs::copy(dst, src)?;
     link::unlink(dst)?;
-    link::link_file(src, dst, ctx.file_mode)?;
+    link::link_file(src, dst, mode)?;
     Ok(())
 }
 
@@ -529,11 +553,12 @@ pub(crate) fn overwrite_source_into_target(
     src: &Utf8Path,
     dst: &Utf8Path,
     ctx: &ApplyCtx<'_>,
+    mode: EffectiveFileMode,
 ) -> Result<()> {
     info!("overwrite: {src} → {dst}");
     backup_existing(dst, ctx.backup_root, /* is_dir */ false)?;
     link::unlink(dst)?;
-    link::link_file(src, dst, ctx.file_mode)?;
+    link::link_file(src, dst, mode)?;
     Ok(())
 }
 
@@ -553,7 +578,13 @@ fn note_unresolved(ctx: &ApplyCtx<'_>, dst: &Utf8Path, reason: &str) {
 ///   - `force` → behave like AutoAbsorb (target wins)
 ///   - `ask`   → on a TTY, show diff + prompt. Off-TTY, leave the target
 ///     alone and record it as unresolved.
-fn handle_anomaly(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>, reason: &str) -> Result<()> {
+fn handle_anomaly(
+    src: &Utf8Path,
+    dst: &Utf8Path,
+    ctx: &ApplyCtx<'_>,
+    mode: EffectiveFileMode,
+    reason: &str,
+) -> Result<()> {
     use crate::config::AnomalyAction::*;
     match ctx.config.absorb.on_anomaly {
         Skip => {
@@ -562,11 +593,11 @@ fn handle_anomaly(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>, reason: &s
         }
         Force => {
             warn!("anomaly force: {dst} ({reason}) — absorbing target into source");
-            absorb_target_into_source(src, dst, ctx)
+            absorb_target_into_source(src, dst, ctx, mode)
         }
         Ask => match prompt_anomaly(ctx, src, dst, reason)? {
-            AnomalyChoice::Absorb => absorb_target_into_source(src, dst, ctx),
-            AnomalyChoice::Overwrite => overwrite_source_into_target(src, dst, ctx),
+            AnomalyChoice::Absorb => absorb_target_into_source(src, dst, ctx, mode),
+            AnomalyChoice::Overwrite => overwrite_source_into_target(src, dst, ctx, mode),
             AnomalyChoice::Skip => {
                 warn!("anomaly skipped by user: {dst}");
                 Ok(())
@@ -899,6 +930,7 @@ pub(crate) fn link_dir_with_backup(
     src: &Utf8Path,
     dst: &Utf8Path,
     ctx: &ApplyCtx<'_>,
+    mode: EffectiveDirMode,
 ) -> Result<()> {
     use absorb::AbsorbDecision::*;
 
@@ -926,7 +958,7 @@ pub(crate) fn link_dir_with_backup(
         InSync => Ok(()),
         Restore => {
             info!("link dir: {src} → {dst}");
-            link::link_dir(src, dst, ctx.dir_mode)?;
+            link::link_dir(src, dst, mode)?;
             Ok(())
         }
         RelinkOnly => {
@@ -936,7 +968,7 @@ pub(crate) fn link_dir_with_backup(
             // so just swap the target for a junction to source.
             info!("relink dir: {src} → {dst}");
             remove_dir_link_or_real(dst)?;
-            link::link_dir(src, dst, ctx.dir_mode)?;
+            link::link_dir(src, dst, mode)?;
             Ok(())
         }
         AutoAbsorb | NeedsConfirm => {
@@ -965,6 +997,7 @@ pub(crate) fn link_dir_with_backup(
                     src,
                     dst,
                     ctx,
+                    mode,
                     "absorb.auto = false; treating divergence as anomaly",
                 );
             }
@@ -973,10 +1006,11 @@ pub(crate) fn link_dir_with_backup(
                     src,
                     dst,
                     ctx,
+                    mode,
                     "source repo is dirty; deferring auto-absorb",
                 );
             }
-            absorb_target_dir_into_source(src, dst, ctx)
+            absorb_target_dir_into_source(src, dst, ctx, mode)
         }
     }
 }
@@ -1338,6 +1372,7 @@ pub(crate) fn absorb_target_dir_into_source(
     src: &Utf8Path,
     dst: &Utf8Path,
     ctx: &ApplyCtx<'_>,
+    mode: EffectiveDirMode,
 ) -> Result<()> {
     info!("absorb dir: {dst} → {src}");
     backup_existing(src, ctx.backup_root, /* is_dir */ true)?;
@@ -1346,7 +1381,7 @@ pub(crate) fn absorb_target_dir_into_source(
         Ok(Some(staged)) => staged,
         // Target vanished under us between classify and now — there is
         // nothing left to absorb, so just expose source.
-        Ok(None) => return link::link_dir(src, dst, ctx.dir_mode).map_err(Into::into),
+        Ok(None) => return link::link_dir(src, dst, mode).map_err(Into::into),
         Err(e) => {
             warn!("cannot stage {dst} aside ({e:#}) — falling back to in-place teardown");
             merge_dir_target_into_source(dst, src, ctx)?;
@@ -1359,12 +1394,12 @@ pub(crate) fn absorb_target_dir_into_source(
                 return Ok(());
             }
             remove_dir_link_or_real(dst)?;
-            link::link_dir(src, dst, ctx.dir_mode)?;
+            link::link_dir(src, dst, mode)?;
             return Ok(());
         }
     };
 
-    link::link_dir(src, dst, ctx.dir_mode)?;
+    link::link_dir(src, dst, mode)?;
     merge_dir_target_into_source(&staged, src, ctx)?;
 
     // If the user picked `[q]uit` at a prompt during the merge, put the
@@ -1396,19 +1431,20 @@ fn overwrite_source_dir_into_target(
     src: &Utf8Path,
     dst: &Utf8Path,
     ctx: &ApplyCtx<'_>,
+    mode: EffectiveDirMode,
 ) -> Result<()> {
     info!("overwrite dir: {src} → {dst}");
     backup_existing(dst, ctx.backup_root, /* is_dir */ true)?;
     match stage_aside(dst, paths::StagedKind::Discard) {
         Ok(Some(staged)) => {
-            link::link_dir(src, dst, ctx.dir_mode)?;
+            link::link_dir(src, dst, mode)?;
             remove_staged(&staged);
         }
-        Ok(None) => link::link_dir(src, dst, ctx.dir_mode)?,
+        Ok(None) => link::link_dir(src, dst, mode)?,
         Err(e) => {
             warn!("cannot stage {dst} aside ({e:#}) — falling back to in-place teardown");
             remove_dir_link_or_real(dst)?;
-            link::link_dir(src, dst, ctx.dir_mode)?;
+            link::link_dir(src, dst, mode)?;
         }
     }
     Ok(())
@@ -1422,6 +1458,7 @@ fn handle_anomaly_dir(
     src: &Utf8Path,
     dst: &Utf8Path,
     ctx: &ApplyCtx<'_>,
+    mode: EffectiveDirMode,
     reason: &str,
 ) -> Result<()> {
     use crate::config::AnomalyAction::*;
@@ -1435,11 +1472,11 @@ fn handle_anomaly_dir(
                 "anomaly force dir: {dst} ({reason}) \
                  — absorbing target into source"
             );
-            absorb_target_dir_into_source(src, dst, ctx)
+            absorb_target_dir_into_source(src, dst, ctx, mode)
         }
         Ask => match prompt_anomaly(ctx, src, dst, reason)? {
-            AnomalyChoice::Absorb => absorb_target_dir_into_source(src, dst, ctx),
-            AnomalyChoice::Overwrite => overwrite_source_dir_into_target(src, dst, ctx),
+            AnomalyChoice::Absorb => absorb_target_dir_into_source(src, dst, ctx, mode),
+            AnomalyChoice::Overwrite => overwrite_source_dir_into_target(src, dst, ctx, mode),
             AnomalyChoice::Skip => {
                 warn!("anomaly skipped by user: {dst}");
                 Ok(())

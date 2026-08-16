@@ -107,7 +107,15 @@ before reverting any of them.
 - **Link modes live in `[mount]`** (`file_mode` / `dir_mode`). They used
   to be a `[link]` table; that key is now the `[[link]]` array, and
   `config::load` intercepts the old table shape with a migration error
-  rather than letting serde emit a type error about a sequence.
+  rather than letting serde emit a type error about a sequence. A single
+  `[[link]]` entry may override the mechanism with `mode` — legal values
+  depend on what it links (dirs: `auto`/`symlink`/`junction`, files:
+  `auto`/`symlink`/`hardlink`), validated where the entry is declared.
+  The override exists because flipping `dir_mode` globally on Windows
+  costs every link its privilege-free default just to accommodate one
+  junction-hostile app. The effective mode is passed down the link /
+  absorb call chain as an argument — no ambient state, so a nested
+  per-file conflict inside a dir merge can't pick up the dir's override.
 - **Templates are `*.tera` files; rendered output goes to the *same
   directory* as the template.** `home/.gitconfig.tera` →
   `home/.gitconfig`. Rendered files are listed in a managed section

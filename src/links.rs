@@ -32,6 +32,7 @@ use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
 use tracing::warn;
 
+use crate::config::{DirLinkMode, FileLinkMode};
 use crate::marker::{self, MarkerSpec};
 use crate::paths;
 use crate::{Error, Result};
@@ -49,6 +50,80 @@ pub struct LinkEntry {
     /// Tera expression gating the entry.
     #[serde(default)]
     pub when: Option<String>,
+    /// Link mechanism for this entry only, overriding `[mount]
+    /// file_mode` / `dir_mode`. One awkward app (a watcher that
+    /// resolves reparse points, an installer that rewrites in place)
+    /// shouldn't force the whole repo onto a different mechanism —
+    /// especially on Windows, where symlinks need Developer Mode or
+    /// admin and the `auto` default exists to avoid exactly that.
+    #[serde(default)]
+    pub mode: Option<LinkMode>,
+}
+
+/// Per-entry `mode` as written. Which values are legal depends on what
+/// the entry links: a directory can't be hardlinked, a file can't be a
+/// junction. Resolution to an effective mode goes through
+/// [`LinkMode::as_dir`] / [`LinkMode::as_file`], which return `None`
+/// for the combination that doesn't exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LinkMode {
+    Auto,
+    Symlink,
+    Hardlink,
+    Junction,
+}
+
+impl LinkMode {
+    pub fn as_dir(self) -> Option<DirLinkMode> {
+        match self {
+            Self::Auto => Some(DirLinkMode::Auto),
+            Self::Symlink => Some(DirLinkMode::Symlink),
+            Self::Junction => Some(DirLinkMode::Junction),
+            Self::Hardlink => None,
+        }
+    }
+
+    pub fn as_file(self) -> Option<FileLinkMode> {
+        match self {
+            Self::Auto => Some(FileLinkMode::Auto),
+            Self::Symlink => Some(FileLinkMode::Symlink),
+            Self::Hardlink => Some(FileLinkMode::Hardlink),
+            Self::Junction => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Symlink => "symlink",
+            Self::Hardlink => "hardlink",
+            Self::Junction => "junction",
+        }
+    }
+}
+
+/// Reject `mode = "hardlink"` on a directory and `mode = "junction"` on
+/// a file at declaration time — both are config bugs with no sensible
+/// runtime interpretation.
+pub fn validate_mode(mode: LinkMode, dir_scoped: bool, label: &str) -> Result<()> {
+    let ok = if dir_scoped {
+        mode.as_dir().is_some()
+    } else {
+        mode.as_file().is_some()
+    };
+    if ok {
+        return Ok(());
+    }
+    let (kind, allowed) = if dir_scoped {
+        ("a directory", "auto | symlink | junction")
+    } else {
+        ("a file", "auto | symlink | hardlink")
+    };
+    Err(Error::Config(format!(
+        "{label}: mode = {:?} cannot link {kind} ({allowed})",
+        mode.as_str()
+    )))
 }
 
 /// Diagnostic prefix for the central table. Every `config.toml`-sourced
@@ -86,6 +161,9 @@ pub struct DirLink {
     pub dst: String,
     pub when: Option<String>,
     pub origin: Origin,
+    /// Per-entry mechanism override, already validated against the
+    /// entry's kind.
+    pub mode: Option<LinkMode>,
 }
 
 impl DirLink {
@@ -107,6 +185,15 @@ pub struct DirSpec {
     pub passthrough: bool,
     pub links: Vec<DirLink>,
 }
+
+/// What makes two `[[link]]` declarations "the same": target-relative
+/// path, dst template, `when` guard and mechanism.
+type DedupeKey = (
+    Option<Utf8PathBuf>,
+    String,
+    Option<String>,
+    Option<LinkMode>,
+);
 
 /// Central `[[link]]` entries, keyed by the source directory the walk
 /// has to be standing in for them to fire.
@@ -153,12 +240,16 @@ impl LinkPlan {
                 })?;
                 (parent, Some(Utf8PathBuf::from(name)))
             };
+            if let Some(mode) = entry.mode {
+                validate_mode(mode, rel.is_none(), &format!("{CONFIG_LABEL} src={src}"))?;
+            }
             by_dir.entry(dir).or_default().push(DirLink {
                 rel,
                 declared: Some(src.clone()),
                 dst: entry.dst.clone(),
                 when: entry.when.clone(),
                 origin: Origin::Config,
+                mode: entry.mode,
             });
         }
         Ok(Self { by_dir })
@@ -188,6 +279,7 @@ impl LinkPlan {
                         dst: e.dst,
                         when: e.when,
                         origin: Origin::Marker,
+                        mode: e.mode,
                     }));
                 }
             }
@@ -195,9 +287,12 @@ impl LinkPlan {
         if let Some(central) = self.by_dir.get(dir) {
             spec.links.extend(central.iter().cloned());
         }
-        let mut seen: BTreeSet<(Option<Utf8PathBuf>, String, Option<String>)> = BTreeSet::new();
+        // Dedupe on everything that decides what gets linked and how:
+        // the same dst reached with two different mechanisms is a
+        // genuine (if odd) pair of declarations, not a duplicate.
+        let mut seen: BTreeSet<DedupeKey> = BTreeSet::new();
         spec.links
-            .retain(|l| seen.insert((l.rel.clone(), l.dst.clone(), l.when.clone())));
+            .retain(|l| seen.insert((l.rel.clone(), l.dst.clone(), l.when.clone(), l.mode)));
         Ok(spec)
     }
 
@@ -297,6 +392,14 @@ mod tests {
             src: Some(Utf8PathBuf::from(src)),
             dst: dst.to_string(),
             when: None,
+            mode: None,
+        }
+    }
+
+    fn entry_with_mode(src: &str, dst: &str, mode: LinkMode) -> LinkEntry {
+        LinkEntry {
+            mode: Some(mode),
+            ..entry(src, dst)
         }
     }
 
@@ -352,6 +455,7 @@ mod tests {
                 src: None,
                 dst: "/t".to_string(),
                 when: None,
+                mode: None,
             }],
         )
         .unwrap_err();
@@ -441,6 +545,67 @@ mod tests {
             .dir_spec(&source.join("home/.config/nvim"), ".yuilink", true)
             .unwrap();
         assert_eq!(spec.links.len(), 2);
+    }
+
+    /// A directory can't be hardlinked and a file can't be a junction;
+    /// both are caught where the entry is declared, not at link time.
+    #[test]
+    fn mode_is_validated_against_the_entry_kind() {
+        let tmp = TempDir::new().unwrap();
+        let source = root(&tmp);
+        std::fs::create_dir_all(source.join("home/dir")).unwrap();
+        std::fs::write(source.join("home/file.txt"), "x").unwrap();
+
+        let err = LinkPlan::from_config(
+            &source,
+            &[entry_with_mode("home/dir", "/t/dir", LinkMode::Hardlink)],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("cannot link a directory"),
+            "{err}"
+        );
+
+        let err = LinkPlan::from_config(
+            &source,
+            &[entry_with_mode("home/file.txt", "/t/f", LinkMode::Junction)],
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("cannot link a file"), "{err}");
+
+        // The legal combinations survive.
+        LinkPlan::from_config(
+            &source,
+            &[
+                entry_with_mode("home/dir", "/t/dir", LinkMode::Symlink),
+                entry_with_mode("home/file.txt", "/t/f", LinkMode::Hardlink),
+            ],
+        )
+        .unwrap();
+    }
+
+    /// `mode` rides along to the walk, and two entries that differ only
+    /// by mechanism are two declarations, not a duplicate.
+    #[test]
+    fn mode_reaches_the_dir_spec_and_survives_dedupe() {
+        let tmp = TempDir::new().unwrap();
+        let source = root(&tmp);
+        std::fs::create_dir_all(source.join("home/app")).unwrap();
+        let plan = LinkPlan::from_config(
+            &source,
+            &[
+                entry("home/app", "/t/app"),
+                entry_with_mode("home/app", "/t/app", LinkMode::Symlink),
+            ],
+        )
+        .unwrap();
+
+        let spec = plan
+            .dir_spec(&source.join("home/app"), ".yuilink", true)
+            .unwrap();
+        assert_eq!(spec.links.len(), 2);
+        assert_eq!(spec.links[0].mode, None);
+        assert_eq!(spec.links[1].mode, Some(LinkMode::Symlink));
     }
 
     /// `per-file` mounts ignore markers; a central entry is an explicit

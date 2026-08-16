@@ -113,6 +113,10 @@ pub fn read_spec(dir: &Utf8Path, marker_filename: &str) -> Result<Option<MarkerS
                 )));
             }
         }
+        if let Some(mode) = link.mode {
+            // `src` present = file scope, absent = this directory.
+            links::validate_mode(mode, link.src.is_none(), &format!("parse {path}: [[link]]"))?;
+        }
     }
     Ok(Some(MarkerSpec::Explicit { links: parsed.link }))
 }

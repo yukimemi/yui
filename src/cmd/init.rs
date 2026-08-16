@@ -194,11 +194,14 @@ dst = "~"
 
 # Explicit links, declared centrally instead of with a `.yuilink`
 # marker file in the tree. `src` is relative to $DOTFILES and may name
-# a directory (linked as one unit) or a single file.
+# a directory (linked as one unit) or a single file. `mode` overrides
+# the [mount] mechanism for that entry alone — dirs take
+# auto|symlink|junction, files auto|symlink|hardlink.
 # [[link]]
 # src = "home/.config/nvim"
 # dst = "{{ env(name='LOCALAPPDATA') }}/nvim"
 # when = "yui.os == 'windows'"
+# mode = "symlink"
 "#;
 
 const SKELETON_GITIGNORE: &str = r#"# yui per-machine state and backups (regenerable, do not commit).
