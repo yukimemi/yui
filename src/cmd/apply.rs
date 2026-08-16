@@ -11,7 +11,7 @@ use crate::vars::YuiVars;
 use crate::{absorb, backup, paths};
 use anyhow::{Context as _, Result};
 use camino::{Utf8Path, Utf8PathBuf};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use teravars::Context as TeraContext;
 use tracing::{info, warn};
 
@@ -22,6 +22,20 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
 
     let mut engine = template::Engine::new();
     let tera_ctx = template::template_context(&yui, &config.vars);
+
+    // Snapshot the git-clean state *before* this run writes anything.
+    // Two reasons it can't wait until the link pass:
+    //   - a whole-dir absorb copies target content into source, so the
+    //     second absorb in a run would see the dirt the first one made
+    //   - apply itself writes `.yui/state.json` (hook state) and
+    //     rendered files along the way
+    // The gate asks "was the user's work committed before yui started",
+    // and that question has exactly one answer per run.
+    let source_clean = if config.absorb.require_clean_git {
+        source_repo_is_clean(&source)
+    } else {
+        true
+    };
 
     // 0. Pre-apply hooks (before render / link). Bail on hook failure so
     //    apply doesn't proceed past a broken bootstrap.
@@ -98,7 +112,6 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     plan.warn_unreachable(mounts.iter().map(|m| m.src.as_path()));
     let ctx = ApplyCtx {
         config: &config,
-        source: &source,
         plan: &plan,
         file_mode: resolve_file_mode(config.mount.file_mode),
         dir_mode: resolve_dir_mode(config.mount.dir_mode),
@@ -106,6 +119,8 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
         dry_run,
         sticky_anomaly: Cell::new(None),
         quit_requested: Cell::new(false),
+        source_clean,
+        unresolved: RefCell::new(Vec::new()),
     };
 
     info!("source: {source}");
@@ -139,6 +154,23 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
         HookPhase::Post,
         dry_run,
     )?;
+
+    // 4. Anything the run couldn't decide fails the run — silence here
+    //    used to make "linked everything" and "left a declared link
+    //    unmade" look identical from the outside. Each entry already
+    //    logged its path and reason when it was hit (`note_unresolved`),
+    //    so this only needs the count and the way out.
+    let unresolved = ctx.unresolved.borrow();
+    if !unresolved.is_empty() {
+        anyhow::bail!(
+            "apply: {} anomal{} left unresolved (see the warnings above) — no TTY \
+             to ask at with [absorb] on_anomaly = \"ask\"; set on_anomaly to \
+             \"force\" (target wins) or \"skip\" (leave them) to make this \
+             deterministic",
+            unresolved.len(),
+            if unresolved.len() == 1 { "y" } else { "ies" }
+        );
+    }
     Ok(())
 }
 
@@ -191,6 +223,11 @@ pub(crate) enum AnomalyChoice {
     Overwrite,
     /// Leave both as-is for now.
     Skip,
+    /// Nobody could be asked — `on_anomaly = "ask"` with no TTY. The
+    /// *action* is the same as `Skip` (do nothing, it's the safe one),
+    /// but it is not a decision, so callers record it and `apply`
+    /// reports it at the end instead of exiting as if all was well.
+    Unresolved,
     /// Skip this entry and stop walking remaining entries.
     Quit,
 }
@@ -214,8 +251,6 @@ enum RenderDriftChoice {
 
 pub(crate) struct ApplyCtx<'a> {
     pub(crate) config: &'a Config,
-    /// Source repo root — needed for git-clean checks during absorb.
-    pub(crate) source: &'a Utf8Path,
     /// Central `[[link]]` declarations from `config.toml`, keyed by the
     /// source dir the walk has to reach for them to fire.
     pub(crate) plan: &'a LinkPlan,
@@ -230,6 +265,17 @@ pub(crate) struct ApplyCtx<'a> {
     /// of every link op and short-circuits to a no-op so apply exits
     /// cleanly without further prompts.
     pub(crate) quit_requested: Cell<bool>,
+    /// Was the source repo clean when this run started?
+    ///
+    /// Snapshotted once on purpose: a whole-dir absorb copies target
+    /// content into source, so anything not gitignored makes the repo
+    /// dirty *mid-run* and would defer every later absorb. The
+    /// `require_clean_git` gate is about the user's uncommitted work,
+    /// not about what this run just produced.
+    pub(crate) source_clean: bool,
+    /// Anomalies left unresolved because there was no TTY to ask at.
+    /// Surfaced together when the walk is over.
+    pub(crate) unresolved: RefCell<Vec<Utf8PathBuf>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -439,7 +485,7 @@ pub(crate) fn link_file_with_backup(
                     "absorb.auto = false; treating divergence as anomaly",
                 );
             }
-            if ctx.config.absorb.require_clean_git && !source_repo_is_clean(ctx.source) {
+            if ctx.config.absorb.require_clean_git && !ctx.source_clean {
                 return handle_anomaly(
                     src,
                     dst,
@@ -491,11 +537,22 @@ pub(crate) fn overwrite_source_into_target(
     Ok(())
 }
 
+/// Log + record an anomaly nobody could be asked about.
+fn note_unresolved(ctx: &ApplyCtx<'_>, dst: &Utf8Path, reason: &str) {
+    warn!(
+        "anomaly unresolved: {dst} ({reason}) — no TTY to ask at, and \
+         [absorb] on_anomaly = \"ask\"; set it to \"force\" or \"skip\" \
+         to decide up front"
+    );
+    ctx.unresolved.borrow_mut().push(dst.to_path_buf());
+}
+
 /// Decide what to do for an anomaly (NeedsConfirm or AutoAbsorb that was
 /// escalated by `auto = false` / dirty git). Per `[absorb] on_anomaly`:
 ///   - `skip`  → log warning, leave target alone
 ///   - `force` → behave like AutoAbsorb (target wins)
-///   - `ask`   → on a TTY, show diff + prompt. Off-TTY, downgrade to skip.
+///   - `ask`   → on a TTY, show diff + prompt. Off-TTY, leave the target
+///     alone and record it as unresolved.
 fn handle_anomaly(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>, reason: &str) -> Result<()> {
     use crate::config::AnomalyAction::*;
     match ctx.config.absorb.on_anomaly {
@@ -512,6 +569,10 @@ fn handle_anomaly(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>, reason: &s
             AnomalyChoice::Overwrite => overwrite_source_into_target(src, dst, ctx),
             AnomalyChoice::Skip => {
                 warn!("anomaly skipped by user: {dst}");
+                Ok(())
+            }
+            AnomalyChoice::Unresolved => {
+                note_unresolved(ctx, dst, reason);
                 Ok(())
             }
             AnomalyChoice::Quit => {
@@ -535,9 +596,10 @@ fn handle_anomaly(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>, reason: &s
 /// `ctx.sticky_anomaly`. `[q]uit` flips `ctx.quit_requested` so the
 /// walker stops calling per-entry link ops.
 ///
-/// Off-TTY: returns `Skip` immediately (caller logs the downgrade) —
-/// matches the previous "non-TTY ask = skip" behaviour. Quit is not
-/// possible without a TTY because there is nothing to interact with.
+/// Off-TTY: returns `Unresolved` immediately. The target is left alone
+/// either way, but the caller records it so the run can report what it
+/// didn't do — nobody chose this, there was just nobody to ask. Quit is
+/// not possible without a TTY because there is nothing to interact with.
 pub(crate) fn prompt_anomaly(
     ctx: &ApplyCtx<'_>,
     src: &Utf8Path,
@@ -558,7 +620,7 @@ pub(crate) fn prompt_anomaly(
     use std::io::IsTerminal;
     use std::io::Write as _;
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
-        return Ok(AnomalyChoice::Skip);
+        return Ok(AnomalyChoice::Unresolved);
     }
 
     eprintln!();
@@ -906,7 +968,7 @@ pub(crate) fn link_dir_with_backup(
                     "absorb.auto = false; treating divergence as anomaly",
                 );
             }
-            if ctx.config.absorb.require_clean_git && !source_repo_is_clean(ctx.source) {
+            if ctx.config.absorb.require_clean_git && !ctx.source_clean {
                 return handle_anomaly_dir(
                     src,
                     dst,
@@ -1064,7 +1126,8 @@ fn merge_dir_target_into_source(
 ///     - `skip` → leave source alone, target's version is dropped
 ///       (after the outer junction, target ends up with source's content)
 ///     - `force` → copy target → source (target wins anyway)
-///     - `ask` → TTY prompt with diff; downgrade to skip off-TTY
+///     - `ask` → TTY prompt with diff; off-TTY it is recorded as
+///       unresolved (`note_unresolved`) and fails the run at the end
 fn merge_resolve_file_conflict(
     target_path: &Utf8Path,
     source_path: &Utf8Path,
@@ -1135,6 +1198,14 @@ fn merge_resolve_file_conflict(
                         }
                         AnomalyChoice::Skip => {
                             warn!("merge: kept source version by user choice: {source_path}");
+                            Ok(())
+                        }
+                        AnomalyChoice::Unresolved => {
+                            note_unresolved(
+                                ctx,
+                                target_path,
+                                "merge: file content differs and source is newer",
+                            );
                             Ok(())
                         }
                         AnomalyChoice::Quit => {
@@ -1345,7 +1416,8 @@ fn overwrite_source_dir_into_target(
 
 /// Dir-level counterpart to `handle_anomaly`. Same `[absorb] on_anomaly`
 /// dispatch — `skip` warns and walks away, `force` absorbs anyway,
-/// `ask` prompts on a TTY (downgraded to skip off-TTY).
+/// `ask` prompts on a TTY; off-TTY the entry is recorded as unresolved
+/// (`note_unresolved`) and `apply` fails at the end of the run.
 fn handle_anomaly_dir(
     src: &Utf8Path,
     dst: &Utf8Path,
@@ -1370,6 +1442,10 @@ fn handle_anomaly_dir(
             AnomalyChoice::Overwrite => overwrite_source_dir_into_target(src, dst, ctx),
             AnomalyChoice::Skip => {
                 warn!("anomaly skipped by user: {dst}");
+                Ok(())
+            }
+            AnomalyChoice::Unresolved => {
+                note_unresolved(ctx, dst, reason);
                 Ok(())
             }
             AnomalyChoice::Quit => {

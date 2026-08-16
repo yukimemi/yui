@@ -7,7 +7,7 @@ use crate::template;
 use crate::vars::YuiVars;
 use anyhow::Result;
 use camino::{Utf8Path, Utf8PathBuf};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use teravars::Context as TeraContext;
 use tracing::{info, warn};
 
@@ -79,7 +79,6 @@ pub fn absorb(
     let plan = LinkPlan::from_config(&source, &config.link)?;
     let ctx = ApplyCtx {
         config: &config,
-        source: &source,
         plan: &plan,
         file_mode: resolve_file_mode(config.mount.file_mode),
         dir_mode: resolve_dir_mode(config.mount.dir_mode),
@@ -87,6 +86,10 @@ pub fn absorb(
         dry_run: false,
         sticky_anomaly: Cell::new(None),
         quit_requested: Cell::new(false),
+        // Manual absorb bypasses the `require_clean_git` policy
+        // entirely (see below), so this only satisfies the shared type.
+        source_clean: true,
+        unresolved: RefCell::new(Vec::new()),
     };
 
     // Manual absorb is an explicit user request — bypass `auto`,

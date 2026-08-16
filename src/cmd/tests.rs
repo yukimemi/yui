@@ -7,7 +7,7 @@ use crate::secret;
 use crate::vars::YuiVars;
 use crate::{absorb, paths};
 use camino::{Utf8Path, Utf8PathBuf};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use tempfile::TempDir;
 
 fn utf8(p: std::path::PathBuf) -> Utf8PathBuf {
@@ -2611,6 +2611,174 @@ fn walkdir(root: &Utf8Path) -> Vec<Utf8PathBuf> {
 }
 
 // -----------------------------------------------------------------
+// anomaly visibility (off-TTY) + git-clean snapshot
+// -----------------------------------------------------------------
+
+/// Initialise a git repo at `dir` and commit everything in it, so
+/// `git status --porcelain` is empty. Returns false when git isn't
+/// available on the runner, so callers can skip.
+fn git_init_and_commit(dir: &Utf8Path) -> bool {
+    let run = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.as_std_path())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    run(&["init", "-q"])
+        && run(&["add", "-A"])
+        && run(&[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ])
+}
+
+/// Off-TTY there is nobody to answer `on_anomaly = "ask"`, so the
+/// anomaly is left unresolved. That used to be logged as
+/// "anomaly skipped by user" and the run exited 0 — indistinguishable
+/// from a run that linked everything. It has to be reported.
+#[test]
+fn off_tty_anomaly_is_reported_instead_of_silently_skipped() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("home"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    // Source newer + content differs → NeedsConfirm, which the default
+    // `on_anomaly = "ask"` sends to the prompt.
+    let now = std::time::SystemTime::now();
+    let past = now - std::time::Duration::from_secs(120);
+    write_with_mtime(&target.join(".bashrc"), "target side", past);
+    write_with_mtime(&source.join("home/.bashrc"), "source side", now);
+
+    let cfg = format!(
+        r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+        toml_path(&target)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    let err = apply(Some(source.clone()), false).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("unresolved"), "got {msg}");
+    assert!(msg.contains("on_anomaly"), "got {msg}");
+
+    // Non-destructive: both sides keep their content.
+    assert_eq!(
+        std::fs::read_to_string(target.join(".bashrc")).unwrap(),
+        "target side"
+    );
+    assert_eq!(
+        std::fs::read_to_string(source.join("home/.bashrc")).unwrap(),
+        "source side"
+    );
+}
+
+/// `on_anomaly = "skip"` is the explicit "leave them alone" answer, so
+/// it must stay silent and keep exiting 0 — only the `ask`-with-no-TTY
+/// degradation is reported.
+#[test]
+fn explicit_skip_policy_does_not_report_unresolved() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("home"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let now = std::time::SystemTime::now();
+    let past = now - std::time::Duration::from_secs(120);
+    write_with_mtime(&target.join(".bashrc"), "target side", past);
+    write_with_mtime(&source.join("home/.bashrc"), "source side", now);
+
+    let cfg = format!(
+        r#"
+[absorb]
+on_anomaly = "skip"
+
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+        toml_path(&target)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+}
+
+/// A dir absorb copies target content into source, which makes the repo
+/// dirty mid-run. `require_clean_git` must judge the state apply started
+/// from, otherwise the first absorb defers every later one and each new
+/// dir link needs its own run (with a commit in between).
+#[test]
+fn dirty_from_own_absorb_does_not_defer_the_next_one() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("home"));
+    std::fs::create_dir_all(source.join("home/appa")).unwrap();
+    std::fs::create_dir_all(source.join("home/appb")).unwrap();
+    std::fs::create_dir_all(target.join("appa")).unwrap();
+    std::fs::create_dir_all(target.join("appb")).unwrap();
+    std::fs::write(source.join("home/appa/config.toml"), "a\n").unwrap();
+    std::fs::write(source.join("home/appb/config.toml"), "b\n").unwrap();
+    // Target-only files: the merge pulls them into source, and they are
+    // what makes the repo dirty for the *second* absorb.
+    std::fs::write(target.join("appa/state.json"), "{}").unwrap();
+    std::fs::write(target.join("appb/state.json"), "{}").unwrap();
+
+    let cfg = format!(
+        r#"
+[[mount.entry]]
+src = "home"
+dst = "{0}"
+
+[[link]]
+src = "home/appa"
+dst = "{0}/appa"
+
+[[link]]
+src = "home/appb"
+dst = "{0}/appb"
+"#,
+        toml_path(&target)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    if !git_init_and_commit(&source) {
+        eprintln!("skipping: git not available");
+        return;
+    }
+
+    // One run has to absorb both. Before the snapshot fix the second
+    // one hit `source repo is dirty; deferring auto-absorb`.
+    apply(Some(source.clone()), false).unwrap();
+
+    for app in ["appa", "appb"] {
+        assert!(
+            source.join(format!("home/{app}/state.json")).exists(),
+            "{app}: target-only file should have been absorbed"
+        );
+        // The dir is now a link: a file written on the target side
+        // shows up in source without another apply.
+        std::fs::write(target.join(format!("{app}/fresh.txt")), "x").unwrap();
+        assert!(
+            source.join(format!("home/{app}/fresh.txt")).exists(),
+            "{app}: target should be linked to source"
+        );
+    }
+}
+
+// -----------------------------------------------------------------
 // gc-backup
 // -----------------------------------------------------------------
 
@@ -2862,7 +3030,6 @@ fn prompt_anomaly_short_circuits_on_quit_requested() {
 
     let ctx = ApplyCtx {
         config: &cfg,
-        source: &source,
         plan: &plan,
         file_mode: resolve_file_mode(cfg.mount.file_mode),
         dir_mode: resolve_dir_mode(cfg.mount.dir_mode),
@@ -2870,6 +3037,8 @@ fn prompt_anomaly_short_circuits_on_quit_requested() {
         dry_run: false,
         sticky_anomaly: Cell::new(None),
         quit_requested: Cell::new(true),
+        source_clean: true,
+        unresolved: RefCell::new(Vec::new()),
     };
 
     let got = prompt_anomaly(&ctx, &src_file, &dst_file, "test").unwrap();
@@ -2891,7 +3060,6 @@ fn prompt_anomaly_short_circuits_on_sticky_choice() {
 
     let ctx = ApplyCtx {
         config: &cfg,
-        source: &source,
         plan: &plan,
         file_mode: resolve_file_mode(cfg.mount.file_mode),
         dir_mode: resolve_dir_mode(cfg.mount.dir_mode),
@@ -2899,6 +3067,8 @@ fn prompt_anomaly_short_circuits_on_sticky_choice() {
         dry_run: false,
         sticky_anomaly: Cell::new(Some(AnomalyChoice::Overwrite)),
         quit_requested: Cell::new(false),
+        source_clean: true,
+        unresolved: RefCell::new(Vec::new()),
     };
 
     let got = prompt_anomaly(&ctx, &src_file, &dst_file, "test").unwrap();
@@ -2920,7 +3090,6 @@ fn overwrite_source_into_target_replaces_target_and_backs_up() {
 
     let ctx = ApplyCtx {
         config: &cfg,
-        source: &source,
         plan: &plan,
         file_mode: resolve_file_mode(cfg.mount.file_mode),
         dir_mode: resolve_dir_mode(cfg.mount.dir_mode),
@@ -2928,6 +3097,8 @@ fn overwrite_source_into_target_replaces_target_and_backs_up() {
         dry_run: false,
         sticky_anomaly: Cell::new(None),
         quit_requested: Cell::new(false),
+        source_clean: true,
+        unresolved: RefCell::new(Vec::new()),
     };
 
     overwrite_source_into_target(&src_file, &dst_file, &ctx).unwrap();
@@ -2974,7 +3145,6 @@ fn link_file_with_backup_short_circuits_when_quit_requested() {
 
     let ctx = ApplyCtx {
         config: &cfg,
-        source: &source,
         plan: &plan,
         file_mode: resolve_file_mode(cfg.mount.file_mode),
         dir_mode: resolve_dir_mode(cfg.mount.dir_mode),
@@ -2982,6 +3152,8 @@ fn link_file_with_backup_short_circuits_when_quit_requested() {
         dry_run: false,
         sticky_anomaly: Cell::new(None),
         quit_requested: Cell::new(true),
+        source_clean: true,
+        unresolved: RefCell::new(Vec::new()),
     };
 
     link_file_with_backup(&src_file, &dst_file, &ctx).unwrap();
@@ -3037,10 +3209,9 @@ fn dir_absorb_fixture(tmp: &TempDir) -> (Config, Utf8PathBuf, Utf8PathBuf, LinkP
 }
 
 macro_rules! dir_ctx {
-    ($cfg:expr, $source:expr, $plan:expr, $backup_root:expr) => {
+    ($cfg:expr, $plan:expr, $backup_root:expr) => {
         ApplyCtx {
             config: &$cfg,
-            source: &$source,
             plan: &$plan,
             file_mode: resolve_file_mode($cfg.mount.file_mode),
             dir_mode: resolve_dir_mode($cfg.mount.dir_mode),
@@ -3048,6 +3219,8 @@ macro_rules! dir_ctx {
             dry_run: false,
             sticky_anomaly: Cell::new(None),
             quit_requested: Cell::new(false),
+            source_clean: true,
+            unresolved: RefCell::new(Vec::new()),
         }
     };
 }
@@ -3067,7 +3240,7 @@ fn absorb_dir_stages_target_aside_and_cleans_up() {
     std::fs::create_dir_all(dst_dir.join("lua")).unwrap();
     std::fs::write(dst_dir.join("lua/only-in-target.lua"), "T").unwrap();
 
-    let ctx = dir_ctx!(cfg, source, plan, backup_root);
+    let ctx = dir_ctx!(cfg, plan, backup_root);
     absorb_target_dir_into_source(&src_dir, &dst_dir, &ctx).unwrap();
 
     assert_eq!(
@@ -3106,7 +3279,7 @@ fn interrupted_absorb_staging_is_resumed_before_classify() {
     std::fs::create_dir_all(staged.join("lua")).unwrap();
     std::fs::write(staged.join("lua/rescued.lua"), "R").unwrap();
 
-    let ctx = dir_ctx!(cfg, source, plan, backup_root);
+    let ctx = dir_ctx!(cfg, plan, backup_root);
     link_dir_with_backup(&src_dir, &dst_dir, &ctx).unwrap();
 
     assert_eq!(
@@ -3140,7 +3313,7 @@ fn interrupted_overwrite_staging_is_discarded_not_merged() {
     std::fs::create_dir_all(&staged).unwrap();
     std::fs::write(staged.join("ghost.lua"), "G").unwrap();
 
-    let ctx = dir_ctx!(cfg, source, plan, backup_root);
+    let ctx = dir_ctx!(cfg, plan, backup_root);
     link_dir_with_backup(&src_dir, &dst_dir, &ctx).unwrap();
 
     assert!(!staged.exists(), "discard staging is swept");
@@ -3170,7 +3343,7 @@ fn dry_run_recovery_leaves_staging_untouched() {
     std::fs::create_dir_all(&staged).unwrap();
     std::fs::write(staged.join("kept.lua"), "K").unwrap();
 
-    let mut ctx = dir_ctx!(cfg, source, plan, backup_root);
+    let mut ctx = dir_ctx!(cfg, plan, backup_root);
     ctx.dry_run = true;
     link_dir_with_backup(&src_dir, &dst_dir, &ctx).unwrap();
 
@@ -3202,7 +3375,7 @@ fn quit_during_dir_absorb_restores_the_target() {
     std::fs::create_dir_all(&dst_dir).unwrap();
     std::fs::write(dst_dir.join("mine.lua"), "target-only").unwrap();
 
-    let mut ctx = dir_ctx!(cfg, source, plan, backup_root);
+    let mut ctx = dir_ctx!(cfg, plan, backup_root);
     ctx.quit_requested = Cell::new(true);
     absorb_target_dir_into_source(&src_dir, &dst_dir, &ctx).unwrap();
 
