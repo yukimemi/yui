@@ -363,6 +363,103 @@ pub fn append_timestamp(path: &Utf8Path, ts: &str) -> Utf8PathBuf {
     parent.join(new_name)
 }
 
+/// What an interrupted run still owes a staged-aside directory.
+///
+/// A dir-level relink moves the live target out of the way with a
+/// single same-volume rename before it touches anything else. The kind
+/// is encoded *in the directory's name* on purpose: the rename is what
+/// establishes the invariant, so a leftover staging directory always
+/// carries its own recovery plan and yui needs no journal file to
+/// finish the job on the next run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedKind {
+    /// Content has not necessarily reached source yet — recovery MUST
+    /// merge it into source before deleting. Written by the absorb
+    /// path, where the staged tree may hold the only copy of a
+    /// target-side edit.
+    Absorb,
+    /// Content is already safe in `.yui/backup/` — recovery just
+    /// deletes. Written by the overwrite path, which takes its backup
+    /// *before* staging precisely so this holds by construction.
+    Discard,
+}
+
+impl StagedKind {
+    /// Infix separating the target's basename from the timestamp.
+    pub fn infix(self) -> &'static str {
+        match self {
+            Self::Absorb => ".yui-absorb.",
+            Self::Discard => ".yui-discard.",
+        }
+    }
+}
+
+/// Staging name for `dst`: a sibling, never a path under
+/// `.yui/backup/` or the system temp dir.
+///
+/// Sibling placement is load-bearing, not cosmetic — `rename` is only
+/// atomic and O(1) within one volume, and the whole point of staging
+/// is to replace an O(tree) `remove_dir_all` on the live path with one
+/// metadata operation.
+///
+/// `None` when `dst` has no basename or no parent (a root), in which
+/// case the caller keeps the in-place teardown.
+pub fn staged_path(dst: &Utf8Path, kind: StagedKind, ts: &str) -> Option<Utf8PathBuf> {
+    let name = dst.file_name()?;
+    let parent = dst.parent()?;
+    Some(parent.join(format!("{name}{}{ts}", kind.infix())))
+}
+
+/// Find every staging directory an interrupted run left next to `dst`,
+/// sorted by name (so same-target leftovers are recovered oldest
+/// first — the timestamp suffix makes name order time order).
+///
+/// A missing or unreadable parent yields an empty list rather than an
+/// error: recovery is a best-effort sweep in front of the real work,
+/// and a target whose parent we can't read has bigger problems that
+/// the link step itself will report.
+pub fn scan_staged(dst: &Utf8Path) -> crate::Result<Vec<(Utf8PathBuf, StagedKind)>> {
+    let (Some(parent), Some(name)) = (dst.parent(), dst.file_name()) else {
+        return Ok(Vec::new());
+    };
+    let entries = match std::fs::read_dir(parent) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+
+    let prefixes = [
+        (
+            format!("{name}{}", StagedKind::Absorb.infix()),
+            StagedKind::Absorb,
+        ),
+        (
+            format!("{name}{}", StagedKind::Discard.infix()),
+            StagedKind::Discard,
+        ),
+    ];
+
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let raw = entry.file_name();
+        let Some(entry_name) = raw.to_str() else {
+            continue;
+        };
+        for (prefix, kind) in &prefixes {
+            // `len() > prefix.len()` keeps a hand-made directory named
+            // exactly `<target>.yui-absorb.` (no timestamp) out of the
+            // sweep — we only claim names this code could have written.
+            if entry_name.starts_with(prefix.as_str()) && entry_name.len() > prefix.len() {
+                found.push((parent.join(entry_name), *kind));
+                break;
+            }
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(found)
+}
+
 /// Normalize a path by eliminating redundant `.` components without accessing
 /// the filesystem, preserving `..` to maintain symlink semantics.
 pub fn normalize(path: &Utf8Path) -> Utf8PathBuf {
@@ -665,5 +762,71 @@ mod tests {
         );
         assert_eq!(normalize(Utf8Path::new("./foo")), Utf8PathBuf::from("foo"));
         assert_eq!(normalize(Utf8Path::new(".")), Utf8PathBuf::from("."));
+    }
+
+    #[test]
+    fn staged_path_is_a_timestamped_sibling() {
+        // Sibling placement is the contract: same volume → the rename
+        // that creates it is atomic and O(1).
+        assert_eq!(
+            staged_path(
+                Utf8Path::new("/home/u/.config"),
+                StagedKind::Absorb,
+                "20260101_010203004"
+            ),
+            Some(Utf8PathBuf::from(
+                "/home/u/.config.yui-absorb.20260101_010203004"
+            ))
+        );
+        assert_eq!(
+            staged_path(
+                Utf8Path::new("/home/u/.config"),
+                StagedKind::Discard,
+                "20260101_010203004"
+            ),
+            Some(Utf8PathBuf::from(
+                "/home/u/.config.yui-discard.20260101_010203004"
+            ))
+        );
+    }
+
+    #[test]
+    fn scan_staged_claims_only_names_yui_could_have_written() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let dst = root.join("nvim");
+        std::fs::create_dir_all(&dst).unwrap();
+
+        std::fs::create_dir_all(root.join("nvim.yui-absorb.20260101_000000000")).unwrap();
+        std::fs::create_dir_all(root.join("nvim.yui-discard.20260102_000000000")).unwrap();
+        // Near-misses: a bare infix with no timestamp, an unrelated
+        // name, and another target's staging. None may be swept — the
+        // sweep deletes trees, so over-matching is data loss.
+        std::fs::create_dir_all(root.join("nvim.yui-absorb.")).unwrap();
+        std::fs::create_dir_all(root.join("nvim-backup")).unwrap();
+        std::fs::create_dir_all(root.join("other.yui-absorb.20260101_000000000")).unwrap();
+
+        let got = scan_staged(&dst).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    root.join("nvim.yui-absorb.20260101_000000000"),
+                    StagedKind::Absorb
+                ),
+                (
+                    root.join("nvim.yui-discard.20260102_000000000"),
+                    StagedKind::Discard
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_staged_on_missing_parent_is_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let dst = root.join("gone/nvim");
+        assert!(scan_staged(&dst).unwrap().is_empty());
     }
 }

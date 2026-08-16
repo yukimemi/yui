@@ -3026,3 +3026,155 @@ recipients = ["{public}"]
         ".gitignore should NOT contain dot component: {gi}"
     );
 }
+
+/// Build a live `ApplyCtx` for the dir-absorb staging tests. Kept
+/// separate from `ctx_for_test` because these need the borrowed
+/// pieces to outlive the call, so the caller owns the tuple.
+fn dir_absorb_fixture(tmp: &TempDir) -> (Config, Utf8PathBuf, Utf8PathBuf, LinkPlan) {
+    let (cfg, source, backup_root, plan) = ctx_for_test(tmp);
+    std::fs::create_dir_all(&backup_root).unwrap();
+    (cfg, source, backup_root, plan)
+}
+
+macro_rules! dir_ctx {
+    ($cfg:expr, $source:expr, $plan:expr, $backup_root:expr) => {
+        ApplyCtx {
+            config: &$cfg,
+            source: &$source,
+            plan: &$plan,
+            file_mode: resolve_file_mode($cfg.mount.file_mode),
+            dir_mode: resolve_dir_mode($cfg.mount.dir_mode),
+            backup_root: &$backup_root,
+            dry_run: false,
+            sticky_anomaly: Cell::new(None),
+            quit_requested: Cell::new(false),
+        }
+    };
+}
+
+#[test]
+fn absorb_dir_stages_target_aside_and_cleans_up() {
+    // The staged-aside rename is an implementation detail, but its
+    // *absence afterwards* is a contract: a completed absorb must not
+    // leave a second copy of the tree sitting next to the target.
+    let tmp = TempDir::new().unwrap();
+    let (cfg, source, backup_root, plan) = dir_absorb_fixture(&tmp);
+    let src_dir = source.join("nvim");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(src_dir.join("init.lua"), "from source").unwrap();
+
+    let dst_dir = utf8(tmp.path().join("target/nvim"));
+    std::fs::create_dir_all(dst_dir.join("lua")).unwrap();
+    std::fs::write(dst_dir.join("lua/only-in-target.lua"), "T").unwrap();
+
+    let ctx = dir_ctx!(cfg, source, plan, backup_root);
+    absorb_target_dir_into_source(&src_dir, &dst_dir, &ctx).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(src_dir.join("lua/only-in-target.lua")).unwrap(),
+        "T",
+        "target-only content must land in source"
+    );
+    assert_eq!(
+        absorb::classify(&src_dir, &dst_dir).unwrap(),
+        absorb::AbsorbDecision::InSync,
+        "target must end up linked to source"
+    );
+    assert!(
+        paths::scan_staged(&dst_dir).unwrap().is_empty(),
+        "staging must be swept once the merge succeeded"
+    );
+}
+
+#[test]
+fn interrupted_absorb_staging_is_resumed_before_classify() {
+    // Crash window: the staging rename landed but the process died
+    // before the link went up. `dst` is missing, so `classify` would
+    // say `Restore` and link straight over the top — stranding the
+    // only copy of the user's target-side file in the staging dir.
+    // Recovery has to run first.
+    let tmp = TempDir::new().unwrap();
+    let (cfg, source, backup_root, plan) = dir_absorb_fixture(&tmp);
+    let src_dir = source.join("nvim");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(src_dir.join("init.lua"), "from source").unwrap();
+
+    let dst_dir = utf8(tmp.path().join("target/nvim"));
+    std::fs::create_dir_all(dst_dir.parent().unwrap()).unwrap();
+    let staged =
+        paths::staged_path(&dst_dir, paths::StagedKind::Absorb, "20260101_000000000").unwrap();
+    std::fs::create_dir_all(staged.join("lua")).unwrap();
+    std::fs::write(staged.join("lua/rescued.lua"), "R").unwrap();
+
+    let ctx = dir_ctx!(cfg, source, plan, backup_root);
+    link_dir_with_backup(&src_dir, &dst_dir, &ctx).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(src_dir.join("lua/rescued.lua")).unwrap(),
+        "R",
+        "interrupted staging must be merged into source, not dropped"
+    );
+    assert!(!staged.exists(), "staging removed once merged");
+    assert_eq!(
+        absorb::classify(&src_dir, &dst_dir).unwrap(),
+        absorb::AbsorbDecision::InSync,
+        "recovery still finishes the link"
+    );
+}
+
+#[test]
+fn interrupted_overwrite_staging_is_discarded_not_merged() {
+    // The `Discard` kind means "already in .yui/backup/". Recovery
+    // must delete it unread — merging it would resurrect exactly the
+    // content the user chose to throw away.
+    let tmp = TempDir::new().unwrap();
+    let (cfg, source, backup_root, plan) = dir_absorb_fixture(&tmp);
+    let src_dir = source.join("nvim");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(src_dir.join("init.lua"), "from source").unwrap();
+
+    let dst_dir = utf8(tmp.path().join("target/nvim"));
+    std::fs::create_dir_all(dst_dir.parent().unwrap()).unwrap();
+    let staged =
+        paths::staged_path(&dst_dir, paths::StagedKind::Discard, "20260101_000000000").unwrap();
+    std::fs::create_dir_all(&staged).unwrap();
+    std::fs::write(staged.join("ghost.lua"), "G").unwrap();
+
+    let ctx = dir_ctx!(cfg, source, plan, backup_root);
+    link_dir_with_backup(&src_dir, &dst_dir, &ctx).unwrap();
+
+    assert!(!staged.exists(), "discard staging is swept");
+    assert!(
+        !src_dir.join("ghost.lua").exists(),
+        "discarded content must never reach source"
+    );
+    assert_eq!(
+        absorb::classify(&src_dir, &dst_dir).unwrap(),
+        absorb::AbsorbDecision::InSync
+    );
+}
+
+#[test]
+fn dry_run_recovery_leaves_staging_untouched() {
+    // `--dry-run` promises to write nothing. Recovery is a write, so
+    // it must only report.
+    let tmp = TempDir::new().unwrap();
+    let (cfg, source, backup_root, plan) = dir_absorb_fixture(&tmp);
+    let src_dir = source.join("nvim");
+    std::fs::create_dir_all(&src_dir).unwrap();
+
+    let dst_dir = utf8(tmp.path().join("target/nvim"));
+    std::fs::create_dir_all(dst_dir.parent().unwrap()).unwrap();
+    let staged =
+        paths::staged_path(&dst_dir, paths::StagedKind::Absorb, "20260101_000000000").unwrap();
+    std::fs::create_dir_all(&staged).unwrap();
+    std::fs::write(staged.join("kept.lua"), "K").unwrap();
+
+    let mut ctx = dir_ctx!(cfg, source, plan, backup_root);
+    ctx.dry_run = true;
+    link_dir_with_backup(&src_dir, &dst_dir, &ctx).unwrap();
+
+    assert!(staged.exists(), "dry-run must not sweep staging");
+    assert!(!src_dir.join("kept.lua").exists(), "dry-run must not merge");
+    assert!(!dst_dir.exists(), "dry-run must not link");
+}

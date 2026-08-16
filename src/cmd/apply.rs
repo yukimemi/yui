@@ -833,9 +833,22 @@ fn source_repo_is_clean(source: &Utf8Path) -> bool {
     }
 }
 
-fn link_dir_with_backup(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>) -> Result<()> {
+pub(crate) fn link_dir_with_backup(
+    src: &Utf8Path,
+    dst: &Utf8Path,
+    ctx: &ApplyCtx<'_>,
+) -> Result<()> {
     use absorb::AbsorbDecision::*;
 
+    if ctx.quit_requested.get() {
+        return Ok(());
+    }
+
+    // Finish any staging left by an interrupted run before classifying.
+    // Order matters: a recovered target reads `InSync`, so classify
+    // would walk away and strand target-side content that never made
+    // it into source.
+    recover_staged(src, dst, ctx)?;
     if ctx.quit_requested.get() {
         return Ok(());
     }
@@ -1136,12 +1149,114 @@ fn merge_resolve_file_conflict(
     }
 }
 
+/// Rename `dst` out of the way to a sibling staging directory.
+///
+/// This is the atomic half of a dir-level relink. A same-volume rename
+/// is one metadata operation, so the live path stops pointing at the
+/// old tree in a single step instead of being carved out entry by
+/// entry by `remove_dir_all`. Callers put the link up immediately
+/// afterwards and only then run the slow work (merge, recursive
+/// delete) against the staging name — so an interrupted run leaves a
+/// *working* target plus a directory that says what it still owes,
+/// rather than a half-deleted tree and no link.
+///
+/// `Ok(None)` means `dst` was already gone; the caller just links.
+/// `Err` means the rename was refused — open handles inside the tree
+/// on Windows, a mount point in the way, permissions. That is not
+/// fatal: callers warn and fall back to the in-place teardown, which
+/// is exactly what yui did before staging existed.
+fn stage_aside(dst: &Utf8Path, kind: paths::StagedKind) -> Result<Option<Utf8PathBuf>> {
+    if std::fs::symlink_metadata(dst).is_err() {
+        return Ok(None);
+    }
+    let ts = backup::current_timestamp("%Y%m%d_%H%M%S%3f")?;
+    let staged = paths::staged_path(dst, kind, &ts)
+        .with_context(|| format!("cannot derive a staging name for {dst}"))?;
+    std::fs::rename(dst, &staged).with_context(|| format!("stage aside {dst} → {staged}"))?;
+    Ok(Some(staged))
+}
+
+/// Delete a staged tree.
+///
+/// Failure is a warning, never an error: by the time we get here the
+/// content is already reflected in source (`Absorb`) or in
+/// `.yui/backup/` (`Discard`), so a leftover directory is litter, not
+/// data loss — and `recover_staged` sweeps it on the next run.
+fn remove_staged(staged: &Utf8Path) {
+    if let Err(e) = std::fs::remove_dir_all(staged) {
+        warn!("staged tree left behind at {staged} ({e}) — next apply retries the cleanup");
+    }
+}
+
+/// Undo a staging rename: drop the link we put up and move the tree
+/// back to the live path. Used when the user quits mid-merge, so the
+/// target ends up as the real directory it was before apply touched
+/// it instead of a link to a half-merged source.
+fn unstage(staged: &Utf8Path, dst: &Utf8Path) -> Result<()> {
+    link::unlink(dst).with_context(|| format!("remove {dst} before restoring {staged}"))?;
+    std::fs::rename(staged, dst).with_context(|| format!("restore {staged} → {dst}"))?;
+    Ok(())
+}
+
+/// Finish whatever a previous interrupted run left staged next to
+/// `dst`. Runs *before* `absorb::classify` because the leftover is
+/// invisible to it: once the link is up the target reads `InSync`,
+/// and a staged `Absorb` tree may still hold the only copy of a
+/// target-side edit.
+///
+/// The staging kind is the whole recovery plan — see
+/// [`paths::StagedKind`]. No journal file, no partial-state parsing:
+/// the rename that created the directory is what made its invariant
+/// true.
+///
+/// Source is not re-backed-up here. The interrupted run already took
+/// its snapshot before staging, and the merge below is
+/// content-classified per file, so re-running it over an
+/// already-merged tree is a no-op rather than a second overwrite.
+fn recover_staged(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>) -> Result<()> {
+    for (staged, kind) in paths::scan_staged(dst)? {
+        if ctx.dry_run {
+            info!("[dry-run] finish interrupted {kind:?} staging: {staged}");
+            continue;
+        }
+        match kind {
+            paths::StagedKind::Absorb => {
+                if !src.is_dir() {
+                    warn!(
+                        "staged tree {staged} left as-is: source dir {src} is missing, \
+                         so there is nothing to merge it into"
+                    );
+                    continue;
+                }
+                info!("resuming interrupted absorb: {staged} → {src}");
+                merge_dir_target_into_source(&staged, src, ctx)?;
+                if ctx.quit_requested.get() {
+                    warn!("recovery interrupted by user quit; {staged} kept");
+                    return Ok(());
+                }
+                remove_staged(&staged);
+            }
+            paths::StagedKind::Discard => {
+                info!("discarding staged tree from interrupted overwrite: {staged}");
+                remove_staged(&staged);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Back up source-side, merge target's content into source (target
 /// wins on conflict), then replace target with a junction to source.
 /// "Target wins" — yui's core philosophy, generalised from the file
 /// path to whole directories so a chezmoi-style migrated `~/.config/`
 /// keeps every file the user actually had instead of stranding most
 /// of them in `.yui/backup/...`.
+///
+/// Ordering is chosen for crash safety on big trees: stage the target
+/// aside (atomic rename), put the link up (instant), *then* merge and
+/// delete. The two expensive steps therefore run while the live path
+/// already resolves to source, so losing power in the middle of a
+/// 50k-file `~/.config` costs a leftover directory, not a target.
 pub(crate) fn absorb_target_dir_into_source(
     src: &Utf8Path,
     dst: &Utf8Path,
@@ -1149,25 +1264,45 @@ pub(crate) fn absorb_target_dir_into_source(
 ) -> Result<()> {
     info!("absorb dir: {dst} → {src}");
     backup_existing(src, ctx.backup_root, /* is_dir */ true)?;
-    merge_dir_target_into_source(dst, src, ctx)?;
-    // If the user picked `[q]uit` at a prompt during the merge, do not
-    // proceed with the teardown/relink that would finish the absorb
-    // the user just asked us to abandon. `dst` keeps its (partially
-    // populated) tree intact, source has whatever content was already
-    // merged before the quit, and the source-side backup taken at the
-    // top of this function is the recovery anchor.
-    if ctx.quit_requested.get() {
-        warn!(
-            "absorb dir interrupted by user quit: {dst} \
-             — leaving target tree intact; source backup at {}",
-            ctx.backup_root
-        );
-        return Ok(());
-    }
-    // Source now carries every regular file from target. Tear down the
-    // original target dir and re-expose source via a junction.
-    remove_dir_link_or_real(dst)?;
+
+    let staged = match stage_aside(dst, paths::StagedKind::Absorb) {
+        Ok(Some(staged)) => staged,
+        // Target vanished under us between classify and now — there is
+        // nothing left to absorb, so just expose source.
+        Ok(None) => return link::link_dir(src, dst, ctx.dir_mode).map_err(Into::into),
+        Err(e) => {
+            warn!("cannot stage {dst} aside ({e:#}) — falling back to in-place teardown");
+            merge_dir_target_into_source(dst, src, ctx)?;
+            if ctx.quit_requested.get() {
+                warn!(
+                    "absorb dir interrupted by user quit: {dst} \
+                     — leaving target tree intact; source backup at {}",
+                    ctx.backup_root
+                );
+                return Ok(());
+            }
+            remove_dir_link_or_real(dst)?;
+            link::link_dir(src, dst, ctx.dir_mode)?;
+            return Ok(());
+        }
+    };
+
     link::link_dir(src, dst, ctx.dir_mode)?;
+    merge_dir_target_into_source(&staged, src, ctx)?;
+
+    // If the user picked `[q]uit` at a prompt during the merge, put the
+    // target back the way we found it rather than finishing an absorb
+    // they just asked us to abandon. The merge only reads from the
+    // staged tree (bar an explicit `[o]verwrite` choice), so what
+    // lands back at `dst` is the tree the user started with. Source
+    // keeps whatever was merged before the quit; its pre-absorb state
+    // is in the backup taken at the top of this function.
+    if ctx.quit_requested.get() {
+        warn!("absorb dir interrupted by user quit: restoring {dst}");
+        return unstage(&staged, dst);
+    }
+
+    remove_staged(&staged);
     Ok(())
 }
 
@@ -1175,6 +1310,11 @@ pub(crate) fn absorb_target_dir_into_source(
 /// content as-is, back up target's diverged content, then re-expose
 /// source via a junction at the target path. Used when the user
 /// picks `[o]verwrite` for a dir-level anomaly.
+///
+/// The backup runs *before* staging, not after. That ordering is what
+/// lets a leftover `Discard` tree be deleted unread during recovery:
+/// the rename only happens once the content is already safe in
+/// `.yui/backup/`.
 fn overwrite_source_dir_into_target(
     src: &Utf8Path,
     dst: &Utf8Path,
@@ -1182,8 +1322,18 @@ fn overwrite_source_dir_into_target(
 ) -> Result<()> {
     info!("overwrite dir: {src} → {dst}");
     backup_existing(dst, ctx.backup_root, /* is_dir */ true)?;
-    remove_dir_link_or_real(dst)?;
-    link::link_dir(src, dst, ctx.dir_mode)?;
+    match stage_aside(dst, paths::StagedKind::Discard) {
+        Ok(Some(staged)) => {
+            link::link_dir(src, dst, ctx.dir_mode)?;
+            remove_staged(&staged);
+        }
+        Ok(None) => link::link_dir(src, dst, ctx.dir_mode)?,
+        Err(e) => {
+            warn!("cannot stage {dst} aside ({e:#}) — falling back to in-place teardown");
+            remove_dir_link_or_real(dst)?;
+            link::link_dir(src, dst, ctx.dir_mode)?;
+        }
+    }
     Ok(())
 }
 
