@@ -3225,3 +3225,89 @@ fn quit_during_dir_absorb_restores_the_target() {
         "an aborted absorb must not have merged anything"
     );
 }
+
+/// A directory link into the source tree that no `[[link]]` declares
+/// is invisible to every other command: both sides resolve to the
+/// same inode *through* that very link, so `absorb::classify` reports
+/// the files inside as in-sync forever. Doctor has to say it out
+/// loud, because the day the link goes away `apply` rebuilds the
+/// target as a plain directory holding per-file links of only the
+/// tracked files — and the rest of the source dir stops being visible
+/// from the target side.
+#[test]
+fn doctor_warns_about_undeclared_dir_link() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    let kimi_src = source.join("home/.kimi-code");
+    std::fs::create_dir_all(&kimi_src).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(kimi_src.join("settings.json"), "{}\n").unwrap();
+
+    let mount_cfg = format!(
+        r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+"#,
+        toml_path(&target)
+    );
+    std::fs::write(source.join("config.toml"), &mount_cfg).unwrap();
+
+    // The dir link exists on disk, but nothing in the config asks for
+    // it — exactly the state a hand-made junction leaves behind.
+    let kimi_dst = target.join(".kimi-code");
+    crate::link::link_dir(
+        &kimi_src,
+        &kimi_dst,
+        resolve_dir_mode(Config::default().mount.dir_mode),
+    )
+    .unwrap();
+    assert!(
+        std::fs::symlink_metadata(&kimi_dst)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "test setup: {kimi_dst} should be a junction / symlink"
+    );
+
+    let yui = YuiVars::detect(&source);
+    let cfg = config::load(&source, &yui).unwrap();
+    let probes = undeclared_dir_link_probes(&source, &cfg, &yui).unwrap();
+    let warns: Vec<&str> = probes
+        .iter()
+        .filter_map(|p| match p {
+            Probe::Warn { detail, .. } => Some(detail.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(warns.len(), 1, "expected one warning, got {probes:?}");
+    let want_dst = paths::normalize(&kimi_dst);
+    let want_src = paths::normalize(&kimi_src);
+    assert!(
+        warns[0].contains(want_dst.as_str()) && warns[0].contains(want_src.as_str()),
+        "warning should name both sides ({want_dst} → {want_src}): {}",
+        warns[0]
+    );
+
+    // Declare it and the link becomes reproducible — nothing to warn
+    // about any more.
+    std::fs::write(
+        source.join("config.toml"),
+        format!(
+            "{mount_cfg}\n[[link]]\nsrc = \"home/.kimi-code\"\ndst = \"{}\"\n",
+            toml_path(&kimi_dst)
+        ),
+    )
+    .unwrap();
+    let cfg = config::load(&source, &yui).unwrap();
+    let probes = undeclared_dir_link_probes(&source, &cfg, &yui).unwrap();
+    assert!(
+        !probes.iter().any(|p| matches!(p, Probe::Warn { .. })),
+        "declared dir link must not warn: {probes:?}"
+    );
+    assert!(
+        probes.iter().any(|p| matches!(p, Probe::Ok { .. })),
+        "a clean check should still report something: {probes:?}"
+    );
+}
