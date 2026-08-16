@@ -5,16 +5,29 @@ use crate::vars::YuiVars;
 use anyhow::Result;
 use camino::{Utf8Path, Utf8PathBuf};
 
-/// `yui gc-backup [--older-than DUR] [--dry-run]` — prune snapshots
-/// under `$DOTFILES/.yui/backup/`.
+/// `yui gc-backup [--older-than DUR] [--keep-last N] [--dry-run]` —
+/// prune snapshots under `$DOTFILES/.yui/backup/`.
 ///
-/// With no `--older-than` we run a non-destructive *survey*: walk the
-/// backup tree, list every entry whose name carries yui's
+/// With no rule we run a non-destructive *survey*: walk the backup
+/// tree, list every entry whose name carries yui's
 /// `_<YYYYMMDD_HHMMSSfff>[.<ext>]` suffix, and print AGE / SIZE / PATH
-/// sorted oldest-first plus a hint to pass `--older-than DUR` to
-/// actually delete. With `--older-than DUR` (e.g. `30d`, `2w`, `12h`,
-/// `6m`, `1y`) we delete every entry strictly older than the cutoff.
-/// `--dry-run` previews the same set without writing.
+/// sorted oldest-first plus a hint about the flags that delete.
+///
+/// Two rules, and they compose as a *retention policy* rather than a
+/// filter chain — **an entry survives if either rule protects it**:
+///   - `--older-than DUR` (e.g. `30d`, `2w`, `12h`, `6mo`, `1y` —
+///     note bare `m` is *minutes*, months need `mo`) keeps
+///     anything newer than the cutoff.
+///   - `--keep-last N` keeps the N newest snapshots of each target,
+///     however old they are. `N = 0` protects nothing, which is the
+///     honest spelling for "purge".
+///
+/// So `--older-than 30d --keep-last 3` prunes what's older than a
+/// month while never dropping the three newest of anything. Age alone
+/// can't help with the case that actually fills a disk: one fresh
+/// snapshot of a large junctioned tree.
+///
+/// `--dry-run` previews whichever policy was given.
 ///
 /// Two design points worth flagging:
 /// 1. *Suffix, not mtime.* `std::fs::copy` preserves source mtime on
@@ -27,6 +40,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 pub fn gc_backup(
     source: Option<Utf8PathBuf>,
     older_than: Option<String>,
+    keep_last: Option<usize>,
     dry_run: bool,
     icons_override: Option<IconsMode>,
     no_color: bool,
@@ -53,71 +67,131 @@ pub fn gc_backup(
     entries.sort_by_key(|e| e.ts);
     let now = jiff::Zoned::now();
 
-    match older_than {
-        None => {
-            let refs: Vec<&BackupEntry> = entries.iter().collect();
-            print_gc_table(&refs, &backup_root, &now, icons, color);
-            println!();
-            println!(
-                "  {} entries · {} total — pass --older-than DUR (e.g. 30d) to delete",
-                entries.len(),
-                format_bytes(entries.iter().map(|e| e.size_bytes).sum())
-            );
-            Ok(())
-        }
+    if older_than.is_none() && keep_last.is_none() {
+        let refs: Vec<&BackupEntry> = entries.iter().collect();
+        print_gc_table(&refs, &backup_root, &now, icons, color);
+        println!();
+        println!(
+            "  {} entries · {} total — pass --older-than DUR (e.g. 30d) \
+             or --keep-last N to delete",
+            entries.len(),
+            format_bytes(entries.iter().map(|e| e.size_bytes).sum())
+        );
+        return Ok(());
+    }
+
+    let cutoff = match &older_than {
         Some(dur_str) => {
-            let span = parse_human_duration(&dur_str)?;
-            let cutoff = now
-                .checked_sub(span)
-                .map_err(|e| anyhow::anyhow!("invalid duration {dur_str:?}: {e}"))?;
-            let cutoff_dt = cutoff.datetime();
-
-            let total_before: u64 = entries.iter().map(|e| e.size_bytes).sum();
-            let to_delete: Vec<&BackupEntry> =
-                entries.iter().filter(|e| e.ts < cutoff_dt).collect();
-
-            if to_delete.is_empty() {
-                println!(
-                    "  no backups older than {dur_str} (oldest: {})",
-                    format_age(entries[0].ts, &now)
-                );
-                return Ok(());
-            }
-
-            print_gc_table(&to_delete, &backup_root, &now, icons, color);
-            println!();
-            let total_freed: u64 = to_delete.iter().map(|e| e.size_bytes).sum();
-
-            if dry_run {
-                println!(
-                    "  [dry-run] would remove {} of {} entries · would free {} of {}",
-                    to_delete.len(),
-                    entries.len(),
-                    format_bytes(total_freed),
-                    format_bytes(total_before),
-                );
-                return Ok(());
-            }
-
-            for entry in &to_delete {
-                match entry.kind {
-                    BackupKind::File => std::fs::remove_file(&entry.path)?,
-                    BackupKind::Dir => std::fs::remove_dir_all(&entry.path)?,
-                }
-                if let Some(parent) = entry.path.parent() {
-                    cleanup_empty_parents(parent, &backup_root);
-                }
-            }
-            println!(
-                "  removed {} of {} entries · freed {} (was {}, now {})",
-                to_delete.len(),
-                entries.len(),
-                format_bytes(total_freed),
-                format_bytes(total_before),
-                format_bytes(total_before - total_freed),
-            );
-            Ok(())
+            let span = parse_human_duration(dur_str)?;
+            Some(
+                now.checked_sub(span)
+                    .map_err(|e| anyhow::anyhow!("invalid duration {dur_str:?}: {e}"))?
+                    .datetime(),
+            )
         }
+        None => None,
+    };
+    let protected = keep_last.map(|n| protected_by_generation(&entries, n));
+
+    let total_before: u64 = entries.iter().map(|e| e.size_bytes).sum();
+    let to_delete: Vec<&BackupEntry> = entries
+        .iter()
+        .enumerate()
+        .filter(|(idx, entry)| {
+            // Retention, not filtering: an entry survives if *any*
+            // active rule protects it. With only one rule given, the
+            // other simply has no opinion.
+            let age_protects = cutoff.is_some_and(|c| entry.ts >= c);
+            let generation_protects = protected.as_ref().is_some_and(|p| p.contains(idx));
+            !(age_protects || generation_protects)
+        })
+        .map(|(_, entry)| entry)
+        .collect();
+
+    if to_delete.is_empty() {
+        println!(
+            "  nothing to prune under this policy ({}; oldest: {})",
+            describe_policy(&older_than, keep_last),
+            format_age(entries[0].ts, &now)
+        );
+        return Ok(());
+    }
+
+    print_gc_table(&to_delete, &backup_root, &now, icons, color);
+    println!();
+    let total_freed: u64 = to_delete.iter().map(|e| e.size_bytes).sum();
+
+    if dry_run {
+        println!(
+            "  [dry-run] would remove {} of {} entries · would free {} of {} ({})",
+            to_delete.len(),
+            entries.len(),
+            format_bytes(total_freed),
+            format_bytes(total_before),
+            describe_policy(&older_than, keep_last),
+        );
+        return Ok(());
+    }
+
+    for entry in &to_delete {
+        match entry.kind {
+            BackupKind::File => std::fs::remove_file(&entry.path)?,
+            BackupKind::Dir => std::fs::remove_dir_all(&entry.path)?,
+        }
+        if let Some(parent) = entry.path.parent() {
+            cleanup_empty_parents(parent, &backup_root);
+        }
+    }
+    println!(
+        "  removed {} of {} entries · freed {} (was {}, now {})",
+        to_delete.len(),
+        entries.len(),
+        format_bytes(total_freed),
+        format_bytes(total_before),
+        format_bytes(total_before - total_freed),
+    );
+    Ok(())
+}
+
+/// Indices of the `n` newest snapshots of every target.
+///
+/// The target is the entry's path with yui's timestamp suffix stripped,
+/// so `home/.claude_<ts>/` and `home/.claude_<older ts>/` share a
+/// bucket while two apps' `settings.json` don't (the parent path is
+/// part of the key).
+fn protected_by_generation(entries: &[BackupEntry], n: usize) -> std::collections::HashSet<usize> {
+    use std::collections::HashMap;
+    let mut by_target: HashMap<Utf8PathBuf, Vec<usize>> = HashMap::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        let Some(name) = entry.path.file_name() else {
+            continue;
+        };
+        let Some(target) = backup_target_name(name) else {
+            continue;
+        };
+        let key = entry
+            .path
+            .parent()
+            .map(|p| p.join(&target))
+            .unwrap_or_else(|| Utf8PathBuf::from(target));
+        by_target.entry(key).or_default().push(idx);
+    }
+    let mut protected = std::collections::HashSet::new();
+    for idxs in by_target.values() {
+        // `entries` is sorted oldest-first, so the tail is the newest.
+        for idx in idxs.iter().rev().take(n) {
+            protected.insert(*idx);
+        }
+    }
+    protected
+}
+
+fn describe_policy(older_than: &Option<String>, keep_last: Option<usize>) -> String {
+    match (older_than, keep_last) {
+        (Some(d), Some(n)) => format!("older than {d}, keeping the newest {n} per target"),
+        (Some(d), None) => format!("older than {d}"),
+        (None, Some(n)) => format!("keeping the newest {n} per target"),
+        (None, None) => "survey".to_string(),
     }
 }
 
@@ -238,6 +312,35 @@ pub(crate) fn parse_backup_suffix(name: &str) -> Option<jiff::civil::DateTime> {
         }
     }
     None
+}
+
+/// Strip yui's `_<YYYYMMDD_HHMMSSfff>` suffix back off, recovering the
+/// name the snapshot was taken of: `config_20260815_020729950.yml` →
+/// `config.yml`, `.claude_20260816_111625675` → `.claude`.
+///
+/// This is the inverse of [`crate::paths::append_timestamp`] and is
+/// what groups snapshots of the same target together. Returns `None`
+/// for anything that isn't yui-stamped, mirroring
+/// [`parse_backup_suffix`]'s defensive stance.
+pub(crate) fn backup_target_name(name: &str) -> Option<String> {
+    if strip_ts_at_end(name).is_some() {
+        return strip_ts_at_end(name).map(str::to_string);
+    }
+    // Nested ifs (not let-chains) so the crate's MSRV
+    // (rust-version = "1.85") stays buildable.
+    if let Some((before, ext)) = name.rsplit_once('.') {
+        if let Some(stem) = strip_ts_at_end(before) {
+            return Some(format!("{stem}.{ext}"));
+        }
+    }
+    None
+}
+
+/// `<stem>_<18-char timestamp>` → `<stem>`, when the tail really is a
+/// timestamp.
+fn strip_ts_at_end(s: &str) -> Option<&str> {
+    parse_ts_at_end(s)?;
+    Some(&s[..s.len() - 19])
 }
 
 fn parse_ts_at_end(s: &str) -> Option<jiff::civil::DateTime> {

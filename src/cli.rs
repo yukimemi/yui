@@ -139,8 +139,14 @@ pub enum Command {
         /// Omit to run a non-destructive survey instead.
         #[arg(long, value_name = "DUR")]
         older_than: Option<String>,
+        /// Keep the newest N snapshots of each target and delete the
+        /// older generations regardless of age. `0` keeps none.
+        /// Composes with `--older-than`: an entry survives if either
+        /// rule protects it.
+        #[arg(long, value_name = "N")]
+        keep_last: Option<usize>,
         /// Preview the deletion (no files removed). Only meaningful
-        /// when `--older-than` is also given.
+        /// alongside `--older-than` / `--keep-last`.
         #[arg(long)]
         dry_run: bool,
         /// Override [ui] icons mode for this invocation
@@ -337,10 +343,11 @@ impl Cli {
             Command::Doctor { icons, no_color } => cmd::doctor(source, icons, no_color),
             Command::GcBackup {
                 older_than,
+                keep_last,
                 dry_run,
                 icons,
                 no_color,
-            } => cmd::gc_backup(source, older_than, dry_run, icons, no_color),
+            } => cmd::gc_backup(source, older_than, keep_last, dry_run, icons, no_color),
             Command::Hooks { action } => match action {
                 HookAction::List { icons, no_color } => cmd::hooks_list(source, icons, no_color),
                 HookAction::Run { name, force } => cmd::hooks_run(source, name, force),
