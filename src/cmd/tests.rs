@@ -3178,3 +3178,50 @@ fn dry_run_recovery_leaves_staging_untouched() {
     assert!(!src_dir.join("kept.lua").exists(), "dry-run must not merge");
     assert!(!dst_dir.exists(), "dry-run must not link");
 }
+
+#[test]
+fn quit_during_dir_absorb_restores_the_target() {
+    // `[q]uit` mid-merge must not leave the user pointed at a
+    // half-merged source: `unstage` drops the link we already put up
+    // and renames the staged tree home, so the target is the real
+    // directory it was before apply touched it.
+    //
+    // Pre-setting `quit_requested` reproduces the state the prompt
+    // leaves behind — `merge_dir_target_into_source` bails at the top
+    // of its entry loop, exactly as it would after the user answered
+    // `q` on the first conflicting file. Calling
+    // `absorb_target_dir_into_source` directly is deliberate:
+    // `link_dir_with_backup` short-circuits on the same flag.
+    let tmp = TempDir::new().unwrap();
+    let (cfg, source, backup_root, plan) = dir_absorb_fixture(&tmp);
+    let src_dir = source.join("nvim");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(src_dir.join("init.lua"), "from source").unwrap();
+
+    let dst_dir = utf8(tmp.path().join("target/nvim"));
+    std::fs::create_dir_all(&dst_dir).unwrap();
+    std::fs::write(dst_dir.join("mine.lua"), "target-only").unwrap();
+
+    let mut ctx = dir_ctx!(cfg, source, plan, backup_root);
+    ctx.quit_requested = Cell::new(true);
+    absorb_target_dir_into_source(&src_dir, &dst_dir, &ctx).unwrap();
+
+    assert!(
+        paths::scan_staged(&dst_dir).is_empty(),
+        "the staged tree must be moved back, not abandoned"
+    );
+    let meta = std::fs::symlink_metadata(&dst_dir).unwrap();
+    assert!(
+        meta.file_type().is_dir() && !meta.file_type().is_symlink(),
+        "target must be a real directory again, not the link we had already put up"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dst_dir.join("mine.lua")).unwrap(),
+        "target-only",
+        "the user's target content comes back untouched"
+    );
+    assert!(
+        !src_dir.join("mine.lua").exists(),
+        "an aborted absorb must not have merged anything"
+    );
+}

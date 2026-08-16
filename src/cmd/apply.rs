@@ -1160,14 +1160,20 @@ fn merge_resolve_file_conflict(
 /// *working* target plus a directory that says what it still owes,
 /// rather than a half-deleted tree and no link.
 ///
-/// `Ok(None)` means `dst` was already gone; the caller just links.
-/// `Err` means the rename was refused — open handles inside the tree
-/// on Windows, a mount point in the way, permissions. That is not
-/// fatal: callers warn and fall back to the in-place teardown, which
-/// is exactly what yui did before staging existed.
+/// `Ok(None)` means `dst` was genuinely absent; the caller just links.
+/// `Err` means we could not stage: the rename was refused (open
+/// handles inside the tree on Windows, a mount point in the way,
+/// permissions), or `dst` could not even be stat'd. Neither is fatal
+/// — callers warn and fall back to the in-place teardown, which is
+/// exactly what yui did before staging existed. What we must not do
+/// is treat an unreadable-but-present `dst` as absent: that skips the
+/// backup and the merge, and hands the caller a `link_dir` that fails
+/// with "already exists" instead of the real cause.
 fn stage_aside(dst: &Utf8Path, kind: paths::StagedKind) -> Result<Option<Utf8PathBuf>> {
-    if std::fs::symlink_metadata(dst).is_err() {
-        return Ok(None);
+    match std::fs::symlink_metadata(dst) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow::Error::new(e).context(format!("stat {dst} before staging"))),
     }
     let ts = backup::current_timestamp("%Y%m%d_%H%M%S%3f")?;
     let staged = paths::staged_path(dst, kind, &ts)
