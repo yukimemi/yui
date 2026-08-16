@@ -567,7 +567,7 @@ Need to absorb a single file regardless of policy? `yui absorb
 | `yui update [--dry-run]` | `git pull --ff-only` source repo, then re-apply |
 | `yui unmanaged [--icons MODE] [--no-color]` | list source files no `[[mount.entry]]` claims |
 | `yui doctor` | environment sanity check |
-| `yui gc-backup [--older-than DUR] [--dry-run]` | survey or prune `.yui/backup/` snapshots by suffix age |
+| `yui gc-backup [--older-than DUR] [--keep-last N] [--dry-run]` | survey or prune `.yui/backup/` snapshots |
 | `yui hooks list` | show configured `[[hook]]` entries + last-run state |
 | `yui hooks run [<name>] [--force]` | run hooks on demand (bypassing `when_run` with `--force`) |
 | `yui secret <init\|encrypt\|store\|unlock>` | manage `*.age` secrets + the X25519 identity — see [Secrets](#secrets-age--opt-in) |
@@ -577,6 +577,16 @@ Need to absorb a single file regardless of policy? `yui absorb
 `--icons` accepts `unicode` (default), `nerd` (Nerd-Font glyphs),
 `ascii` (CI-log-safe). The `[ui] icons = "..."` config key sets it
 globally.
+
+`gc-backup` with no rule surveys; `--older-than DUR` (`30d`, `2w`,
+`12h`, `6mo`, `1y` — bare `m` is *minutes*, months are `mo`) and
+`--keep-last N` are a retention policy, so **an
+entry survives if either rule protects it** — `--older-than 30d
+--keep-last 3` prunes anything over a month old except the three newest
+snapshots of each target. Generation count is the axis age can't reach:
+the snapshot that fills a disk is usually the freshest one, taken the
+moment a large directory was first absorbed. `--keep-last 0` protects
+nothing, which is the honest spelling for "purge".
 
 ### Background auto-update (`[ui] auto_update`)
 

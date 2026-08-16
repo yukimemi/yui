@@ -3112,7 +3112,7 @@ fn gc_backup_survey_keeps_all_entries() {
     std::fs::write(backup.join("a_20260101_000000000.txt"), "old").unwrap();
     std::fs::write(backup.join("b_20260415_120000000.txt"), "fresh").unwrap();
 
-    gc_backup(Some(source.clone()), None, false, None, true).unwrap();
+    gc_backup(Some(source.clone()), None, None, false, None, true).unwrap();
 
     // Both still present.
     assert!(backup.join("a_20260101_000000000.txt").exists());
@@ -3141,7 +3141,15 @@ fn gc_backup_prune_removes_old_files_only() {
     // User-dropped file — not in yui shape.
     std::fs::write(backup.join("notes.md"), "mine").unwrap();
 
-    gc_backup(Some(source.clone()), Some("30d".into()), false, None, true).unwrap();
+    gc_backup(
+        Some(source.clone()),
+        Some("30d".into()),
+        None,
+        false,
+        None,
+        true,
+    )
+    .unwrap();
 
     assert!(!backup.join("sub/old_20200101_000000000.txt").exists());
     // Empty parent dir got cleaned up too.
@@ -3162,7 +3170,15 @@ fn gc_backup_dry_run_does_not_delete() {
     let backup = source.join(".yui/backup");
     std::fs::write(backup.join("old_20200101_000000000.txt"), "old").unwrap();
 
-    gc_backup(Some(source.clone()), Some("30d".into()), true, None, true).unwrap();
+    gc_backup(
+        Some(source.clone()),
+        Some("30d".into()),
+        None,
+        true,
+        None,
+        true,
+    )
+    .unwrap();
 
     assert!(
         backup.join("old_20200101_000000000.txt").exists(),
@@ -3185,11 +3201,120 @@ fn gc_backup_prune_handles_directory_snapshot() {
     std::fs::write(snap.join("init.lua"), "x").unwrap();
     std::fs::write(snap.join("lua/y.lua"), "y").unwrap();
 
-    gc_backup(Some(source.clone()), Some("30d".into()), false, None, true).unwrap();
+    gc_backup(
+        Some(source.clone()),
+        Some("30d".into()),
+        None,
+        false,
+        None,
+        true,
+    )
+    .unwrap();
 
     assert!(!snap.exists(), "dir snapshot removed wholesale");
     assert!(!backup.join("mirror").exists(), "empty mirror chain pruned");
     assert!(backup.exists(), "backup root preserved");
+}
+
+/// `--keep-last N` prunes by generation, which is the axis age can't
+/// reach: the snapshot that fills the disk is usually the freshest one.
+/// Buckets are per target, so a busy file losing generations must not
+/// drag another target's only snapshot with it.
+#[test]
+fn gc_backup_keep_last_prunes_per_target() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    std::fs::create_dir_all(source.join(".yui/backup/app")).unwrap();
+    std::fs::write(source.join("config.toml"), "").unwrap();
+    let backup = source.join(".yui/backup");
+
+    // Three generations of one target, all fresh (dated in the future
+    // so no age rule could be what removed them).
+    for ts in [
+        "20260101_000000000",
+        "20260102_000000000",
+        "20260103_000000000",
+    ] {
+        std::fs::write(backup.join(format!("app/config_{ts}.yml")), ts).unwrap();
+    }
+    // A different target in the same directory, single generation.
+    std::fs::write(backup.join("app/other_20260101_000000000.yml"), "other").unwrap();
+    // A directory snapshot of a third target.
+    let snap = backup.join("app/tree_20260101_000000000");
+    std::fs::create_dir_all(&snap).unwrap();
+    std::fs::write(snap.join("f.txt"), "x").unwrap();
+
+    gc_backup(Some(source.clone()), None, Some(1), false, None, true).unwrap();
+
+    // Newest generation of the busy target survives, older ones don't.
+    assert!(backup.join("app/config_20260103_000000000.yml").exists());
+    assert!(!backup.join("app/config_20260102_000000000.yml").exists());
+    assert!(!backup.join("app/config_20260101_000000000.yml").exists());
+    // Other targets each keep their only snapshot.
+    assert!(backup.join("app/other_20260101_000000000.yml").exists());
+    assert!(snap.exists(), "single dir snapshot of its own target kept");
+}
+
+/// The two rules are a retention policy: an entry survives if *either*
+/// protects it. A fresh entry beyond the generation limit stays because
+/// it is newer than the cutoff.
+#[test]
+fn gc_backup_age_and_generation_rules_compose() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    std::fs::create_dir_all(source.join(".yui/backup")).unwrap();
+    std::fs::write(source.join("config.toml"), "").unwrap();
+    let backup = source.join(".yui/backup");
+
+    // Two ancient generations…
+    std::fs::write(backup.join("c_20200101_000000000.yml"), "old1").unwrap();
+    std::fs::write(backup.join("c_20200102_000000000.yml"), "old2").unwrap();
+    // …and two fresh ones (tomorrow, so they can't age out).
+    let tomorrow = jiff::Zoned::now()
+        .checked_add(jiff::Span::new().days(1))
+        .unwrap();
+    let bdt = jiff::fmt::strtime::BrokenDownTime::from(&tomorrow);
+    let future_ts = bdt.to_string("%Y%m%d_%H%M%S%3f").unwrap();
+    std::fs::write(backup.join(format!("c_{future_ts}.yml")), "fresh").unwrap();
+
+    gc_backup(
+        Some(source.clone()),
+        Some("30d".into()),
+        Some(1),
+        false,
+        None,
+        true,
+    )
+    .unwrap();
+
+    // Fresh: protected by age even though it is the only kept generation.
+    assert!(backup.join(format!("c_{future_ts}.yml")).exists());
+    // Ancient + beyond the generation limit → gone.
+    assert!(!backup.join("c_20200101_000000000.yml").exists());
+    assert!(!backup.join("c_20200102_000000000.yml").exists());
+}
+
+/// `--keep-last 0` protects nothing — the honest spelling for "purge".
+/// `--dry-run` still writes nothing.
+#[test]
+fn gc_backup_keep_last_zero_purges_and_dry_run_is_safe() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    std::fs::create_dir_all(source.join(".yui/backup")).unwrap();
+    std::fs::write(source.join("config.toml"), "").unwrap();
+    let backup = source.join(".yui/backup");
+    std::fs::write(backup.join("a_20260101_000000000.txt"), "a").unwrap();
+    std::fs::write(backup.join("notes.md"), "mine").unwrap();
+
+    gc_backup(Some(source.clone()), None, Some(0), true, None, true).unwrap();
+    assert!(
+        backup.join("a_20260101_000000000.txt").exists(),
+        "dry-run must not delete"
+    );
+
+    gc_backup(Some(source.clone()), None, Some(0), false, None, true).unwrap();
+    assert!(!backup.join("a_20260101_000000000.txt").exists());
+    assert!(backup.join("notes.md").exists(), "user file untouched");
 }
 
 /// Build a no-op `ApplyCtx` over a `TempDir`. The returned tuple
