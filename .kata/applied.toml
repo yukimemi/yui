@@ -1,5 +1,5 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-08-19T03:32:41.009283271Z"
+applied_at = "2026-08-20T03:32:39.899136581Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
