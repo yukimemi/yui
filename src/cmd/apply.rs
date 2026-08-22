@@ -13,7 +13,7 @@ use anyhow::{Context as _, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use std::cell::{Cell, RefCell};
 use teravars::Context as TeraContext;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     let source = resolve_source(source)?;
@@ -411,7 +411,11 @@ fn walk_and_link_body(
             // still descends and per-file defaults still apply.
             // Phrase it so users don't read "skipping" as
             // "subtree blocked" (the v0.5 behaviour).
-            info!("no active [[link]] for {src_dir} — falling back to defaults");
+            //
+            // debug, not info: OS-gated `when` conditions mean every
+            // run has a whole platform's worth of inactive links, and
+            // that's the design working, not something to report.
+            debug!("no active [[link]] for {src_dir} — falling back to defaults");
         }
         if emitted_dir_link {
             covered = true;
