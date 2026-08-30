@@ -12,6 +12,9 @@
 //! `yui` is taken by an unrelated abandoned crate), but the repo
 //! and binary are both `yui`, so going through `env!("CARGO_PKG_NAME")`
 //! the way renri does would produce the wrong GitHub Release URL.
+//! `kaishin_opts` additionally passes `.crate_name("yui-cli")` so
+//! kaishin's `cargo install` fallback reaches the right package
+//! instead of the unrelated `yui` crate.
 //!
 //! The module exposes two layers:
 //!
@@ -41,6 +44,12 @@ use crate::vars::YuiVars;
 const OWNER: &str = "yukimemi";
 const REPO: &str = "yui";
 const BIN: &str = "yui";
+/// Published package name, for kaishin's `cargo install` fallback.
+/// crates.io's `yui` is taken by an unrelated abandoned crate, so this
+/// repo publishes as `yui-cli` (see `Cargo.toml`'s `[package] name`).
+/// Without this, kaishin would derive `cargo install yui` and reach
+/// the wrong package.
+const CRATE: &str = "yui-cli";
 
 /// How long [`finalize_auto_update_check`] waits for an in-flight
 /// background install before giving up (silently). Keeps fast commands
@@ -79,7 +88,7 @@ fn auto_update_disabled_by_env() -> bool {
 }
 
 fn kaishin_opts() -> kaishin::KaishinOptions {
-    kaishin::KaishinOptions::new(OWNER, REPO, BIN, env!("CARGO_PKG_VERSION"))
+    kaishin::KaishinOptions::new(OWNER, REPO, BIN, env!("CARGO_PKG_VERSION")).crate_name(CRATE)
 }
 
 fn make_runtime() -> Result<tokio::runtime::Runtime> {
