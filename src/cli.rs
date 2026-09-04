@@ -106,8 +106,24 @@ pub enum Command {
     /// `--yes`, prompts on a TTY before writing; off a TTY refuses
     /// to act unless `--yes` is given. `--dry-run` only shows the
     /// diff and exits.
+    ///
+    /// If no `[[mount.entry]]` / `[[link]]` already claims `target`
+    /// — or only the generic `[[mount.entry]]` fallback does — pass
+    /// `--to` to declare where it should live in source: yui creates
+    /// that directory, writes a `.yuilink` marker mapping it back to
+    /// `target` (substituting a known env var like `%APPDATA%` /
+    /// `$XDG_CONFIG_HOME` for portability when the target falls under
+    /// one), and proceeds with the absorb. Refuses to run if a
+    /// *different*, more specific `[[link]]`/`.yuilink` declaration
+    /// already claims `target`.
     Absorb {
         target: Utf8PathBuf,
+        /// Where `target` should live in source (relative to
+        /// $DOTFILES), e.g. `home/.config/magi`. Only used when no
+        /// specific declaration already claims `target`; writes a new
+        /// `.yuilink` marker there.
+        #[arg(long, value_name = "SRC")]
+        to: Option<Utf8PathBuf>,
         #[arg(long)]
         dry_run: bool,
         /// Skip the y/N prompt (still prints the diff).
@@ -337,9 +353,10 @@ impl Cli {
             } => cmd::list(source, all, icons, no_color),
             Command::Absorb {
                 target,
+                to,
                 dry_run,
                 yes,
-            } => cmd::absorb(source, target, dry_run, yes),
+            } => cmd::absorb(source, target, to, dry_run, yes),
             Command::Doctor { icons, no_color } => cmd::doctor(source, icons, no_color),
             Command::GcBackup {
                 older_than,
