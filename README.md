@@ -549,7 +549,17 @@ on_anomaly        = "ask"    # "ask" | "skip" | "force"
 
 Need to absorb a single file regardless of policy? `yui absorb
 <target-path>` does that — bypasses `auto`, `require_clean_git`, and
-`on_anomaly` for an explicit user-initiated pull.
+`on_anomaly` for an explicit user-initiated pull. If no `[[link]]`/
+`.yuilink` declaration claims the target yet — or only the generic
+`[[mount.entry]]` fallback does — pass `--to <SRC>` (a path relative
+to `$DOTFILES`, e.g. `home/.config/magi`): yui creates that
+directory, writes a `.yuilink` marker back to the target
+(substituting a known env var like `%APPDATA%` / `$XDG_CONFIG_HOME`
+for portability when the target falls under one), and absorbs into
+it. `--to` only creates a *new* declaration — it refuses to run if a
+*different*, more specific `[[link]]`/`.yuilink` declaration already
+claims the target, so it can't silently redirect an existing
+mapping.
 
 ## Commands
 
@@ -562,7 +572,7 @@ Need to absorb a single file regardless of policy? `yui absorb
 | `yui list [--all] [--icons MODE] [--no-color]` | every src→dst mapping |
 | `yui status [--icons MODE] [--no-color]` | drift overview, exits non-zero on any divergence |
 | `yui diff [--icons MODE] [--no-color]` | unified diff of every drifted entry (link or render) |
-| `yui absorb <target> [--dry-run] [--yes]` | pull one target into source — prints diff, confirms (`--yes` to skip) |
+| `yui absorb <target> [--to SRC] [--dry-run] [--yes]` | pull one target into source — prints diff, confirms (`--yes` to skip); `--to` declares a new `.yuilink` unless a more specific declaration already claims the target |
 | `yui unlink <path>...` | tear down a specific link |
 | `yui update [--dry-run]` | `git pull --ff-only` source repo, then re-apply |
 | `yui unmanaged [--icons MODE] [--no-color]` | list source files no `[[mount.entry]]` claims |

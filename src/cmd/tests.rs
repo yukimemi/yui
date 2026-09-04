@@ -1099,6 +1099,7 @@ dst = "{}"
     absorb(
         Some(source.clone()),
         target.join(".bashrc"),
+        /* to */ None,
         /* dry_run */ false,
         /* yes */ true,
     )
@@ -1138,6 +1139,7 @@ dst = "{}"
     absorb(
         Some(source.clone()),
         target.join("kimi-code"),
+        /* to */ None,
         /* dry_run */ false,
         /* yes */ true,
     )
@@ -1170,6 +1172,7 @@ fn manual_absorb_honors_dir_only_gitignore_for_target_only_dir() {
     let err = absorb(
         Some(source.clone()),
         target.join("sessions"),
+        /* to */ None,
         /* dry_run */ false,
         /* yes */ true,
     )
@@ -1193,7 +1196,7 @@ fn manual_absorb_errors_when_target_outside_known_mounts() {
     let stranger = utf8(tmp.path().join("not-managed/foo"));
     std::fs::create_dir_all(stranger.parent().unwrap()).unwrap();
     std::fs::write(&stranger, "not yui's").unwrap();
-    let err = absorb(Some(source), stranger, false, /* yes */ true).unwrap_err();
+    let err = absorb(Some(source), stranger, None, false, /* yes */ true).unwrap_err();
     assert!(format!("{err}").contains("no mount entry"));
 }
 
@@ -2292,6 +2295,7 @@ mode = "hardlink"
     absorb(
         Some(source.clone()),
         dst_file.clone(),
+        /* to */ None,
         /* dry_run */ false,
         /* yes */ true,
     )
