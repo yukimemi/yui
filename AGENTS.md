@@ -195,8 +195,13 @@ before reverting any of them.
   half-deleted target and no link if it was interrupted. Sibling
   placement is mandatory — `rename` is only atomic within one volume,
   which is also why the staging dir is not under `.yui/backup/`.
-  A refused rename (open handles on Windows) warns and falls back to
-  the in-place teardown.
+  A refused rename (open handles on Windows) aborts that operation
+  without merging or deleting the live target. Never fall back to
+  in-place teardown. If link creation fails after staging, restore the
+  original target when its path is still absent; otherwise retain the
+  staged tree and report its recovery path without deleting the new
+  occupant. Rollback uses an atomic no-replace rename; a metadata
+  existence check followed by ordinary rename is not sufficient.
 - **The staging name is the crash journal.** `Absorb` means "content
   may not have reached source yet → merge, then delete"; `Discard`
   means "already in `.yui/backup/` → delete unread". Each invariant is
@@ -205,7 +210,10 @@ before reverting any of them.
   state file. `recover_staged` runs at the top of
   `link_dir_with_backup`, **before `absorb::classify`** — a recovered
   target reads `InSync`, so classifying first would strand the
-  leftover. Recovery is idempotent: re-merging an already-merged tree
+  leftover. Recovery must first prove the target resolves to source
+  (installing the link if the target is absent); an unrelated target
+  blocks recovery without merging or deleting staging. Recovery is
+  idempotent: re-merging an already-merged tree
   is per-file content-classified, hence a no-op.
 - **backup path scheme**: mirror absolute target into
   `$DOTFILES/.yui/backup/<abs-path>` with the drive colon stripped on

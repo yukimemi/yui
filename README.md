@@ -98,7 +98,15 @@ reached `$DOTFILES/.yui/backup/` before the rename). Recovery runs
 ahead of the classifier on purpose — a relinked target reads `InSync`,
 so classification alone would walk right past the leftover. If the
 rename itself is refused — a file held open inside the tree on
-Windows, say — `yui` warns and falls back to deleting in place.
+Windows, say — `yui` stops that operation and leaves the live target
+unchanged. Close the applications using it and retry. There is no
+in-place deletion fallback. If link creation fails after staging,
+`yui` restores the original target when its path is still absent.
+If restoration is blocked, it keeps the staged tree and reports its
+path for recovery. Restoration uses an atomic no-replace rename, so a
+concurrent destination is never overwritten. On retry, staging is
+consumed only after the live target resolves to source; an unrelated
+target blocks recovery without changing source or the staged tree.
 
 ## Install
 
