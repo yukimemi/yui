@@ -30,7 +30,7 @@ name = "yui"
 path = "src/lib.rs"
 
 [dependencies]
-age = { version = "0.11.3", features = ["cli-common", "plugin"] }
+age = { version = "0.12.1", features = ["cli-common", "plugin"] }
 anyhow = "1.0.104"
 base64 = "0.23.1"
 camino = { version = "1.2.5", features = ["serde1"] }
