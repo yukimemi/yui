@@ -74,6 +74,52 @@ pub fn link_dir(src: &Utf8Path, dst: &Utf8Path, mode: EffectiveDirMode) -> Resul
     Ok(())
 }
 
+/// Rename a directory atomically without replacing any destination, including
+/// an empty directory created by another process during rollback.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn rename_dir_noreplace(src: &Utf8Path, dst: &Utf8Path) -> std::io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    renameat_with(
+        CWD,
+        src.as_std_path(),
+        CWD,
+        dst.as_std_path(),
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(Into::into)
+}
+
+#[cfg(windows)]
+pub(crate) fn rename_dir_noreplace(src: &Utf8Path, dst: &Utf8Path) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+    fn wide(path: &Utf8Path) -> std::io::Result<Vec<u16>> {
+        if path.as_str().contains('\0') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains NUL",
+            ));
+        }
+        Ok(path.as_str().encode_utf16().chain(Some(0)).collect())
+    }
+    let src = wide(src)?;
+    let dst = wide(dst)?;
+    // SAFETY: both buffers are valid NUL-terminated UTF-16 for this call.
+    // No MOVEFILE_REPLACE_EXISTING flag: a concurrent destination must survive.
+    if unsafe { MoveFileExW(src.as_ptr(), dst.as_ptr(), 0) } != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+pub(crate) fn rename_dir_noreplace(_src: &Utf8Path, _dst: &Utf8Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace directory rename is unavailable on this platform",
+    ))
+}
+
 /// Remove a yui-managed link. No-op if the path doesn't exist. Refuses to
 /// recursively delete a regular directory with contents.
 pub fn unlink(dst: &Utf8Path) -> Result<()> {

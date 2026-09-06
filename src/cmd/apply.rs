@@ -946,7 +946,7 @@ pub(crate) fn link_dir_with_backup(
     // Order matters: a recovered target reads `InSync`, so classify
     // would walk away and strand target-side content that never made
     // it into source.
-    recover_staged(src, dst, ctx)?;
+    recover_staged(src, dst, ctx, mode)?;
     if ctx.quit_requested.get() {
         return Ok(());
     }
@@ -971,9 +971,7 @@ pub(crate) fn link_dir_with_backup(
             // for symmetry with the file path: contents already match,
             // so just swap the target for a junction to source.
             info!("relink dir: {src} → {dst}");
-            remove_dir_link_or_real(dst)?;
-            link::link_dir(src, dst, mode)?;
-            Ok(())
+            overwrite_source_dir_into_target(src, dst, ctx, mode)
         }
         AutoAbsorb | NeedsConfirm => {
             // Reaching `link_dir_with_backup` means we're acting on a
@@ -1272,12 +1270,10 @@ fn merge_resolve_file_conflict(
 /// `Ok(None)` means `dst` was genuinely absent; the caller just links.
 /// `Err` means we could not stage: the rename was refused (open
 /// handles inside the tree on Windows, a mount point in the way,
-/// permissions), or `dst` could not even be stat'd. Neither is fatal
-/// — callers warn and fall back to the in-place teardown, which is
-/// exactly what yui did before staging existed. What we must not do
-/// is treat an unreadable-but-present `dst` as absent: that skips the
-/// backup and the merge, and hands the caller a `link_dir` that fails
-/// with "already exists" instead of the real cause.
+/// permissions), or `dst` could not even be stat'd. Callers must stop
+/// this operation and leave the live target unchanged. Falling back
+/// to recursive deletion could partially destroy it before a link
+/// exists. An unreadable-but-present target must not count as absent.
 fn stage_aside(dst: &Utf8Path, kind: paths::StagedKind) -> Result<Option<Utf8PathBuf>> {
     match std::fs::symlink_metadata(dst) {
         Ok(_) => {}
@@ -1289,6 +1285,38 @@ fn stage_aside(dst: &Utf8Path, kind: paths::StagedKind) -> Result<Option<Utf8Pat
         .with_context(|| format!("cannot derive a staging name for {dst}"))?;
     std::fs::rename(dst, &staged).with_context(|| format!("stage aside {dst} → {staged}"))?;
     Ok(Some(staged))
+}
+
+fn staging_failure_message(dst: &Utf8Path) -> String {
+    format!(
+        "cannot safely relink {dst}: target left unchanged; \
+         Close applications using this directory, check permissions, and retry"
+    )
+}
+
+/// A failed link must not strand the original target under the staging name.
+/// Never remove a destination that appeared in the meantime: it may belong to
+/// another process, or be a partial result of a failed link operation.
+fn link_staged_dir(
+    src: &Utf8Path,
+    dst: &Utf8Path,
+    staged: &Utf8Path,
+    mode: EffectiveDirMode,
+) -> Result<()> {
+    if let Err(error) = link::link_dir(src, dst, mode) {
+        let restored = link::rename_dir_noreplace(staged, dst)
+            .with_context(|| format!("restore {staged} → {dst}"));
+        return match restored {
+            Ok(()) => Err(anyhow::Error::new(error).context(format!(
+                "cannot link {src} → {dst}; original target restored"
+            ))),
+            Err(restore_error) => Err(anyhow::Error::new(error).context(format!(
+                "cannot link {src} → {dst}; original target retained at {staged}; \
+                 restoration failed: {restore_error:#}"
+            ))),
+        };
+    }
+    Ok(())
 }
 
 /// Delete a staged tree.
@@ -1328,11 +1356,42 @@ fn unstage(staged: &Utf8Path, dst: &Utf8Path) -> Result<()> {
 /// its snapshot before staging, and the merge below is
 /// content-classified per file, so re-running it over an
 /// already-merged tree is a no-op rather than a second overwrite.
-fn recover_staged(src: &Utf8Path, dst: &Utf8Path, ctx: &ApplyCtx<'_>) -> Result<()> {
+fn recover_staged(
+    src: &Utf8Path,
+    dst: &Utf8Path,
+    ctx: &ApplyCtx<'_>,
+    mode: EffectiveDirMode,
+) -> Result<()> {
     for (staged, kind) in paths::scan_staged(dst) {
         if ctx.dry_run {
             info!("[dry-run] finish interrupted {kind:?} staging: {staged}");
             continue;
+        }
+        // A failed installation can leave staging beside an unrelated target.
+        // Prove the live path resolves to source before consuming any recovery
+        // tree. If the process died before linking, install the link first.
+        match std::fs::symlink_metadata(dst) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !src.is_dir() {
+                    anyhow::bail!("cannot recover {staged}: source directory {src} is missing");
+                }
+                link_staged_dir(src, dst, &staged, mode)?;
+            }
+            Ok(_) => {
+                if !same_file::is_same_file(src, dst).with_context(|| {
+                    format!("verify {dst} links to {src}; recovery tree retained at {staged}")
+                })? {
+                    anyhow::bail!(
+                        "cannot recover {staged}: {dst} does not link to {src}; \
+                         target, source, and recovery tree left unchanged"
+                    );
+                }
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "stat {dst} before recovery; recovery tree retained at {staged}"
+                )));
+            }
         }
         match kind {
             paths::StagedKind::Absorb => {
@@ -1381,29 +1440,16 @@ pub(crate) fn absorb_target_dir_into_source(
     info!("absorb dir: {dst} → {src}");
     backup_existing(src, ctx.backup_root, /* is_dir */ true)?;
 
-    let staged = match stage_aside(dst, paths::StagedKind::Absorb) {
-        Ok(Some(staged)) => staged,
+    let staged = match stage_aside(dst, paths::StagedKind::Absorb)
+        .with_context(|| staging_failure_message(dst))?
+    {
+        Some(staged) => staged,
         // Target vanished under us between classify and now — there is
         // nothing left to absorb, so just expose source.
-        Ok(None) => return link::link_dir(src, dst, mode).map_err(Into::into),
-        Err(e) => {
-            warn!("cannot stage {dst} aside ({e:#}) — falling back to in-place teardown");
-            merge_dir_target_into_source(dst, src, ctx)?;
-            if ctx.quit_requested.get() {
-                warn!(
-                    "absorb dir interrupted by user quit: {dst} \
-                     — leaving target tree intact; source backup at {}",
-                    ctx.backup_root
-                );
-                return Ok(());
-            }
-            remove_dir_link_or_real(dst)?;
-            link::link_dir(src, dst, mode)?;
-            return Ok(());
-        }
+        None => return link::link_dir(src, dst, mode).map_err(Into::into),
     };
 
-    link::link_dir(src, dst, mode)?;
+    link_staged_dir(src, dst, &staged, mode)?;
     merge_dir_target_into_source(&staged, src, ctx)?;
 
     // If the user picked `[q]uit` at a prompt during the merge, put the
@@ -1439,17 +1485,14 @@ fn overwrite_source_dir_into_target(
 ) -> Result<()> {
     info!("overwrite dir: {src} → {dst}");
     backup_existing(dst, ctx.backup_root, /* is_dir */ true)?;
-    match stage_aside(dst, paths::StagedKind::Discard) {
-        Ok(Some(staged)) => {
-            link::link_dir(src, dst, mode)?;
+    match stage_aside(dst, paths::StagedKind::Discard)
+        .with_context(|| staging_failure_message(dst))?
+    {
+        Some(staged) => {
+            link_staged_dir(src, dst, &staged, mode)?;
             remove_staged(&staged);
         }
-        Ok(None) => link::link_dir(src, dst, mode)?,
-        Err(e) => {
-            warn!("cannot stage {dst} aside ({e:#}) — falling back to in-place teardown");
-            remove_dir_link_or_real(dst)?;
-            link::link_dir(src, dst, mode)?;
-        }
+        None => link::link_dir(src, dst, mode)?,
     }
     Ok(())
 }
@@ -1513,3 +1556,6 @@ fn backup_existing(target: &Utf8Path, backup_root: &Utf8Path, is_dir: bool) -> R
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod staging_tests;

@@ -3901,6 +3901,7 @@ dependencies = [
  "kaishin",
  "owo-colors",
  "predicates",
+ "rustix 1.1.4",
  "same-file",
  "serde",
  "serde_json",
@@ -3915,6 +3916,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "whoami",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
