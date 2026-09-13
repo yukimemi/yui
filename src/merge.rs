@@ -30,9 +30,6 @@ pub struct MergeEntry {
     pub src: Utf8PathBuf,
     /// Destination live target path. Tera-rendered, `~` expanded.
     pub dst: String,
-    /// Format of the configuration file. Default: auto-detected from extension (or TOML).
-    #[serde(default)]
-    pub format: Option<MergeFormat>,
     /// Keys to ignore when absorbing from target into source.
     /// Supports dot-notation for nested tables (e.g. `"marketplaces.openai-bundled"`).
     #[serde(default)]
@@ -40,14 +37,6 @@ pub struct MergeEntry {
     /// Optional Tera boolean predicate gating this entry.
     #[serde(default)]
     pub when: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum MergeFormat {
-    #[default]
-    Toml,
-    Json,
 }
 
 impl MergeEntry {

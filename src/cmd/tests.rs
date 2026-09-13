@@ -4186,7 +4186,11 @@ dst = "{}"
     );
     std::fs::write(source.join("config.toml"), cfg).unwrap();
 
-    apply(Some(source.clone()), false).unwrap();
+    // Default `on_anomaly = "ask"`, off-TTY: nobody to ask, so this is
+    // reported as unresolved and the run fails — same as the file-level
+    // `off_tty_anomaly_is_reported_instead_of_silently_skipped` case.
+    let err = apply(Some(source.clone()), false).unwrap_err();
+    assert!(format!("{err:#}").contains("unresolved"));
 
     assert_eq!(
         std::fs::read_to_string(&target_file).unwrap(),
@@ -4237,11 +4241,180 @@ dst = "{}"
     // same as the file-level require_clean_git tests do.
     std::fs::write(source.join("untracked.txt"), "dirty").unwrap();
 
-    apply(Some(source.clone()), false).unwrap();
+    // Default `on_anomaly = "ask"`, off-TTY: nobody to ask, so this is
+    // reported as unresolved and the run fails — same as the file-level
+    // `off_tty_anomaly_is_reported_instead_of_silently_skipped` case.
+    let err = apply(Some(source.clone()), false).unwrap_err();
+    assert!(format!("{err:#}").contains("unresolved"));
 
     let base_after = std::fs::read_to_string(&base_file).unwrap();
     assert!(
         !base_after.contains("live_added"),
         "a dirty source repo must defer merge auto-absorb, not base:\n{base_after}"
+    );
+}
+
+/// `[absorb] on_anomaly = "skip"` is the explicit "leave it alone"
+/// answer for a merge entry whose target is newer than base but
+/// auto-absorb didn't run — it must stay silent (exit 0), unlike the
+/// default `ask`, which fails the run when there's no TTY to ask at.
+#[test]
+fn apply_merge_anomaly_skip_policy_does_not_fail_the_run() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let now = std::time::SystemTime::now();
+    let past = now - std::time::Duration::from_secs(120);
+    write_with_mtime(
+        &source.join("home/config.base.toml"),
+        "model = \"gpt-6\"\n",
+        past,
+    );
+
+    let target_file = target.join("config.toml");
+    write_with_mtime(&target_file, "model = \"gpt-6-user-edited\"\n", now);
+
+    let cfg = format!(
+        r#"
+[absorb]
+auto = false
+on_anomaly = "skip"
+
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        "model = \"gpt-6-user-edited\"\n"
+    );
+}
+
+/// `[absorb] on_anomaly = "force"` for a merge entry whose target is
+/// newer than base but auto-absorb didn't run must still fold target's
+/// state into `src` — the same "force through the gate" contract the
+/// file-level `AutoAbsorb` path honors.
+#[test]
+fn apply_merge_anomaly_force_policy_absorbs_despite_auto_false() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let base_file = source.join("home/config.base.toml");
+    let now = std::time::SystemTime::now();
+    let past = now - std::time::Duration::from_secs(120);
+    write_with_mtime(&base_file, "model = \"gpt-6\"\n", past);
+
+    let target_file = target.join("config.toml");
+    write_with_mtime(
+        &target_file,
+        "model = \"gpt-6\"\nlive_added = \"yes\"\n",
+        now,
+    );
+
+    let cfg = format!(
+        r#"
+[absorb]
+auto = false
+on_anomaly = "force"
+
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    let base_after = std::fs::read_to_string(&base_file).unwrap();
+    assert!(
+        base_after.contains("live_added"),
+        "on_anomaly = \"force\" must absorb target into base despite auto=false:\n{base_after}"
+    );
+}
+
+/// `status` must not treat a `[[merge]]` `src` living under a mounted
+/// subtree as a missing plain link — `apply` never creates that
+/// mount-derived destination for it (see
+/// `apply_does_not_link_merge_source_via_generic_mount_walk`), so
+/// `status`'s parallel walk has to exclude it the same way.
+#[test]
+fn status_does_not_report_merge_source_as_missing_link() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    std::fs::write(source.join("home/config.base.toml"), "model = \"gpt-6\"\n").unwrap();
+
+    let target_file = target.join("config.toml");
+    let cfg = format!(
+        r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+"#,
+        toml_path(&target),
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    assert!(
+        status(Some(source.clone()), None, true).is_ok(),
+        "status must not report the merge source as a missing plain link"
+    );
+}
+
+#[test]
+fn diff_succeeds_and_detects_merge_drift() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let base_file = source.join("home/config.base.toml");
+    let target_file = target.join("config.toml");
+    std::fs::write(&base_file, "model = \"gpt-6\"\n").unwrap();
+    std::fs::write(
+        &target_file,
+        "model = \"gpt-6-diverged\"\n[projects]\n\"c:\\secret\" = \"trusted\"\n",
+    )
+    .unwrap();
+
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+ignore_keys = ["projects"]
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    assert!(
+        diff(Some(source.clone()), None, true).is_ok(),
+        "diff must report merge drift successfully"
     );
 }

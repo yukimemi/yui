@@ -38,6 +38,16 @@ pub fn diff(
     let _icons = Icons::for_mode(icons_override.unwrap_or(config.ui.icons));
     let color = !no_color && supports_color_stdout();
 
+    // `[[merge]]` sources are excluded from the generic mount walk the
+    // same way `apply`/`status` exclude them (see the `merge_sources`
+    // comment in `cmd::apply`) — otherwise the walk reports them as a
+    // missing plain link.
+    let merge_sources: std::collections::HashSet<Utf8PathBuf> = config
+        .merge
+        .iter()
+        .map(|m| paths::normalize(&source.join(&m.src)))
+        .collect();
+
     // Reuse classify_walk to enumerate every src→dst pair.
     let mut report: Vec<StatusItem> = Vec::new();
     let mut yuiignore = paths::YuiIgnoreStack::with_gitignore(config.mount.respect_gitignore);
@@ -60,6 +70,7 @@ pub fn diff(
                 &source,
                 &mut yuiignore,
                 &mut report,
+                &merge_sources,
             )?;
         }
         Ok(())
@@ -90,6 +101,32 @@ pub fn diff(
             }
         }
         Err(e) => tracing::warn!("secret drift check skipped: {e}"),
+    }
+
+    // Merge drift — check [[merge]] entries (same as cmd::status).
+    for m in &config.merge {
+        if m.is_active(&mut engine, &tera_ctx)? {
+            let src_path = source.join(&m.src);
+            let dst_path = m.resolve_dst(&mut engine, &tera_ctx)?;
+            let state = if !dst_path.exists() || !src_path.exists() {
+                StatusState::MergeDrift
+            } else {
+                let src_content = std::fs::read_to_string(&src_path).unwrap_or_default();
+                let dst_content = std::fs::read_to_string(&dst_path).unwrap_or_default();
+                let src_table: toml::Table = toml::from_str(&src_content).unwrap_or_default();
+                let dst_table: toml::Table = toml::from_str(&dst_content).unwrap_or_default();
+                if crate::merge::check_drift(&src_table, &dst_table, &m.ignore_keys) {
+                    StatusState::MergeDrift
+                } else {
+                    StatusState::MergeInSync
+                }
+            };
+            report.push(StatusItem {
+                src: super::status::relative_for_display(&source, &src_path),
+                dst: dst_path,
+                state,
+            });
+        }
     }
 
     let mut printed = 0usize;
@@ -228,6 +265,53 @@ fn print_unified_diff(
                 return;
             }
         },
+        StatusState::MergeDrift => {
+            let ignore_keys = config
+                .merge
+                .iter()
+                .find(|m| {
+                    let rel_src = paths::normalize(&source_root.join(&m.src));
+                    let abs_src = paths::normalize(src);
+                    rel_src == abs_src
+                })
+                .map(|m| m.ignore_keys.as_slice())
+                .unwrap_or(&[]);
+
+            let src_text = match read_text_for_diff(src) {
+                DiffSide::Text(s) => s,
+                DiffSide::Binary => {
+                    println!("(binary file or non-UTF-8 content — diff skipped)");
+                    println!();
+                    return;
+                }
+            };
+            let dst_text = match read_text_for_diff(dst) {
+                DiffSide::Text(s) => s,
+                DiffSide::Binary => {
+                    println!("(binary file or non-UTF-8 content — diff skipped)");
+                    println!();
+                    return;
+                }
+            };
+
+            let mut src_table: toml::Table = toml::from_str(&src_text).unwrap_or_default();
+            let mut dst_table: toml::Table = toml::from_str(&dst_text).unwrap_or_default();
+            crate::merge::filter_table(&mut src_table, ignore_keys);
+            crate::merge::filter_table(&mut dst_table, ignore_keys);
+
+            let filtered_src = toml::to_string_pretty(&src_table).unwrap_or(src_text);
+            let filtered_dst = toml::to_string_pretty(&dst_table).unwrap_or(dst_text);
+
+            print_unified_text_diff(
+                &filtered_src,
+                &filtered_dst,
+                src.as_str(),
+                dst.as_str(),
+                color,
+            );
+            println!();
+            return;
+        }
         _ => match read_text_for_diff(src) {
             DiffSide::Text(s) => s,
             DiffSide::Binary => {

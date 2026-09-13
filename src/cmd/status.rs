@@ -51,6 +51,17 @@ pub fn status(
     let icons = Icons::for_mode(icons_mode);
     let color = !no_color && supports_color_stdout();
 
+    // `[[merge]]` sources are excluded from the generic mount walk the
+    // same way `apply` excludes them (see the `merge_sources` comment
+    // there) — otherwise `status` reports them as a missing plain link
+    // (the mount-derived destination `apply` never creates for them),
+    // which never reaches in-sync and fails every run.
+    let merge_sources: std::collections::HashSet<Utf8PathBuf> = config
+        .merge
+        .iter()
+        .map(|m| paths::normalize(&source.join(&m.src)))
+        .collect();
+
     let mut report: Vec<StatusItem> = Vec::new();
 
     // 1. Template drift — render in dry-run mode and surface anything
@@ -114,6 +125,7 @@ pub fn status(
                 &source,
                 &mut yuiignore,
                 &mut report,
+                &merge_sources,
             )?;
         }
         Ok(())
@@ -211,6 +223,7 @@ pub(crate) fn classify_walk(
     source_root: &Utf8Path,
     yuiignore: &mut paths::YuiIgnoreStack,
     report: &mut Vec<StatusItem>,
+    merge_sources: &std::collections::HashSet<Utf8PathBuf>,
 ) -> Result<()> {
     classify_walk_inner(
         src_dir,
@@ -224,6 +237,7 @@ pub(crate) fn classify_walk(
         yuiignore,
         report,
         false,
+        merge_sources,
     )
 }
 
@@ -240,6 +254,7 @@ fn classify_walk_inner(
     yuiignore: &mut paths::YuiIgnoreStack,
     report: &mut Vec<StatusItem>,
     parent_covered: bool,
+    merge_sources: &std::collections::HashSet<Utf8PathBuf>,
 ) -> Result<()> {
     if yuiignore.is_ignored(src_dir, /* is_dir */ true) {
         return Ok(());
@@ -259,6 +274,7 @@ fn classify_walk_inner(
         yuiignore,
         report,
         parent_covered,
+        merge_sources,
     );
     yuiignore.pop_dir(src_dir);
     result
@@ -277,6 +293,7 @@ fn classify_walk_inner_body(
     yuiignore: &mut paths::YuiIgnoreStack,
     report: &mut Vec<StatusItem>,
     parent_covered: bool,
+    merge_sources: &std::collections::HashSet<Utf8PathBuf>,
 ) -> Result<()> {
     let marker_filename = &config.mount.marker_filename;
     let mut covered = parent_covered;
@@ -363,8 +380,10 @@ fn classify_walk_inner_body(
                 yuiignore,
                 report,
                 covered,
+                merge_sources,
             )?;
-        } else if ft.is_file() && !covered {
+        } else if ft.is_file() && !covered && !merge_sources.contains(&paths::normalize(&src_path))
+        {
             let decision = absorb::classify(&src_path, &dst_path)?;
             report.push(StatusItem {
                 src: relative_for_display(source_root, &src_path),
@@ -376,7 +395,7 @@ fn classify_walk_inner_body(
     Ok(())
 }
 
-fn relative_for_display(source_root: &Utf8Path, p: &Utf8Path) -> Utf8PathBuf {
+pub(crate) fn relative_for_display(source_root: &Utf8Path, p: &Utf8Path) -> Utf8PathBuf {
     p.strip_prefix(source_root)
         .map(Utf8PathBuf::from)
         .unwrap_or_else(|_| p.to_path_buf())
