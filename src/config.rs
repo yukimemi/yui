@@ -29,6 +29,10 @@ pub struct Config {
     #[serde(default)]
     pub link: Vec<LinkEntry>,
 
+    /// Central `[[merge]]` table — semantic config file merging.
+    #[serde(default)]
+    pub merge: Vec<crate::merge::MergeEntry>,
+
     #[serde(default)]
     pub mount: MountConfig,
 

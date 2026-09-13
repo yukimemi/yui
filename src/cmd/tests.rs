@@ -3802,3 +3802,619 @@ dst = "{}"
         "a clean check should still report something: {probes:?}"
     );
 }
+
+#[test]
+fn apply_merges_base_into_target_preserving_local_state() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let target_content = r#"
+model = "gpt-5"
+notify = "path/to/exe"
+[projects]
+"c:\\test" = "trusted"
+"#;
+    let target_file = target.join("config.toml");
+    std::fs::write(&target_file, target_content).unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let base_content = r#"
+model = "gpt-6-astra"
+model_reasoning_effort = "high"
+"#;
+    std::fs::write(source.join("home/config.base.toml"), base_content).unwrap();
+
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+ignore_keys = ["notify", "projects"]
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    let merged_str = std::fs::read_to_string(&target_file).unwrap();
+    let merged: toml::Table = toml::from_str(&merged_str).unwrap();
+
+    assert_eq!(
+        merged.get("model").unwrap().as_str().unwrap(),
+        "gpt-6-astra"
+    );
+    assert_eq!(
+        merged
+            .get("model_reasoning_effort")
+            .unwrap()
+            .as_str()
+            .unwrap(),
+        "high"
+    );
+    assert_eq!(
+        merged.get("notify").unwrap().as_str().unwrap(),
+        "path/to/exe"
+    );
+    assert!(merged.contains_key("projects"));
+}
+
+#[test]
+fn apply_creates_target_from_merge_base_if_missing() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+
+    let base_content = r#"
+model = "gpt-6-astra"
+"#;
+    std::fs::write(source.join("home/config.base.toml"), base_content).unwrap();
+    let target_file = target.join("sub/config.toml");
+
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    assert!(target_file.exists());
+    let content = std::fs::read_to_string(&target_file).unwrap();
+    assert!(content.contains("gpt-6-astra"));
+}
+
+#[test]
+fn absorb_command_merges_target_excluding_ignore_keys() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let base_file = source.join("home/config.base.toml");
+    std::fs::write(&base_file, "model = \"gpt-6\"\n").unwrap();
+
+    let target_file = target.join("config.toml");
+    let target_content = r#"
+model = "gpt-6"
+new_feature = true
+notify = "secret_path"
+[projects]
+"c:\\secret" = "trusted"
+"#;
+    std::fs::write(&target_file, target_content).unwrap();
+
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+ignore_keys = ["notify", "projects"]
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    absorb(Some(source.clone()), target_file, None, false, true).unwrap();
+
+    let absorbed_str = std::fs::read_to_string(&base_file).unwrap();
+    let absorbed: toml::Table = toml::from_str(&absorbed_str).unwrap();
+
+    assert_eq!(absorbed.get("model").unwrap().as_str().unwrap(), "gpt-6");
+    assert!(absorbed.get("new_feature").unwrap().as_bool().unwrap());
+    assert!(!absorbed.contains_key("notify"));
+    assert!(!absorbed.contains_key("projects"));
+}
+
+#[test]
+fn apply_auto_absorbs_when_target_newer() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let base_file = source.join("home/config.base.toml");
+    std::fs::write(&base_file, "model = \"gpt-6\"\n").unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let target_file = target.join("config.toml");
+    let target_content = r#"
+model = "gpt-6"
+live_added = "yes"
+notify = "skip_me"
+"#;
+    std::fs::write(&target_file, target_content).unwrap();
+
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+ignore_keys = ["notify"]
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    let absorbed_str = std::fs::read_to_string(&base_file).unwrap();
+    let absorbed: toml::Table = toml::from_str(&absorbed_str).unwrap();
+
+    assert_eq!(absorbed.get("live_added").unwrap().as_str().unwrap(), "yes");
+    assert!(!absorbed.contains_key("notify"));
+}
+
+#[test]
+fn status_reports_in_sync_for_clean_merge() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let base_file = source.join("home/config.base.toml");
+    std::fs::write(&base_file, "model = \"gpt-6\"\n").unwrap();
+
+    let target_file = target.join("config.toml");
+    let target_content = r#"
+model = "gpt-6"
+notify = "skip_me"
+"#;
+    std::fs::write(&target_file, target_content).unwrap();
+
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+ignore_keys = ["notify"]
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    // status returns Ok(()) when all entries are in sync
+    assert!(status(Some(source.clone()), None, true).is_ok());
+}
+
+#[test]
+fn status_detects_merge_drift_on_user_setting_change() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let base_file = source.join("home/config.base.toml");
+    std::fs::write(&base_file, "model = \"gpt-6\"\n").unwrap();
+
+    let target_file = target.join("config.toml");
+    let target_content = r#"
+model = "gpt-6-changed"
+notify = "skip_me"
+"#;
+    std::fs::write(&target_file, target_content).unwrap();
+
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+ignore_keys = ["notify"]
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    // status returns Err when drift exists
+    assert!(status(Some(source.clone()), None, true).is_err());
+}
+
+/// A `[[merge]]` `src` living under a mounted subtree (the shape the
+/// README's own example uses: `home/.codex/config.base.toml`) must not
+/// also be picked up by the generic per-file mount walk — that walk
+/// knows nothing about `[[merge]]` and would otherwise link the base
+/// file straight into the target directory as an unwanted extra file.
+#[test]
+fn apply_does_not_link_merge_source_via_generic_mount_walk() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    std::fs::write(source.join("home/config.base.toml"), "model = \"gpt-6\"\n").unwrap();
+
+    let target_file = target.join("config.toml");
+    let cfg = format!(
+        r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+"#,
+        toml_path(&target),
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    assert!(target_file.exists(), "merge should still create its target");
+    assert!(
+        !target.join("config.base.toml").exists(),
+        "the mount walk must not also link the merge source directly"
+    );
+}
+
+/// `check_drift` has to catch drift in both directions: not just "target
+/// has something absorb should pull into base" but also "base gained a
+/// key apply hasn't pushed to target yet". Otherwise `status` reports
+/// `in-sync (merge)` for a target that a fresh `apply` would still change.
+#[test]
+fn test_check_drift_detects_new_key_added_to_base() {
+    let base: toml::Table = r#"
+model = "gpt-6-astra"
+new_setting = true
+"#
+    .parse()
+    .unwrap();
+
+    let target: toml::Table = r#"
+model = "gpt-6-astra"
+"#
+    .parse()
+    .unwrap();
+
+    assert!(
+        crate::merge::check_drift(&base, &target, &[]),
+        "a key present only in base is unapplied drift, not in-sync"
+    );
+}
+
+/// `merge_toml` runs on every `apply`, so array-valued base keys must be
+/// replaced, not appended, in the target — otherwise a second `apply`
+/// with no real change duplicates every element again.
+#[test]
+fn apply_does_not_duplicate_array_values_on_repeated_runs() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    std::fs::write(
+        source.join("home/config.base.toml"),
+        "allowed = [\"a\", \"b\"]\n",
+    )
+    .unwrap();
+
+    let target_file = target.join("config.toml");
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+    apply(Some(source.clone()), false).unwrap();
+    apply(Some(source.clone()), false).unwrap();
+
+    let merged: toml::Table =
+        toml::from_str(&std::fs::read_to_string(&target_file).unwrap()).unwrap();
+    let allowed = merged.get("allowed").unwrap().as_array().unwrap();
+    assert_eq!(
+        allowed.len(),
+        2,
+        "repeated apply must not keep appending base's array: {allowed:?}"
+    );
+}
+
+/// `[absorb] auto = false` is a kill-switch: it must stop the newer
+/// target's overlapping values from being silently overwritten by the
+/// (now-stale) base during `apply`'s merge step, the same way it stops
+/// the file-level `AutoAbsorb` path.
+#[test]
+fn apply_merge_does_not_overwrite_newer_target_when_auto_absorb_disabled() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let now = std::time::SystemTime::now();
+    let past = now - std::time::Duration::from_secs(120);
+    write_with_mtime(
+        &source.join("home/config.base.toml"),
+        "model = \"gpt-6\"\n",
+        past,
+    );
+
+    let target_file = target.join("config.toml");
+    write_with_mtime(&target_file, "model = \"gpt-6-user-edited\"\n", now);
+
+    let cfg = format!(
+        r#"
+[absorb]
+auto = false
+
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    // Default `on_anomaly = "ask"`, off-TTY: nobody to ask, so this is
+    // reported as unresolved and the run fails — same as the file-level
+    // `off_tty_anomaly_is_reported_instead_of_silently_skipped` case.
+    let err = apply(Some(source.clone()), false).unwrap_err();
+    assert!(format!("{err:#}").contains("unresolved"));
+
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        "model = \"gpt-6-user-edited\"\n",
+        "auto=false must not let the stale base overwrite the newer target edit"
+    );
+}
+
+/// `[absorb] require_clean_git = true` has to gate merge auto-absorb the
+/// same way it gates the file-level `AutoAbsorb` path: a dirty source
+/// repo must defer pulling target's newer state into `src`, instead of
+/// writing straight into an uncommitted base file.
+#[test]
+fn apply_merge_auto_absorb_respects_require_clean_git() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let base_file = source.join("home/config.base.toml");
+    let now = std::time::SystemTime::now();
+    let past = now - std::time::Duration::from_secs(120);
+    write_with_mtime(&base_file, "model = \"gpt-6\"\n", past);
+
+    let target_file = target.join("config.toml");
+    write_with_mtime(
+        &target_file,
+        "model = \"gpt-6\"\nlive_added = \"yes\"\n",
+        now,
+    );
+
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    if !git_init_and_commit(&source) {
+        eprintln!("skipping: git not available");
+        return;
+    }
+    // Dirty the source repo *after* the commit `git_init_and_commit` made,
+    // same as the file-level require_clean_git tests do.
+    std::fs::write(source.join("untracked.txt"), "dirty").unwrap();
+
+    // Default `on_anomaly = "ask"`, off-TTY: nobody to ask, so this is
+    // reported as unresolved and the run fails — same as the file-level
+    // `off_tty_anomaly_is_reported_instead_of_silently_skipped` case.
+    let err = apply(Some(source.clone()), false).unwrap_err();
+    assert!(format!("{err:#}").contains("unresolved"));
+
+    let base_after = std::fs::read_to_string(&base_file).unwrap();
+    assert!(
+        !base_after.contains("live_added"),
+        "a dirty source repo must defer merge auto-absorb, not base:\n{base_after}"
+    );
+}
+
+/// `[absorb] on_anomaly = "skip"` is the explicit "leave it alone"
+/// answer for a merge entry whose target is newer than base but
+/// auto-absorb didn't run — it must stay silent (exit 0), unlike the
+/// default `ask`, which fails the run when there's no TTY to ask at.
+#[test]
+fn apply_merge_anomaly_skip_policy_does_not_fail_the_run() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let now = std::time::SystemTime::now();
+    let past = now - std::time::Duration::from_secs(120);
+    write_with_mtime(
+        &source.join("home/config.base.toml"),
+        "model = \"gpt-6\"\n",
+        past,
+    );
+
+    let target_file = target.join("config.toml");
+    write_with_mtime(&target_file, "model = \"gpt-6-user-edited\"\n", now);
+
+    let cfg = format!(
+        r#"
+[absorb]
+auto = false
+on_anomaly = "skip"
+
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        "model = \"gpt-6-user-edited\"\n"
+    );
+}
+
+/// `[absorb] on_anomaly = "force"` for a merge entry whose target is
+/// newer than base but auto-absorb didn't run must still fold target's
+/// state into `src` — the same "force through the gate" contract the
+/// file-level `AutoAbsorb` path honors.
+#[test]
+fn apply_merge_anomaly_force_policy_absorbs_despite_auto_false() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let base_file = source.join("home/config.base.toml");
+    let now = std::time::SystemTime::now();
+    let past = now - std::time::Duration::from_secs(120);
+    write_with_mtime(&base_file, "model = \"gpt-6\"\n", past);
+
+    let target_file = target.join("config.toml");
+    write_with_mtime(
+        &target_file,
+        "model = \"gpt-6\"\nlive_added = \"yes\"\n",
+        now,
+    );
+
+    let cfg = format!(
+        r#"
+[absorb]
+auto = false
+on_anomaly = "force"
+
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    let base_after = std::fs::read_to_string(&base_file).unwrap();
+    assert!(
+        base_after.contains("live_added"),
+        "on_anomaly = \"force\" must absorb target into base despite auto=false:\n{base_after}"
+    );
+}
+
+/// `status` must not treat a `[[merge]]` `src` living under a mounted
+/// subtree as a missing plain link — `apply` never creates that
+/// mount-derived destination for it (see
+/// `apply_does_not_link_merge_source_via_generic_mount_walk`), so
+/// `status`'s parallel walk has to exclude it the same way.
+#[test]
+fn status_does_not_report_merge_source_as_missing_link() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    std::fs::write(source.join("home/config.base.toml"), "model = \"gpt-6\"\n").unwrap();
+
+    let target_file = target.join("config.toml");
+    let cfg = format!(
+        r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+"#,
+        toml_path(&target),
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    assert!(
+        status(Some(source.clone()), None, true).is_ok(),
+        "status must not report the merge source as a missing plain link"
+    );
+}
+
+#[test]
+fn diff_succeeds_and_detects_merge_drift() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let base_file = source.join("home/config.base.toml");
+    let target_file = target.join("config.toml");
+    std::fs::write(&base_file, "model = \"gpt-6\"\n").unwrap();
+    std::fs::write(
+        &target_file,
+        "model = \"gpt-6-diverged\"\n[projects]\n\"c:\\secret\" = \"trusted\"\n",
+    )
+    .unwrap();
+
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+ignore_keys = ["projects"]
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    assert!(
+        diff(Some(source.clone()), None, true).is_ok(),
+        "diff must report merge drift successfully"
+    );
+}

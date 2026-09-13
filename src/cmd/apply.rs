@@ -129,6 +129,21 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
         info!("dry-run: nothing will be written");
     }
 
+    // `[[merge]]` sources live inside the dotfiles tree (typically under
+    // a mounted `home/`), but they are never meant to be linked directly
+    // — they're only ever read by `merge::apply_entry`/`absorb_entry`.
+    // Without this exclusion, the generic per-file walk below would also
+    // link them as ordinary files: at best an unwanted extra link next
+    // to the merge target, at worst — if a `src` happens to share a
+    // mount-derived destination with the merge `dst` — the walk would
+    // treat the live target as a plain link anomaly and absorb/overwrite
+    // it, destroying the local state `[[merge]]` exists to preserve.
+    let merge_sources: std::collections::HashSet<Utf8PathBuf> = config
+        .merge
+        .iter()
+        .map(|m| paths::normalize(&source.join(&m.src)))
+        .collect();
+
     // Nested ignore stack — push on dir entry, pop on exit. Seed
     // with the source-root layer so root-level rules apply from the
     // start without `walk_and_link` having to special-case it.
@@ -137,12 +152,85 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     let walk_result = (|| -> Result<()> {
         for m in &mounts {
             info!("mount: {} → {}", m.src, m.dst);
-            process_mount(m, &ctx, &mut engine, &tera_ctx, &mut yuiignore)?;
+            process_mount(
+                m,
+                &ctx,
+                &mut engine,
+                &tera_ctx,
+                &mut yuiignore,
+                &merge_sources,
+            )?;
         }
         Ok(())
     })();
     yuiignore.pop_dir(&source);
     walk_result?;
+
+    // 2b. Semantic merge for [[merge]] entries.
+    for m in &config.merge {
+        if ctx.quit_requested.get() {
+            break;
+        }
+        if m.is_active(&mut engine, &tera_ctx)? {
+            let dst_path = m.resolve_dst(&mut engine, &tera_ctx)?;
+            let src_path = source.join(&m.src);
+            if dst_path.exists() && src_path.exists() {
+                let dst_meta = std::fs::metadata(&dst_path).ok();
+                let src_meta = std::fs::metadata(&src_path).ok();
+                let dst_mtime = dst_meta.and_then(|m| m.modified().ok());
+                let src_mtime = src_meta.and_then(|m| m.modified().ok());
+                if let (Some(dt), Some(st)) = (dst_mtime, src_mtime) {
+                    if dt > st {
+                        // Same gates as the file-level `AutoAbsorb` path
+                        // (`link_file_with_backup`): the `auto` kill-switch
+                        // and `require_clean_git` both have to clear before
+                        // target's newer edits are allowed to flow back into
+                        // source. Skipping straight to `apply_entry` here
+                        // would deep-merge the *old* base over target's
+                        // newer values for any key both sides share.
+                        let can_auto_absorb = config.absorb.auto
+                            && !(config.absorb.require_clean_git && !source_clean);
+                        if can_auto_absorb {
+                            crate::merge::absorb_entry(
+                                m,
+                                &source,
+                                &mut engine,
+                                &tera_ctx,
+                                dry_run,
+                                &backup_root,
+                            )?;
+                        } else {
+                            // The gate didn't clear, so this is an anomaly —
+                            // dispatch through `[absorb] on_anomaly` exactly
+                            // like the file-level path does, instead of
+                            // always behaving as if it were `skip`.
+                            let reason = if !config.absorb.auto {
+                                "absorb.auto = false; treating divergence as anomaly"
+                            } else {
+                                "source repo is dirty; deferring auto-absorb"
+                            };
+                            let skip_apply = handle_merge_anomaly(
+                                &ctx,
+                                m,
+                                &source,
+                                &mut engine,
+                                &tera_ctx,
+                                dry_run,
+                                &backup_root,
+                                &src_path,
+                                &dst_path,
+                                reason,
+                            )?;
+                            if skip_apply {
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            crate::merge::apply_entry(m, &source, &mut engine, &tera_ctx, dry_run, &backup_root)?;
+        }
+    }
 
     // 3. Post-apply hooks (after every link is in place).
     hook::run_phase(
@@ -304,6 +392,7 @@ fn process_mount(
     engine: &mut template::Engine,
     tera_ctx: &TeraContext,
     yuiignore: &mut paths::YuiIgnoreStack,
+    merge_sources: &std::collections::HashSet<Utf8PathBuf>,
 ) -> Result<()> {
     // `m.src` is already absolute (resolved by `mount::resolve`),
     // so we don't need the source-root anymore.
@@ -313,7 +402,15 @@ fn process_mount(
         return Ok(());
     }
     walk_and_link(
-        &src_root, &m.dst, ctx, m.strategy, engine, tera_ctx, yuiignore, false,
+        &src_root,
+        &m.dst,
+        ctx,
+        m.strategy,
+        engine,
+        tera_ctx,
+        yuiignore,
+        false,
+        merge_sources,
     )
 }
 
@@ -327,6 +424,7 @@ fn walk_and_link(
     tera_ctx: &TeraContext,
     yuiignore: &mut paths::YuiIgnoreStack,
     parent_covered: bool,
+    merge_sources: &std::collections::HashSet<Utf8PathBuf>,
 ) -> Result<()> {
     // `.yuiignore` short-circuit — entire subtrees that match are skipped
     // without even reading their marker / iterating their children.
@@ -345,6 +443,7 @@ fn walk_and_link(
         tera_ctx,
         yuiignore,
         parent_covered,
+        merge_sources,
     );
     yuiignore.pop_dir(src_dir);
     result
@@ -360,6 +459,7 @@ fn walk_and_link_body(
     tera_ctx: &TeraContext,
     yuiignore: &mut paths::YuiIgnoreStack,
     parent_covered: bool,
+    merge_sources: &std::collections::HashSet<Utf8PathBuf>,
 ) -> Result<()> {
     let marker_filename = &ctx.config.mount.marker_filename;
     let mut covered = parent_covered;
@@ -445,7 +545,15 @@ fn walk_and_link_body(
 
         if ft.is_dir() {
             walk_and_link(
-                &src_path, &dst_path, ctx, strategy, engine, tera_ctx, yuiignore, covered,
+                &src_path,
+                &dst_path,
+                ctx,
+                strategy,
+                engine,
+                tera_ctx,
+                yuiignore,
+                covered,
+                merge_sources,
             )?;
         } else if ft.is_file() {
             // If an ancestor (or this dir itself) created a dir-level
@@ -453,7 +561,12 @@ fn walk_and_link_body(
             // — emitting another per-file link would just duplicate work
             // (and on Windows might land at a path that's already
             // hard-linked through the parent).
-            if !covered {
+            //
+            // `[[merge]]` source files are excluded the same way: they
+            // live under a mounted subtree for convenience but are only
+            // ever read by `merge::apply_entry`/`absorb_entry`, never
+            // linked directly (see the `merge_sources` comment in `apply`).
+            if !covered && !merge_sources.contains(&paths::normalize(&src_path)) {
                 link_file_with_backup(&src_path, &dst_path, ctx, ctx.file_mode)?;
             }
         }
@@ -617,6 +730,192 @@ fn handle_anomaly(
             }
         },
     }
+}
+
+/// Merge counterpart of `handle_anomaly`, for a `[[merge]]` entry whose
+/// target is newer than its base but `auto`/`require_clean_git` didn't
+/// clear to auto-absorb it. Same `[absorb] on_anomaly` dispatch:
+///   - `skip`  → log warning, leave both sides alone this run
+///   - `force` → absorb anyway (target's state wins, folded into `src`)
+///   - `ask`   → on a TTY, show diff + prompt. Off-TTY, leave both sides
+///     alone and record it as unresolved.
+///
+/// Returns whether the caller should skip this entry's normal
+/// `apply_entry` call this run (`true` for `skip`/`unresolved`/`quit` —
+/// pushing base over target would defeat the point of not absorbing
+/// first) or fall through to it (`false` for `force`/`absorb`, where
+/// `src` now already reflects target, and `overwrite`, which is
+/// exactly what the subsequent `apply_entry` does).
+#[allow(clippy::too_many_arguments)]
+fn handle_merge_anomaly(
+    ctx: &ApplyCtx<'_>,
+    m: &crate::merge::MergeEntry,
+    source: &Utf8Path,
+    engine: &mut template::Engine,
+    tera_ctx: &TeraContext,
+    dry_run: bool,
+    backup_root: &Utf8Path,
+    src_path: &Utf8Path,
+    dst_path: &Utf8Path,
+    reason: &str,
+) -> Result<bool> {
+    use crate::config::AnomalyAction::*;
+    match ctx.config.absorb.on_anomaly {
+        Skip => {
+            warn!("merge anomaly skip: {dst_path} ({reason})");
+            Ok(true)
+        }
+        Force => {
+            warn!("merge anomaly force: {dst_path} ({reason}) — absorbing target into source");
+            crate::merge::absorb_entry(m, source, engine, tera_ctx, dry_run, backup_root)?;
+            Ok(false)
+        }
+        Ask => match prompt_merge_anomaly(ctx, src_path, dst_path, &m.ignore_keys, reason)? {
+            AnomalyChoice::Absorb => {
+                crate::merge::absorb_entry(m, source, engine, tera_ctx, dry_run, backup_root)?;
+                Ok(false)
+            }
+            AnomalyChoice::Overwrite => Ok(false),
+            AnomalyChoice::Skip => {
+                warn!("merge anomaly skipped by user: {dst_path}");
+                Ok(true)
+            }
+            AnomalyChoice::Unresolved => {
+                note_unresolved(ctx, dst_path, reason);
+                Ok(true)
+            }
+            AnomalyChoice::Quit => {
+                warn!("merge anomaly: user requested quit; stopping apply at {dst_path}");
+                ctx.quit_requested.set(true);
+                Ok(true)
+            }
+        },
+    }
+}
+
+fn prompt_merge_anomaly(
+    ctx: &ApplyCtx<'_>,
+    src: &Utf8Path,
+    dst: &Utf8Path,
+    ignore_keys: &[String],
+    reason: &str,
+) -> Result<AnomalyChoice> {
+    if ctx.quit_requested.get() {
+        return Ok(AnomalyChoice::Quit);
+    }
+    if let Some(c) = ctx.sticky_anomaly.get() {
+        return Ok(c);
+    }
+
+    use std::io::IsTerminal;
+    use std::io::Write as _;
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Ok(AnomalyChoice::Unresolved);
+    }
+
+    eprintln!();
+    eprintln!("anomaly: {reason}");
+    eprintln!("  src: {src}");
+    eprintln!("  dst: {dst}");
+    print_merge_absorb_diff(src, dst, ignore_keys);
+
+    loop {
+        eprintln!("  [a/A] absorb     target → source   (this / all remaining)");
+        eprintln!("  [o/O] overwrite  source → target   (this / all remaining)");
+        eprintln!("  [s/S] skip       leave as-is       (this / all remaining)");
+        eprintln!("  [d]   diff       re-show the diff");
+        eprintln!("  [q]   quit       skip this and stop apply");
+        eprint!("choice [s]: ");
+        std::io::stderr().flush().ok();
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let trimmed = input.trim();
+        let choice = match trimmed {
+            "" | "s" | "n" => AnomalyChoice::Skip,
+            "a" | "y" => AnomalyChoice::Absorb,
+            "o" => AnomalyChoice::Overwrite,
+            "q" => AnomalyChoice::Quit,
+            "A" => {
+                ctx.sticky_anomaly.set(Some(AnomalyChoice::Absorb));
+                AnomalyChoice::Absorb
+            }
+            "O" => {
+                ctx.sticky_anomaly.set(Some(AnomalyChoice::Overwrite));
+                AnomalyChoice::Overwrite
+            }
+            "S" => {
+                ctx.sticky_anomaly.set(Some(AnomalyChoice::Skip));
+                AnomalyChoice::Skip
+            }
+            "d" => {
+                print_merge_absorb_diff(src, dst, ignore_keys);
+                continue;
+            }
+            other => {
+                eprintln!("unknown choice: {other:?}");
+                continue;
+            }
+        };
+        return Ok(choice);
+    }
+}
+
+fn print_merge_absorb_diff(src: &Utf8Path, dst: &Utf8Path, ignore_keys: &[String]) {
+    use owo_colors::OwoColorize as _;
+    use std::io::IsTerminal;
+
+    let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+
+    eprintln!();
+    if color {
+        eprintln!(
+            "{}  {}  {}",
+            "── unified diff (filtered) ──".bold(),
+            "[-] src".red().bold(),
+            "[+] dst".green().bold()
+        );
+        eprintln!("  {} {}", "[-] src:".red(), src);
+        eprintln!("  {} {}", "[+] dst:".green(), dst);
+    } else {
+        eprintln!("── unified diff (filtered) ──  [-] src   [+] dst");
+        eprintln!("  [-] src: {src}");
+        eprintln!("  [+] dst: {dst}");
+    }
+    eprintln!();
+
+    let src_text = std::fs::read_to_string(src).unwrap_or_default();
+    let dst_text = std::fs::read_to_string(dst).unwrap_or_default();
+
+    let mut src_table: toml::Table = toml::from_str(&src_text).unwrap_or_default();
+    let mut dst_table: toml::Table = toml::from_str(&dst_text).unwrap_or_default();
+    crate::merge::filter_table(&mut src_table, ignore_keys);
+    crate::merge::filter_table(&mut dst_table, ignore_keys);
+
+    let filtered_src = toml::to_string_pretty(&src_table).unwrap_or(src_text);
+    let filtered_dst = toml::to_string_pretty(&dst_table).unwrap_or(dst_text);
+
+    let diff = similar::TextDiff::from_lines(&filtered_src, &filtered_dst);
+    let formatted = diff
+        .unified_diff()
+        .header(src.as_str(), dst.as_str())
+        .to_string();
+    for line in formatted.lines() {
+        if !color {
+            eprintln!("{line}");
+        } else if line.starts_with("+++") || line.starts_with("---") {
+            eprintln!("{}", line.dimmed());
+        } else if line.starts_with("@@") {
+            eprintln!("{}", line.cyan());
+        } else if line.starts_with('+') {
+            eprintln!("{}", line.green());
+        } else if line.starts_with('-') {
+            eprintln!("{}", line.red());
+        } else {
+            eprintln!("{line}");
+        }
+    }
+    eprintln!();
 }
 
 /// Multi-choice TTY prompt for an anomaly.

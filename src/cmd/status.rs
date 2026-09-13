@@ -51,6 +51,17 @@ pub fn status(
     let icons = Icons::for_mode(icons_mode);
     let color = !no_color && supports_color_stdout();
 
+    // `[[merge]]` sources are excluded from the generic mount walk the
+    // same way `apply` excludes them (see the `merge_sources` comment
+    // there) — otherwise `status` reports them as a missing plain link
+    // (the mount-derived destination `apply` never creates for them),
+    // which never reaches in-sync and fails every run.
+    let merge_sources: std::collections::HashSet<Utf8PathBuf> = config
+        .merge
+        .iter()
+        .map(|m| paths::normalize(&source.join(&m.src)))
+        .collect();
+
     let mut report: Vec<StatusItem> = Vec::new();
 
     // 1. Template drift — render in dry-run mode and surface anything
@@ -114,12 +125,39 @@ pub fn status(
                 &source,
                 &mut yuiignore,
                 &mut report,
+                &merge_sources,
             )?;
         }
         Ok(())
     })();
     yuiignore.pop_dir(&source);
     walk_result?;
+
+    // 4. Merge drift — check [[merge]] entries.
+    for m in &config.merge {
+        if m.is_active(&mut engine, &tera_ctx)? {
+            let src_path = source.join(&m.src);
+            let dst_path = m.resolve_dst(&mut engine, &tera_ctx)?;
+            let state = if !dst_path.exists() || !src_path.exists() {
+                StatusState::MergeDrift
+            } else {
+                let src_content = std::fs::read_to_string(&src_path).unwrap_or_default();
+                let dst_content = std::fs::read_to_string(&dst_path).unwrap_or_default();
+                let src_table: toml::Table = toml::from_str(&src_content).unwrap_or_default();
+                let dst_table: toml::Table = toml::from_str(&dst_content).unwrap_or_default();
+                if crate::merge::check_drift(&src_table, &dst_table, &m.ignore_keys) {
+                    StatusState::MergeDrift
+                } else {
+                    StatusState::MergeInSync
+                }
+            };
+            report.push(StatusItem {
+                src: relative_for_display(&source, &src_path),
+                dst: dst_path,
+                state,
+            });
+        }
+    }
 
     report.sort_by(|a, b| a.src.cmp(&b.src).then_with(|| a.dst.cmp(&b.dst)));
 
@@ -158,11 +196,18 @@ pub(crate) enum StatusState {
     /// edited the decrypted file (usually through the target link)
     /// without re-encrypting via `yui secret encrypt`.
     SecretDrift,
+    /// Target has changes not yet absorbed into source, or is missing.
+    MergeDrift,
+    /// Target and source are in sync (excluding ignore_keys).
+    MergeInSync,
 }
 
 impl StatusState {
     fn is_in_sync(self) -> bool {
-        matches!(self, Self::Link(absorb::AbsorbDecision::InSync))
+        matches!(
+            self,
+            Self::Link(absorb::AbsorbDecision::InSync) | Self::MergeInSync
+        )
     }
 }
 
@@ -178,6 +223,7 @@ pub(crate) fn classify_walk(
     source_root: &Utf8Path,
     yuiignore: &mut paths::YuiIgnoreStack,
     report: &mut Vec<StatusItem>,
+    merge_sources: &std::collections::HashSet<Utf8PathBuf>,
 ) -> Result<()> {
     classify_walk_inner(
         src_dir,
@@ -191,6 +237,7 @@ pub(crate) fn classify_walk(
         yuiignore,
         report,
         false,
+        merge_sources,
     )
 }
 
@@ -207,6 +254,7 @@ fn classify_walk_inner(
     yuiignore: &mut paths::YuiIgnoreStack,
     report: &mut Vec<StatusItem>,
     parent_covered: bool,
+    merge_sources: &std::collections::HashSet<Utf8PathBuf>,
 ) -> Result<()> {
     if yuiignore.is_ignored(src_dir, /* is_dir */ true) {
         return Ok(());
@@ -226,6 +274,7 @@ fn classify_walk_inner(
         yuiignore,
         report,
         parent_covered,
+        merge_sources,
     );
     yuiignore.pop_dir(src_dir);
     result
@@ -244,6 +293,7 @@ fn classify_walk_inner_body(
     yuiignore: &mut paths::YuiIgnoreStack,
     report: &mut Vec<StatusItem>,
     parent_covered: bool,
+    merge_sources: &std::collections::HashSet<Utf8PathBuf>,
 ) -> Result<()> {
     let marker_filename = &config.mount.marker_filename;
     let mut covered = parent_covered;
@@ -330,8 +380,10 @@ fn classify_walk_inner_body(
                 yuiignore,
                 report,
                 covered,
+                merge_sources,
             )?;
-        } else if ft.is_file() && !covered {
+        } else if ft.is_file() && !covered && !merge_sources.contains(&paths::normalize(&src_path))
+        {
             let decision = absorb::classify(&src_path, &dst_path)?;
             report.push(StatusItem {
                 src: relative_for_display(source_root, &src_path),
@@ -343,7 +395,7 @@ fn classify_walk_inner_body(
     Ok(())
 }
 
-fn relative_for_display(source_root: &Utf8Path, p: &Utf8Path) -> Utf8PathBuf {
+pub(crate) fn relative_for_display(source_root: &Utf8Path, p: &Utf8Path) -> Utf8PathBuf {
     p.strip_prefix(source_root)
         .map(Utf8PathBuf::from)
         .unwrap_or_else(|_| p.to_path_buf())
@@ -394,6 +446,8 @@ fn state_label(s: StatusState) -> &'static str {
         StatusState::Link(Restore) => "missing",
         StatusState::RenderDrift => "render drift",
         StatusState::SecretDrift => "secret drift",
+        StatusState::MergeDrift => "merge drift",
+        StatusState::MergeInSync => "in-sync (merge)",
     }
 }
 
@@ -407,6 +461,8 @@ fn state_icon(s: StatusState, icons: Icons) -> &'static str {
         StatusState::Link(Restore) => icons.info,
         StatusState::RenderDrift => icons.error,
         StatusState::SecretDrift => icons.error,
+        StatusState::MergeDrift => icons.warn,
+        StatusState::MergeInSync => icons.ok,
     }
 }
 
@@ -469,8 +525,8 @@ fn print_status_row(
 
     use absorb::AbsorbDecision::*;
     let state_colored = match item.state {
-        StatusState::Link(InSync) => cell_state.green().to_string(),
-        StatusState::Link(RelinkOnly) | StatusState::Link(AutoAbsorb) => {
+        StatusState::Link(InSync) | StatusState::MergeInSync => cell_state.green().to_string(),
+        StatusState::Link(RelinkOnly) | StatusState::Link(AutoAbsorb) | StatusState::MergeDrift => {
             cell_state.yellow().to_string()
         }
         StatusState::Link(NeedsConfirm) => cell_state.red().to_string(),
