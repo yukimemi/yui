@@ -129,6 +129,21 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
         info!("dry-run: nothing will be written");
     }
 
+    // `[[merge]]` sources live inside the dotfiles tree (typically under
+    // a mounted `home/`), but they are never meant to be linked directly
+    // — they're only ever read by `merge::apply_entry`/`absorb_entry`.
+    // Without this exclusion, the generic per-file walk below would also
+    // link them as ordinary files: at best an unwanted extra link next
+    // to the merge target, at worst — if a `src` happens to share a
+    // mount-derived destination with the merge `dst` — the walk would
+    // treat the live target as a plain link anomaly and absorb/overwrite
+    // it, destroying the local state `[[merge]]` exists to preserve.
+    let merge_sources: std::collections::HashSet<Utf8PathBuf> = config
+        .merge
+        .iter()
+        .map(|m| paths::normalize(&source.join(&m.src)))
+        .collect();
+
     // Nested ignore stack — push on dir entry, pop on exit. Seed
     // with the source-root layer so root-level rules apply from the
     // start without `walk_and_link` having to special-case it.
@@ -137,7 +152,14 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     let walk_result = (|| -> Result<()> {
         for m in &mounts {
             info!("mount: {} → {}", m.src, m.dst);
-            process_mount(m, &ctx, &mut engine, &tera_ctx, &mut yuiignore)?;
+            process_mount(
+                m,
+                &ctx,
+                &mut engine,
+                &tera_ctx,
+                &mut yuiignore,
+                &merge_sources,
+            )?;
         }
         Ok(())
     })();
@@ -155,12 +177,38 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
                 let dst_mtime = dst_meta.and_then(|m| m.modified().ok());
                 let src_mtime = src_meta.and_then(|m| m.modified().ok());
                 if let (Some(dt), Some(st)) = (dst_mtime, src_mtime) {
-                    if dt > st && config.absorb.auto {
-                        crate::merge::absorb_entry(m, &source, &mut engine, &tera_ctx, dry_run)?;
+                    if dt > st {
+                        // Same gates as the file-level `AutoAbsorb` path
+                        // (`link_file_with_backup`): the `auto` kill-switch
+                        // and `require_clean_git` both have to clear before
+                        // target's newer edits are allowed to flow back into
+                        // source. Skipping straight to `apply_entry` here
+                        // would deep-merge the *old* base over target's
+                        // newer values for any key both sides share.
+                        let can_auto_absorb = config.absorb.auto
+                            && !(config.absorb.require_clean_git && !source_clean);
+                        if can_auto_absorb {
+                            crate::merge::absorb_entry(
+                                m,
+                                &source,
+                                &mut engine,
+                                &tera_ctx,
+                                dry_run,
+                                &backup_root,
+                            )?;
+                        } else {
+                            warn!(
+                                "merge: {dst_path} is newer than {src_path} but auto-absorb \
+                                 didn't run (absorb.auto=false or source repo dirty) — \
+                                 skipping apply so base doesn't overwrite the newer target; \
+                                 run `yui absorb {dst_path}` manually",
+                            );
+                            continue;
+                        }
                     }
                 }
             }
-            crate::merge::apply_entry(m, &source, &mut engine, &tera_ctx, dry_run)?;
+            crate::merge::apply_entry(m, &source, &mut engine, &tera_ctx, dry_run, &backup_root)?;
         }
     }
 
@@ -324,6 +372,7 @@ fn process_mount(
     engine: &mut template::Engine,
     tera_ctx: &TeraContext,
     yuiignore: &mut paths::YuiIgnoreStack,
+    merge_sources: &std::collections::HashSet<Utf8PathBuf>,
 ) -> Result<()> {
     // `m.src` is already absolute (resolved by `mount::resolve`),
     // so we don't need the source-root anymore.
@@ -333,7 +382,15 @@ fn process_mount(
         return Ok(());
     }
     walk_and_link(
-        &src_root, &m.dst, ctx, m.strategy, engine, tera_ctx, yuiignore, false,
+        &src_root,
+        &m.dst,
+        ctx,
+        m.strategy,
+        engine,
+        tera_ctx,
+        yuiignore,
+        false,
+        merge_sources,
     )
 }
 
@@ -347,6 +404,7 @@ fn walk_and_link(
     tera_ctx: &TeraContext,
     yuiignore: &mut paths::YuiIgnoreStack,
     parent_covered: bool,
+    merge_sources: &std::collections::HashSet<Utf8PathBuf>,
 ) -> Result<()> {
     // `.yuiignore` short-circuit — entire subtrees that match are skipped
     // without even reading their marker / iterating their children.
@@ -365,6 +423,7 @@ fn walk_and_link(
         tera_ctx,
         yuiignore,
         parent_covered,
+        merge_sources,
     );
     yuiignore.pop_dir(src_dir);
     result
@@ -380,6 +439,7 @@ fn walk_and_link_body(
     tera_ctx: &TeraContext,
     yuiignore: &mut paths::YuiIgnoreStack,
     parent_covered: bool,
+    merge_sources: &std::collections::HashSet<Utf8PathBuf>,
 ) -> Result<()> {
     let marker_filename = &ctx.config.mount.marker_filename;
     let mut covered = parent_covered;
@@ -465,7 +525,15 @@ fn walk_and_link_body(
 
         if ft.is_dir() {
             walk_and_link(
-                &src_path, &dst_path, ctx, strategy, engine, tera_ctx, yuiignore, covered,
+                &src_path,
+                &dst_path,
+                ctx,
+                strategy,
+                engine,
+                tera_ctx,
+                yuiignore,
+                covered,
+                merge_sources,
             )?;
         } else if ft.is_file() {
             // If an ancestor (or this dir itself) created a dir-level
@@ -473,7 +541,12 @@ fn walk_and_link_body(
             // — emitting another per-file link would just duplicate work
             // (and on Windows might land at a path that's already
             // hard-linked through the parent).
-            if !covered {
+            //
+            // `[[merge]]` source files are excluded the same way: they
+            // live under a mounted subtree for convenience but are only
+            // ever read by `merge::apply_entry`/`absorb_entry`, never
+            // linked directly (see the `merge_sources` comment in `apply`).
+            if !covered && !merge_sources.contains(&paths::normalize(&src_path)) {
                 link_file_with_backup(&src_path, &dst_path, ctx, ctx.file_mode)?;
             }
         }

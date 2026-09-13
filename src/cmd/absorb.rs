@@ -41,6 +41,7 @@ pub fn absorb(
 
     let mut engine = template::Engine::new();
     let tera_ctx = template::template_context(&yui, &config.vars);
+    let backup_root = source.join(&config.backup.dir);
 
     // Check if target is claimed by a [[merge]] entry.
     for m in &config.merge {
@@ -67,8 +68,14 @@ pub fn absorb(
                         return Ok(());
                     }
                 }
-                let changed =
-                    crate::merge::absorb_entry(m, &source, &mut engine, &tera_ctx, false)?;
+                let changed = crate::merge::absorb_entry(
+                    m,
+                    &source,
+                    &mut engine,
+                    &tera_ctx,
+                    false,
+                    &backup_root,
+                )?;
                 if changed {
                     info!("absorbed changes from {target} into {src_path}");
                 } else {
@@ -162,7 +169,6 @@ pub fn absorb(
         write_marker(pending)?;
     }
 
-    let backup_root = source.join(&config.backup.dir);
     let plan = LinkPlan::from_config(&source, &config.link)?;
     let ctx = ApplyCtx {
         config: &config,

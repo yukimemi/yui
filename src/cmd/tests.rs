@@ -4042,3 +4042,206 @@ ignore_keys = ["notify"]
     // status returns Err when drift exists
     assert!(status(Some(source.clone()), None, true).is_err());
 }
+
+/// A `[[merge]]` `src` living under a mounted subtree (the shape the
+/// README's own example uses: `home/.codex/config.base.toml`) must not
+/// also be picked up by the generic per-file mount walk — that walk
+/// knows nothing about `[[merge]]` and would otherwise link the base
+/// file straight into the target directory as an unwanted extra file.
+#[test]
+fn apply_does_not_link_merge_source_via_generic_mount_walk() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    std::fs::write(source.join("home/config.base.toml"), "model = \"gpt-6\"\n").unwrap();
+
+    let target_file = target.join("config.toml");
+    let cfg = format!(
+        r#"
+[[mount.entry]]
+src = "home"
+dst = "{}"
+
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+"#,
+        toml_path(&target),
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    assert!(target_file.exists(), "merge should still create its target");
+    assert!(
+        !target.join("config.base.toml").exists(),
+        "the mount walk must not also link the merge source directly"
+    );
+}
+
+/// `check_drift` has to catch drift in both directions: not just "target
+/// has something absorb should pull into base" but also "base gained a
+/// key apply hasn't pushed to target yet". Otherwise `status` reports
+/// `in-sync (merge)` for a target that a fresh `apply` would still change.
+#[test]
+fn test_check_drift_detects_new_key_added_to_base() {
+    let base: toml::Table = r#"
+model = "gpt-6-astra"
+new_setting = true
+"#
+    .parse()
+    .unwrap();
+
+    let target: toml::Table = r#"
+model = "gpt-6-astra"
+"#
+    .parse()
+    .unwrap();
+
+    assert!(
+        crate::merge::check_drift(&base, &target, &[]),
+        "a key present only in base is unapplied drift, not in-sync"
+    );
+}
+
+/// `merge_toml` runs on every `apply`, so array-valued base keys must be
+/// replaced, not appended, in the target — otherwise a second `apply`
+/// with no real change duplicates every element again.
+#[test]
+fn apply_does_not_duplicate_array_values_on_repeated_runs() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    std::fs::write(
+        source.join("home/config.base.toml"),
+        "allowed = [\"a\", \"b\"]\n",
+    )
+    .unwrap();
+
+    let target_file = target.join("config.toml");
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+    apply(Some(source.clone()), false).unwrap();
+    apply(Some(source.clone()), false).unwrap();
+
+    let merged: toml::Table =
+        toml::from_str(&std::fs::read_to_string(&target_file).unwrap()).unwrap();
+    let allowed = merged.get("allowed").unwrap().as_array().unwrap();
+    assert_eq!(
+        allowed.len(),
+        2,
+        "repeated apply must not keep appending base's array: {allowed:?}"
+    );
+}
+
+/// `[absorb] auto = false` is a kill-switch: it must stop the newer
+/// target's overlapping values from being silently overwritten by the
+/// (now-stale) base during `apply`'s merge step, the same way it stops
+/// the file-level `AutoAbsorb` path.
+#[test]
+fn apply_merge_does_not_overwrite_newer_target_when_auto_absorb_disabled() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let now = std::time::SystemTime::now();
+    let past = now - std::time::Duration::from_secs(120);
+    write_with_mtime(
+        &source.join("home/config.base.toml"),
+        "model = \"gpt-6\"\n",
+        past,
+    );
+
+    let target_file = target.join("config.toml");
+    write_with_mtime(&target_file, "model = \"gpt-6-user-edited\"\n", now);
+
+    let cfg = format!(
+        r#"
+[absorb]
+auto = false
+
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        "model = \"gpt-6-user-edited\"\n",
+        "auto=false must not let the stale base overwrite the newer target edit"
+    );
+}
+
+/// `[absorb] require_clean_git = true` has to gate merge auto-absorb the
+/// same way it gates the file-level `AutoAbsorb` path: a dirty source
+/// repo must defer pulling target's newer state into `src`, instead of
+/// writing straight into an uncommitted base file.
+#[test]
+fn apply_merge_auto_absorb_respects_require_clean_git() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let base_file = source.join("home/config.base.toml");
+    let now = std::time::SystemTime::now();
+    let past = now - std::time::Duration::from_secs(120);
+    write_with_mtime(&base_file, "model = \"gpt-6\"\n", past);
+
+    let target_file = target.join("config.toml");
+    write_with_mtime(
+        &target_file,
+        "model = \"gpt-6\"\nlive_added = \"yes\"\n",
+        now,
+    );
+
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    if !git_init_and_commit(&source) {
+        eprintln!("skipping: git not available");
+        return;
+    }
+    // Dirty the source repo *after* the commit `git_init_and_commit` made,
+    // same as the file-level require_clean_git tests do.
+    std::fs::write(source.join("untracked.txt"), "dirty").unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    let base_after = std::fs::read_to_string(&base_file).unwrap();
+    assert!(
+        !base_after.contains("live_added"),
+        "a dirty source repo must defer merge auto-absorb, not base:\n{base_after}"
+    );
+}

@@ -15,11 +15,11 @@ use std::fs;
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
-use teravars::deep_merge;
 use toml::{Table, Value};
 use tracing::{debug, info, warn};
 
 use crate::Result;
+use crate::backup;
 use crate::paths;
 use crate::template::{self, Engine};
 
@@ -125,6 +125,29 @@ fn remove_nested(table: &mut Table, parts: &[&str]) -> bool {
     table.is_empty()
 }
 
+/// Deep-merge `overlay` into `base`: nested tables recurse, everything
+/// else (including arrays) is replaced wholesale.
+///
+/// This is deliberately *not* `teravars::deep_merge`, which appends
+/// overlay arrays onto base arrays — the right call for layering
+/// `config.toml` + `config.local.toml` exactly once at load time. A
+/// `[[merge]]` entry instead runs `apply`/`absorb` on every invocation,
+/// so array-append would duplicate the same elements on every run
+/// instead of converging to a stable, idempotent result.
+fn deep_merge(base: &mut Table, overlay: Table) {
+    for (k, v) in overlay {
+        match (base.remove(&k), v) {
+            (Some(Value::Table(mut b)), Value::Table(o)) => {
+                deep_merge(&mut b, o);
+                base.insert(k, Value::Table(b));
+            }
+            (_, v) => {
+                base.insert(k, v);
+            }
+        }
+    }
+}
+
 /// Merge `base` into `target` in-place.
 /// Keys present in `base` are injected/overwritten in `target`.
 /// Keys exclusive to `target` (local state) are preserved intact.
@@ -144,15 +167,44 @@ pub fn absorb_toml(base: &mut Table, target: &Table, ignore_keys: &[String]) -> 
     *base != old_base
 }
 
-/// Check if `target` has changes that should be absorbed into `base`
-/// (ignoring `ignore_keys`).
+/// Check if `base` and `target` (outside `ignore_keys`) have diverged in
+/// either direction: `target` holds changes `absorb` would pull into
+/// `base`, or `base` holds settings `apply` hasn't pushed to `target`
+/// yet (e.g. a key newly added to `base`, which `target` simply lacks).
 pub fn check_drift(base: &Table, target: &Table, ignore_keys: &[String]) -> bool {
     let mut clean_target = target.clone();
     filter_table(&mut clean_target, ignore_keys);
 
+    // apply direction: would base → target change target?
+    let mut applied = clean_target.clone();
+    deep_merge(&mut applied, base.clone());
+    if applied != clean_target {
+        return true;
+    }
+
+    // absorb direction: would target → base change base?
     let mut test_base = base.clone();
     deep_merge(&mut test_base, clean_target);
     test_base != *base
+}
+
+/// Back up `target`'s current content into `.yui/backup/...` before a
+/// `[[merge]]` write overwrites it. `apply_entry`/`absorb_entry` each
+/// overwrite one side (target or source) of a merge based on an mtime
+/// comparison; a coarse filesystem mtime, clock skew, or checked-out
+/// files sharing a timestamp can misjudge that comparison, so the
+/// write must stay recoverable the same way every other yui mutation
+/// is (`backup_existing` in `cmd::apply`).
+fn backup_before_overwrite(target: &Utf8Path, backup_root: &Utf8Path) -> Result<()> {
+    if !target.exists() {
+        return Ok(());
+    }
+    let abs_target = crate::cmd::absolutize(target)?;
+    let ts = backup::current_timestamp("%Y%m%d_%H%M%S%3f")?;
+    let bp = paths::append_timestamp(&paths::mirror_into_backup(backup_root, &abs_target), &ts);
+    info!("backup → {bp}");
+    backup::backup_file(target, &bp)?;
+    Ok(())
 }
 
 /// Execute apply for a single merge entry.
@@ -162,6 +214,7 @@ pub fn apply_entry(
     engine: &mut Engine,
     ctx: &teravars::Context,
     dry_run: bool,
+    backup_root: &Utf8Path,
 ) -> Result<()> {
     let src_path = source_root.join(&entry.src);
     if !src_path.exists() {
@@ -205,6 +258,7 @@ pub fn apply_entry(
     if dst_table != original_dst {
         info!("merge: updating target {dst_path} with base {src_path}");
         if !dry_run {
+            backup_before_overwrite(&dst_path, backup_root)?;
             let rendered = toml::to_string_pretty(&dst_table)
                 .with_context(|| format!("serializing merged TOML for {dst_path}"))?;
             fs::write(&dst_path, rendered)
@@ -224,6 +278,7 @@ pub fn absorb_entry(
     engine: &mut Engine,
     ctx: &teravars::Context,
     dry_run: bool,
+    backup_root: &Utf8Path,
 ) -> Result<bool> {
     let src_path = source_root.join(&entry.src);
     let dst_path = entry.resolve_dst(engine, ctx)?;
@@ -263,6 +318,7 @@ pub fn absorb_entry(
                 fs::create_dir_all(parent)
                     .with_context(|| format!("creating directory {parent}"))?;
             }
+            backup_before_overwrite(&src_path, backup_root)?;
             let rendered = toml::to_string_pretty(&src_table)
                 .with_context(|| format!("serializing absorbed TOML for {src_path}"))?;
             fs::write(&src_path, rendered)
@@ -463,5 +519,50 @@ notify = ["local/path"]
         .parse()
         .unwrap();
         assert!(check_drift(&base, &target_with_user_change, &ignore));
+    }
+
+    #[test]
+    fn test_check_drift_detects_key_new_to_base() {
+        // `apply` hasn't run yet: target predates the setting base just
+        // gained. This must count as drift even though `target` has
+        // nothing extra for `absorb` to pull back.
+        let base: Table = r#"
+model = "gpt-6-astra"
+new_setting = true
+"#
+        .parse()
+        .unwrap();
+
+        let target: Table = r#"
+model = "gpt-6-astra"
+"#
+        .parse()
+        .unwrap();
+
+        assert!(check_drift(&base, &target, &[]));
+    }
+
+    #[test]
+    fn test_merge_toml_overwrites_arrays_instead_of_appending() {
+        // `merge_toml` runs on every `apply`. If arrays appended (as
+        // `teravars::deep_merge` does for layering config files), a
+        // second no-op apply would duplicate every element again.
+        let base: Table = r#"
+notify = ["path/to/exe"]
+"#
+        .parse()
+        .unwrap();
+
+        let mut target: Table = r#"
+notify = ["path/to/exe"]
+"#
+        .parse()
+        .unwrap();
+
+        merge_toml(&base, &mut target);
+        merge_toml(&base, &mut target);
+
+        let notify = target.get("notify").unwrap().as_array().unwrap();
+        assert_eq!(notify.len(), 1, "array should be replaced, not appended");
     }
 }
