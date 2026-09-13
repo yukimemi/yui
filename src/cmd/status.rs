@@ -121,6 +121,32 @@ pub fn status(
     yuiignore.pop_dir(&source);
     walk_result?;
 
+    // 4. Merge drift — check [[merge]] entries.
+    for m in &config.merge {
+        if m.is_active(&mut engine, &tera_ctx)? {
+            let src_path = source.join(&m.src);
+            let dst_path = m.resolve_dst(&mut engine, &tera_ctx)?;
+            let state = if !dst_path.exists() || !src_path.exists() {
+                StatusState::MergeDrift
+            } else {
+                let src_content = std::fs::read_to_string(&src_path).unwrap_or_default();
+                let dst_content = std::fs::read_to_string(&dst_path).unwrap_or_default();
+                let src_table: toml::Table = toml::from_str(&src_content).unwrap_or_default();
+                let dst_table: toml::Table = toml::from_str(&dst_content).unwrap_or_default();
+                if crate::merge::check_drift(&src_table, &dst_table, &m.ignore_keys) {
+                    StatusState::MergeDrift
+                } else {
+                    StatusState::MergeInSync
+                }
+            };
+            report.push(StatusItem {
+                src: relative_for_display(&source, &src_path),
+                dst: dst_path,
+                state,
+            });
+        }
+    }
+
     report.sort_by(|a, b| a.src.cmp(&b.src).then_with(|| a.dst.cmp(&b.dst)));
 
     print_status_table(&report, icons, color);
@@ -158,11 +184,18 @@ pub(crate) enum StatusState {
     /// edited the decrypted file (usually through the target link)
     /// without re-encrypting via `yui secret encrypt`.
     SecretDrift,
+    /// Target has changes not yet absorbed into source, or is missing.
+    MergeDrift,
+    /// Target and source are in sync (excluding ignore_keys).
+    MergeInSync,
 }
 
 impl StatusState {
     fn is_in_sync(self) -> bool {
-        matches!(self, Self::Link(absorb::AbsorbDecision::InSync))
+        matches!(
+            self,
+            Self::Link(absorb::AbsorbDecision::InSync) | Self::MergeInSync
+        )
     }
 }
 
@@ -394,6 +427,8 @@ fn state_label(s: StatusState) -> &'static str {
         StatusState::Link(Restore) => "missing",
         StatusState::RenderDrift => "render drift",
         StatusState::SecretDrift => "secret drift",
+        StatusState::MergeDrift => "merge drift",
+        StatusState::MergeInSync => "in-sync (merge)",
     }
 }
 
@@ -407,6 +442,8 @@ fn state_icon(s: StatusState, icons: Icons) -> &'static str {
         StatusState::Link(Restore) => icons.info,
         StatusState::RenderDrift => icons.error,
         StatusState::SecretDrift => icons.error,
+        StatusState::MergeDrift => icons.warn,
+        StatusState::MergeInSync => icons.ok,
     }
 }
 
@@ -469,8 +506,8 @@ fn print_status_row(
 
     use absorb::AbsorbDecision::*;
     let state_colored = match item.state {
-        StatusState::Link(InSync) => cell_state.green().to_string(),
-        StatusState::Link(RelinkOnly) | StatusState::Link(AutoAbsorb) => {
+        StatusState::Link(InSync) | StatusState::MergeInSync => cell_state.green().to_string(),
+        StatusState::Link(RelinkOnly) | StatusState::Link(AutoAbsorb) | StatusState::MergeDrift => {
             cell_state.yellow().to_string()
         }
         StatusState::Link(NeedsConfirm) => cell_state.red().to_string(),

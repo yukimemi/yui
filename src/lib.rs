@@ -10,6 +10,7 @@ pub mod icons;
 pub mod link;
 pub mod links;
 pub mod marker;
+pub mod merge;
 pub mod mount;
 pub mod paths;
 pub mod render;

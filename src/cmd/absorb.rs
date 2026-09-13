@@ -42,6 +42,43 @@ pub fn absorb(
     let mut engine = template::Engine::new();
     let tera_ctx = template::template_context(&yui, &config.vars);
 
+    // Check if target is claimed by a [[merge]] entry.
+    for m in &config.merge {
+        if m.is_active(&mut engine, &tera_ctx)? {
+            let dst_path = m.resolve_dst(&mut engine, &tera_ctx)?;
+            if paths::normalize(&dst_path) == paths::normalize(&target) {
+                let src_path = source.join(&m.src);
+                info!("target {target} claimed by [[merge]] with source {src_path}");
+                print_absorb_diff(&src_path, &target);
+                if dry_run {
+                    info!("[dry-run] would absorb {target} → {src_path} (filtered)");
+                    return Ok(());
+                }
+                if !yes {
+                    use std::io::IsTerminal;
+                    if !std::io::stdin().is_terminal() {
+                        anyhow::bail!(
+                            "manual absorb refuses to run off-TTY without --yes \
+                             (would silently overwrite {src_path})"
+                        );
+                    }
+                    if !prompt_yes_no("absorb target into source?")? {
+                        warn!("manual absorb cancelled by user: {target}");
+                        return Ok(());
+                    }
+                }
+                let changed =
+                    crate::merge::absorb_entry(m, &source, &mut engine, &tera_ctx, false)?;
+                if changed {
+                    info!("absorbed changes from {target} into {src_path}");
+                } else {
+                    info!("no changes to absorb from {target} into {src_path}");
+                }
+                return Ok(());
+            }
+        }
+    }
+
     let found = find_source_for_target(&source, &config, &target, &mut engine, &tera_ctx)?;
 
     let (target_match, pending_marker) = match (found, to) {

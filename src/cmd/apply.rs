@@ -144,6 +144,26 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     yuiignore.pop_dir(&source);
     walk_result?;
 
+    // 2b. Semantic merge for [[merge]] entries.
+    for m in &config.merge {
+        if m.is_active(&mut engine, &tera_ctx)? {
+            let dst_path = m.resolve_dst(&mut engine, &tera_ctx)?;
+            let src_path = source.join(&m.src);
+            if dst_path.exists() && src_path.exists() {
+                let dst_meta = std::fs::metadata(&dst_path).ok();
+                let src_meta = std::fs::metadata(&src_path).ok();
+                let dst_mtime = dst_meta.and_then(|m| m.modified().ok());
+                let src_mtime = src_meta.and_then(|m| m.modified().ok());
+                if let (Some(dt), Some(st)) = (dst_mtime, src_mtime) {
+                    if dt > st && config.absorb.auto {
+                        crate::merge::absorb_entry(m, &source, &mut engine, &tera_ctx, dry_run)?;
+                    }
+                }
+            }
+            crate::merge::apply_entry(m, &source, &mut engine, &tera_ctx, dry_run)?;
+        }
+    }
+
     // 3. Post-apply hooks (after every link is in place).
     hook::run_phase(
         &config,

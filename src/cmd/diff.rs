@@ -136,19 +136,22 @@ pub fn diff(
 pub(crate) fn resolve_diff_src(item: &StatusItem, source: &Utf8Path) -> Utf8PathBuf {
     match item.state {
         StatusState::RenderDrift | StatusState::SecretDrift => item.src.clone(),
-        StatusState::Link(_) => source.join(&item.src),
+        StatusState::Link(_) | StatusState::MergeDrift | StatusState::MergeInSync => {
+            source.join(&item.src)
+        }
     }
 }
 
 pub(crate) fn diff_worth_printing(state: &StatusState) -> bool {
     use absorb::AbsorbDecision::*;
     match state {
-        StatusState::Link(InSync) => false,
+        StatusState::Link(InSync) | StatusState::MergeInSync => false,
         StatusState::Link(Restore) => false, // target missing — nothing to diff
         StatusState::Link(RelinkOnly) => false, // content identical, only metadata drift
         StatusState::Link(_) => true,
         StatusState::RenderDrift => true,
         StatusState::SecretDrift => true,
+        StatusState::MergeDrift => true,
     }
 }
 
@@ -173,6 +176,7 @@ fn print_unified_diff(
     let header = match state {
         StatusState::RenderDrift => format!("--- render drift: {src} (template) vs {dst}"),
         StatusState::SecretDrift => format!("--- secret drift: {src} (decrypted) vs {dst}"),
+        StatusState::MergeDrift => format!("--- merge drift: {src} (base) vs {dst} (target)"),
         _ => format!("--- {src} → {dst}"),
     };
     if color {

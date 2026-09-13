@@ -313,6 +313,32 @@ odd one out is visible without reading the config.
   default). Central entries are explicit instructions and apply under
   `per-file` too.
 
+## Merging configs (`[[merge]]`)
+
+For apps that write local machine state or trusted project paths into their main
+configuration file (such as OpenAI Codex `config.toml` auto-saving `[projects]`),
+linking the file directly would dirty or leak private state into your dotfiles.
+
+Instead of creating a link, a `[[merge]]` entry deep-merges your base settings into
+the live target file while preserving local changes and untracked keys.
+
+```toml
+# $DOTFILES/config.toml
+[[merge]]
+src = "home/.codex/config.base.toml"
+dst = "~/.codex/config.toml"
+ignore_keys = [
+    "projects",
+    "notify",
+    "marketplaces.*",
+]
+```
+
+- **`apply`**: If the target is missing, creates it from `src`. If the target exists and has newer edits, automatically absorbs upstream changes first, then merges `src` onto the live target.
+- **`absorb`**: Pulls new settings from the live target back into `src`, pruning any keys matching `ignore_keys` (supports dot notation and wildcards like `section.*`).
+- **`status` & `diff`**: Reports `drift` when base settings diverge from the live target outside of `ignore_keys`.
+- **`list`**: Shows merge entries with `mode: merge`.
+
 ## `.yuiignore` — exclude paths from being linked
 
 A `$DOTFILES/.yuiignore` file (gitignore syntax) keeps matched paths

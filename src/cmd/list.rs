@@ -130,6 +130,25 @@ fn collect_list_items(source: &Utf8Path, config: &Config, yui: &YuiVars) -> Resu
         }
     }
 
+    // 3. `[[merge]]` declarations
+    for entry in &config.merge {
+        let active = match &entry.when {
+            None => true,
+            Some(w) => template::eval_truthy(w, &mut engine, &tera_ctx)?,
+        };
+        let dst = engine
+            .render(&entry.dst, &tera_ctx)
+            .map(|s| paths::expand_tilde(s.trim()).to_string())
+            .unwrap_or_else(|_| entry.dst.clone());
+        items.push(ListItem {
+            src: entry.src.clone(),
+            dst,
+            when: entry.when.clone(),
+            active,
+            mode: Some("merge"),
+        });
+    }
+
     items.sort_by(|a, b| a.src.cmp(&b.src).then_with(|| a.dst.cmp(&b.dst)));
     Ok(items)
 }
