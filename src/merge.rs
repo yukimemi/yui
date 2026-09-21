@@ -30,7 +30,9 @@ pub struct MergeEntry {
     pub src: Utf8PathBuf,
     /// Destination live target path. Tera-rendered, `~` expanded.
     pub dst: String,
-    /// Keys to ignore when absorbing from target into source.
+    /// Keys treated as target's exclusive local state: excluded from
+    /// `absorb` (never pulled into source) and from `apply` (base never
+    /// overwrites them in target either), and from drift comparisons.
     /// Supports dot-notation for nested tables (e.g. `"marketplaces.openai-bundled"`).
     #[serde(default)]
     pub ignore_keys: Vec<String>,
@@ -217,7 +219,7 @@ pub fn apply_entry(
 
     let src_content = fs::read_to_string(&src_path)
         .with_context(|| format!("reading merge source {src_path}"))?;
-    let src_table: Table = toml::from_str(&src_content)
+    let mut src_table: Table = toml::from_str(&src_content)
         .with_context(|| format!("parsing TOML in merge source {src_path}"))?;
 
     if !dst_path.exists() {
@@ -242,6 +244,15 @@ pub fn apply_entry(
             return Ok(());
         }
     };
+
+    // `ignore_keys` marks a key as target's exclusive local state (that's
+    // what makes it safe for `check_drift` to exclude from both sides when
+    // deciding whether an anomaly prompt is even needed). Base must not
+    // clobber that state here just because it happens to also carry a
+    // value under the same key — otherwise a target-only edit to an
+    // ignored key gets silently overwritten the moment `check_drift`
+    // (correctly) reports no drift and this runs unprompted.
+    filter_table(&mut src_table, &entry.ignore_keys);
 
     let original_dst = dst_table.clone();
     merge_toml(&src_table, &mut dst_table);

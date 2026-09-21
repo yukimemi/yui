@@ -3864,6 +3864,58 @@ ignore_keys = ["notify", "projects"]
 }
 
 #[test]
+fn apply_never_overwrites_ignored_key_even_when_base_also_has_it() {
+    // base and target both carry a value under an ignored key
+    // ("notify"), and target's edit is the newer one. `check_drift`
+    // filters `notify` from both sides, so it correctly sees no
+    // semantic drift and never raises the anomaly prompt — but that
+    // must not mean `apply_entry`'s unconditional base → target merge
+    // is left free to clobber target's ignored key anyway.
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let base_content = r#"
+model = "gpt-6-astra"
+notify = "base_value"
+"#;
+    std::fs::write(source.join("home/config.base.toml"), base_content).unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let target_content = r#"
+model = "gpt-6-astra"
+notify = "local_value"
+"#;
+    let target_file = target.join("config.toml");
+    std::fs::write(&target_file, target_content).unwrap();
+
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+ignore_keys = ["notify"]
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    let merged_str = std::fs::read_to_string(&target_file).unwrap();
+    let merged: toml::Table = toml::from_str(&merged_str).unwrap();
+
+    assert_eq!(
+        merged.get("notify").unwrap().as_str().unwrap(),
+        "local_value",
+        "ignored key must stay under target's control even though base also sets it"
+    );
+}
+
+#[test]
 fn apply_creates_target_from_merge_base_if_missing() {
     let tmp = TempDir::new().unwrap();
     let source = utf8(tmp.path().join("dotfiles"));
