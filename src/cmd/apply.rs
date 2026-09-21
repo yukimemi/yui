@@ -180,7 +180,14 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
                 let dst_mtime = dst_meta.and_then(|m| m.modified().ok());
                 let src_mtime = src_meta.and_then(|m| m.modified().ok());
                 if let (Some(dt), Some(st)) = (dst_mtime, src_mtime) {
-                    if dt > st {
+                    let semantically_drifted = {
+                        let src_text = std::fs::read_to_string(&src_path).unwrap_or_default();
+                        let dst_text = std::fs::read_to_string(&dst_path).unwrap_or_default();
+                        let src_table: toml::Table = toml::from_str(&src_text).unwrap_or_default();
+                        let dst_table: toml::Table = toml::from_str(&dst_text).unwrap_or_default();
+                        crate::merge::check_drift(&src_table, &dst_table, &m.ignore_keys)
+                    };
+                    if dt > st && semantically_drifted {
                         // Same gates as the file-level `AutoAbsorb` path
                         // (`link_file_with_backup`): the `auto` kill-switch
                         // and `require_clean_git` both have to clear before

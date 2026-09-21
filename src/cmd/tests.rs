@@ -4254,6 +4254,64 @@ dst = "{}"
     );
 }
 
+/// Editors/tools that write the target file wholesale (e.g. `codex`
+/// rewriting its own config) bump `dst`'s mtime past `src` even when the
+/// content is unchanged, or changed only cosmetically (comments, key
+/// order, formatting). Before this fix, the merge anomaly gate compared
+/// mtimes only — a cosmetic-only rewrite with a dirty source repo hit the
+/// exact same "source repo is dirty; deferring auto-absorb" anomaly as a
+/// real content change, forcing a prompt (and failing off-TTY) for a
+/// target that has nothing to absorb. The gate must also check semantic
+/// (filtered-TOML) drift and skip the anomaly entirely when there is none.
+#[test]
+fn apply_merge_skips_anomaly_when_target_diverges_only_cosmetically() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let base_file = source.join("home/config.base.toml");
+    let now = std::time::SystemTime::now();
+    let past = now - std::time::Duration::from_secs(120);
+    write_with_mtime(&base_file, "model = \"gpt-6\"\nnotify = \"x\"\n", past);
+
+    let target_file = target.join("config.toml");
+    // Same data as base_file, but reordered and with a comment — cosmetic
+    // only once re-parsed/re-serialized as TOML.
+    write_with_mtime(
+        &target_file,
+        "# rewritten by an external tool\nnotify = \"x\"\nmodel = \"gpt-6\"\n",
+        now,
+    );
+
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    if !git_init_and_commit(&source) {
+        eprintln!("skipping: git not available");
+        return;
+    }
+    // Dirty the source repo — under the old mtime-only gate this alone was
+    // enough to force the anomaly path even with zero semantic drift.
+    std::fs::write(source.join("untracked.txt"), "dirty").unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    let base_after = std::fs::read_to_string(&base_file).unwrap();
+    assert_eq!(
+        base_after, "model = \"gpt-6\"\nnotify = \"x\"\n",
+        "cosmetic-only target drift must not touch base"
+    );
+}
+
 /// `[absorb] on_anomaly = "skip"` is the explicit "leave it alone"
 /// answer for a merge entry whose target is newer than base but
 /// auto-absorb didn't run — it must stay silent (exit 0), unlike the
