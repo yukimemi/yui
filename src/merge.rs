@@ -161,20 +161,22 @@ pub fn absorb_toml(base: &mut Table, target: &Table, ignore_keys: &[String]) -> 
 /// `base`, or `base` holds settings `apply` hasn't pushed to `target`
 /// yet (e.g. a key newly added to `base`, which `target` simply lacks).
 pub fn check_drift(base: &Table, target: &Table, ignore_keys: &[String]) -> bool {
+    let mut clean_base = base.clone();
+    filter_table(&mut clean_base, ignore_keys);
     let mut clean_target = target.clone();
     filter_table(&mut clean_target, ignore_keys);
 
     // apply direction: would base → target change target?
     let mut applied = clean_target.clone();
-    deep_merge(&mut applied, base.clone());
+    deep_merge(&mut applied, clean_base.clone());
     if applied != clean_target {
         return true;
     }
 
     // absorb direction: would target → base change base?
-    let mut test_base = base.clone();
+    let mut test_base = clean_base.clone();
     deep_merge(&mut test_base, clean_target);
-    test_base != *base
+    test_base != clean_base
 }
 
 /// Back up `target`'s current content into `.yui/backup/...` before a
@@ -529,6 +531,30 @@ model = "gpt-6-astra"
         .unwrap();
 
         assert!(check_drift(&base, &target, &[]));
+    }
+
+    #[test]
+    fn test_check_drift_ignores_blacklisted_key_also_present_in_base() {
+        // `base` (not just `target`) carries a value under an ignored key.
+        // A target-only edit to that same ignored key must not register as
+        // drift — `ignore_keys` means "outside comparison" on both sides,
+        // not just the target side.
+        let base: Table = r#"
+model = "gpt-6-astra"
+notify = "base"
+"#
+        .parse()
+        .unwrap();
+
+        let target_only_ignored_change: Table = r#"
+model = "gpt-6-astra"
+notify = "local"
+"#
+        .parse()
+        .unwrap();
+
+        let ignore = vec!["notify".to_string()];
+        assert!(!check_drift(&base, &target_only_ignored_change, &ignore));
     }
 
     #[test]
