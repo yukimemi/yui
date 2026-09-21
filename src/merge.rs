@@ -30,7 +30,9 @@ pub struct MergeEntry {
     pub src: Utf8PathBuf,
     /// Destination live target path. Tera-rendered, `~` expanded.
     pub dst: String,
-    /// Keys to ignore when absorbing from target into source.
+    /// Keys treated as target's exclusive local state: excluded from
+    /// `absorb` (never pulled into source) and from `apply` (base never
+    /// overwrites them in target either), and from drift comparisons.
     /// Supports dot-notation for nested tables (e.g. `"marketplaces.openai-bundled"`).
     #[serde(default)]
     pub ignore_keys: Vec<String>,
@@ -161,20 +163,22 @@ pub fn absorb_toml(base: &mut Table, target: &Table, ignore_keys: &[String]) -> 
 /// `base`, or `base` holds settings `apply` hasn't pushed to `target`
 /// yet (e.g. a key newly added to `base`, which `target` simply lacks).
 pub fn check_drift(base: &Table, target: &Table, ignore_keys: &[String]) -> bool {
+    let mut clean_base = base.clone();
+    filter_table(&mut clean_base, ignore_keys);
     let mut clean_target = target.clone();
     filter_table(&mut clean_target, ignore_keys);
 
     // apply direction: would base → target change target?
     let mut applied = clean_target.clone();
-    deep_merge(&mut applied, base.clone());
+    deep_merge(&mut applied, clean_base.clone());
     if applied != clean_target {
         return true;
     }
 
     // absorb direction: would target → base change base?
-    let mut test_base = base.clone();
+    let mut test_base = clean_base.clone();
     deep_merge(&mut test_base, clean_target);
-    test_base != *base
+    test_base != clean_base
 }
 
 /// Back up `target`'s current content into `.yui/backup/...` before a
@@ -215,7 +219,7 @@ pub fn apply_entry(
 
     let src_content = fs::read_to_string(&src_path)
         .with_context(|| format!("reading merge source {src_path}"))?;
-    let src_table: Table = toml::from_str(&src_content)
+    let mut src_table: Table = toml::from_str(&src_content)
         .with_context(|| format!("parsing TOML in merge source {src_path}"))?;
 
     if !dst_path.exists() {
@@ -240,6 +244,15 @@ pub fn apply_entry(
             return Ok(());
         }
     };
+
+    // `ignore_keys` marks a key as target's exclusive local state (that's
+    // what makes it safe for `check_drift` to exclude from both sides when
+    // deciding whether an anomaly prompt is even needed). Base must not
+    // clobber that state here just because it happens to also carry a
+    // value under the same key — otherwise a target-only edit to an
+    // ignored key gets silently overwritten the moment `check_drift`
+    // (correctly) reports no drift and this runs unprompted.
+    filter_table(&mut src_table, &entry.ignore_keys);
 
     let original_dst = dst_table.clone();
     merge_toml(&src_table, &mut dst_table);
@@ -529,6 +542,30 @@ model = "gpt-6-astra"
         .unwrap();
 
         assert!(check_drift(&base, &target, &[]));
+    }
+
+    #[test]
+    fn test_check_drift_ignores_blacklisted_key_also_present_in_base() {
+        // `base` (not just `target`) carries a value under an ignored key.
+        // A target-only edit to that same ignored key must not register as
+        // drift — `ignore_keys` means "outside comparison" on both sides,
+        // not just the target side.
+        let base: Table = r#"
+model = "gpt-6-astra"
+notify = "base"
+"#
+        .parse()
+        .unwrap();
+
+        let target_only_ignored_change: Table = r#"
+model = "gpt-6-astra"
+notify = "local"
+"#
+        .parse()
+        .unwrap();
+
+        let ignore = vec!["notify".to_string()];
+        assert!(!check_drift(&base, &target_only_ignored_change, &ignore));
     }
 
     #[test]
