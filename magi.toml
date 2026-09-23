@@ -47,25 +47,15 @@ e2e = ["CARGO_TARGET_DIR={{ vars.cache }}/yui-target cargo test --locked --all-t
 # either — gating on it here would block merges over something CI itself
 # does not block on.
 #
-# Makefile.toml's `editorconfig-check` task no-ops when the
-# `editorconfig-checker` binary isn't on PATH (deliberately, so a human's
-# local `cargo make check` still works without it installed — CI's own
-# `editorconfig` job installs the tool itself and always enforces it). That
-# fail-open behaviour is right for a human, but wrong for this gate: on a
-# machine without the binary, `cargo make check` would report clean while
-# CI's `editorconfig` job still fails on the same violation, which is
-# exactly the drift this file exists to close. So the gate also invokes
-# `editorconfig-checker` directly — that fails hard (command not found)
-# instead of skipping when the binary is missing, independent of
-# Makefile.toml's local-friendly default. It runs first because it is cheap
-# and should fail fast, before the multi-minute compile+test below.
+# editorconfig is enforced by CI's `editorconfig` job only, not by this gate:
+# tools that must be installed on a specific machine stay in GHA. The
+# `editorconfig-check` task inside `cargo make check` no-ops when the binary
+# is missing, which is fine here.
 gate = [
-  "editorconfig-checker",
   "CARGO_TARGET_DIR={{ vars.cache }}/yui-target cargo make check",
 ]
 
 [merge]
-mode = "none"
 # Required here, and in every jj-colocated repo: jj keeps git's HEAD detached at
 # the working-copy commit, so magi cannot infer the base branch from
 # `git symbolic-ref HEAD`. Teaching magi to read the jj bookmark instead is a
