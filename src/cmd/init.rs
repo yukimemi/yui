@@ -54,6 +54,7 @@ const YUI_REQUIRED_GITIGNORE: &[&str] = &[
     "/.yui/state.json",
     "/.yui/state.json.tmp",
     "/.yui/backup/",
+    "/.gitignore.tmp",
     "config.local.toml",
 ];
 
@@ -208,6 +209,7 @@ const SKELETON_GITIGNORE: &str = r#"# yui per-machine state and backups (regener
 # .yui/bin/ is intentionally tracked — it holds your hook scripts.
 /.yui/state.json
 /.yui/state.json.tmp
+/.gitignore.tmp
 /.yui/backup/
 
 # >>> yui rendered (auto-managed, do not edit) >>>
