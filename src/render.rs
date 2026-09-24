@@ -447,7 +447,16 @@ fn update_gitignore(source: &Utf8Path, rendered_abs_paths: &[Utf8PathBuf]) -> Re
     let updated = replace_or_append_section(&existing, &new_section);
 
     if updated != existing {
-        std::fs::write(&gi_path, updated)?;
+        // Atomically persist: write to a sibling `.tmp` then rename, so an
+        // interrupted apply (Ctrl-C, crash, AV/OneDrive lock delay) can't
+        // leave a truncated `.gitignore` behind — a bare `fs::write` opens
+        // with truncate first, and dying between the truncate and the
+        // write completing wipes the *entire* managed block, including
+        // long-standing entries that had nothing to do with this run.
+        // Mirrors `hook::State::save`.
+        let tmp = source.join(".gitignore.tmp");
+        std::fs::write(&tmp, &updated)?;
+        std::fs::rename(&tmp, &gi_path)?;
     }
     Ok(())
 }
