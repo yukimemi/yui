@@ -182,7 +182,19 @@ pub fn render_to_string(
         }
     }
 
-    Ok(Some(engine.render(&body_input, &ctx)?))
+    let out = engine
+        .render(&body_input, &ctx)
+        .map_err(|e| in_file(template_path, e))?;
+    Ok(Some(out))
+}
+
+/// Prefix a template error with the file that produced it — Tera reports
+/// only `__tera_one_off:LINE:COL`, which is useless with many templates.
+fn in_file(path: &Utf8Path, e: Error) -> Error {
+    match e {
+        Error::Template(msg) => Error::Template(format!("{path}: {msg}")),
+        other => other,
+    }
 }
 
 struct CompiledRule {
@@ -245,7 +257,9 @@ fn process_template(
         }
     }
 
-    let body = engine.render(&body_input, ctx)?;
+    let body = engine
+        .render(&body_input, ctx)
+        .map_err(|e| in_file(template_path, e))?;
 
     match std::fs::read_to_string(&target) {
         Ok(existing) if existing == body => {

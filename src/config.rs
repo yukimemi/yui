@@ -550,7 +550,10 @@ pub fn load(source: &Utf8Path, yui: &YuiVars) -> Result<Config> {
         // (`{{ script_path }}` etc.) survive this pass intact. Dotfile
         // rendering keeps the bare `template_context`.
         let ctx = template::config_render_context(yui, &vars_acc);
-        let rendered = engine.render(&raw, &ctx)?;
+        let rendered = engine.render(&raw, &ctx).map_err(|e| match e {
+            Error::Template(msg) => Error::Template(format!("{file}: {msg}")),
+            other => other,
+        })?;
         let parsed: toml::Table =
             toml::from_str(&rendered).map_err(|e| Error::Config(format!("parse {file}: {e}")))?;
 
