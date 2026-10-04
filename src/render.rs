@@ -160,7 +160,7 @@ pub fn render_to_string(
     let rules = compile_rules(&config.render.rule)?;
 
     let body_input = if let Some((expr, body)) = split_yui_when(&raw) {
-        if !eval_when(expr, &mut engine, &ctx)? {
+        if !eval_when(expr, &mut engine, &ctx).map_err(|e| in_file(template_path, e))? {
             return Ok(None);
         }
         body.to_string()
@@ -175,7 +175,7 @@ pub fn render_to_string(
         // (rust-version = "1.85") stays buildable.
         if rule.matcher.is_match(&rel_for_match) {
             if let Some(w) = &rule.when {
-                if !eval_when(w, &mut engine, &ctx)? {
+                if !eval_when(w, &mut engine, &ctx).map_err(|e| in_file(template_path, e))? {
                     return Ok(None);
                 }
             }
@@ -237,7 +237,7 @@ fn process_template(
     // Tera, so a falsy header doesn't leave a stray newline at the top of
     // a successful render.
     let body_input = if let Some((expr, body)) = split_yui_when(&raw) {
-        if !eval_when(expr, engine, ctx)? {
+        if !eval_when(expr, engine, ctx).map_err(|e| in_file(template_path, e))? {
             return skip_when_false(template_path, &target, dry_run, report);
         }
         body.to_string()
@@ -250,7 +250,7 @@ fn process_template(
     for rule in rules {
         if rule.matcher.is_match(&rel_for_match) {
             if let Some(w) = &rule.when {
-                if !eval_when(w, engine, ctx)? {
+                if !eval_when(w, engine, ctx).map_err(|e| in_file(template_path, e))? {
                     return skip_when_false(template_path, &target, dry_run, report);
                 }
             }
