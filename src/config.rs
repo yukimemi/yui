@@ -544,13 +544,21 @@ pub fn load(source: &Utf8Path, yui: &YuiVars) -> Result<Config> {
         // every string value in `vars_acc` with `vars_acc` itself as
         // the context, until nothing changes (or we've burned through
         // the iteration budget — that catches genuine cycles).
-        resolve_vars_refs(&mut vars_acc, yui, &mut engine)?;
+        // Values resolved by earlier files already succeeded, so a failure
+        // here comes from this file's `[vars]` — name it.
+        resolve_vars_refs(&mut vars_acc, yui, &mut engine).map_err(|e| match e {
+            Error::Template(msg) => Error::Template(format!("{file}: {msg}")),
+            other => other,
+        })?;
 
         // Use the config-flavoured context so hook-level placeholders
         // (`{{ script_path }}` etc.) survive this pass intact. Dotfile
         // rendering keeps the bare `template_context`.
         let ctx = template::config_render_context(yui, &vars_acc);
-        let rendered = engine.render(&raw, &ctx)?;
+        let rendered = engine.render(&raw, &ctx).map_err(|e| match e {
+            Error::Template(msg) => Error::Template(format!("{file}: {msg}")),
+            other => other,
+        })?;
         let parsed: toml::Table =
             toml::from_str(&rendered).map_err(|e| Error::Config(format!("parse {file}: {e}")))?;
 
