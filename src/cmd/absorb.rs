@@ -368,6 +368,51 @@ fn templatize_dst_with(
     (target_str.replace('\\', "/"), None)
 }
 
+/// Labels for the anomaly prompt diff (src -> dst). Each says which
+/// prompt choice leaves that side in place, since `-` / `+` read the
+/// other way round under the usual `git diff` convention.
+pub(crate) const ANOMALY_MINUS: &str = "[-] src (kept by overwrite)";
+pub(crate) const ANOMALY_PLUS: &str = "[+] dst (kept by absorb)";
+
+/// Build the three header lines (title, `-` side, `+` side) shared by
+/// every diff prompt. Pure and colourless so the wording can be tested.
+pub(crate) fn diff_header_lines(
+    title: &str,
+    minus: &str,
+    minus_path: &Utf8Path,
+    plus: &str,
+    plus_path: &Utf8Path,
+) -> [String; 3] {
+    [
+        title.to_string(),
+        format!("  {minus}: {minus_path}"),
+        format!("  {plus}: {plus_path}"),
+    ]
+}
+
+/// Print the header from [`diff_header_lines`]; when `color` is set the
+/// title is bold and the two path lines are red / green.
+pub(crate) fn print_diff_header(
+    color: bool,
+    title: &str,
+    minus: &str,
+    minus_path: &Utf8Path,
+    plus: &str,
+    plus_path: &Utf8Path,
+) {
+    use owo_colors::OwoColorize as _;
+    let [t, m, p] = diff_header_lines(title, minus, minus_path, plus, plus_path);
+    if color {
+        eprintln!("{}", t.bold());
+        eprintln!("{}", m.red());
+        eprintln!("{}", p.green());
+    } else {
+        eprintln!("{t}");
+        eprintln!("{m}");
+        eprintln!("{p}");
+    }
+}
+
 /// Stderr-print a unified diff between `src` (file or dir) and `dst`
 /// using `similar`. Falls back to a one-line description when one
 /// side is a directory or content isn't valid UTF-8 — we'd rather
@@ -381,20 +426,14 @@ pub(crate) fn print_absorb_diff(src: &Utf8Path, dst: &Utf8Path) {
     let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
 
     eprintln!();
-    if color {
-        eprintln!(
-            "{}  {}  {}",
-            "── unified diff ──".bold(),
-            "[-] src".red().bold(),
-            "[+] dst".green().bold()
-        );
-        eprintln!("  {} {}", "[-] src:".red(), src);
-        eprintln!("  {} {}", "[+] dst:".green(), dst);
-    } else {
-        eprintln!("── unified diff ──  [-] src   [+] dst");
-        eprintln!("  [-] src: {src}");
-        eprintln!("  [+] dst: {dst}");
-    }
+    print_diff_header(
+        color,
+        "── unified diff ──",
+        ANOMALY_MINUS,
+        src,
+        ANOMALY_PLUS,
+        dst,
+    );
     eprintln!();
 
     if src.is_dir() || dst.is_dir() {
