@@ -4528,3 +4528,31 @@ ignore_keys = ["projects"]
         "diff must report merge drift successfully"
     );
 }
+
+#[test]
+fn diff_header_labels_state_which_choice_keeps_each_side() {
+    let a = Utf8Path::new("/s");
+    let b = Utf8Path::new("/d");
+    let [_, m, p] = crate::cmd::absorb::diff_header_lines(
+        "t",
+        crate::cmd::absorb::ANOMALY_MINUS,
+        a,
+        crate::cmd::absorb::ANOMALY_PLUS,
+        b,
+    );
+    assert!(
+        m.contains("[-] src") && m.contains("kept by overwrite"),
+        "{m}"
+    );
+    assert!(p.contains("[+] dst") && p.contains("kept by absorb"), "{p}");
+
+    let [_, m, p] = crate::cmd::absorb::diff_header_lines(
+        "t",
+        crate::cmd::apply::RENDER_DRIFT_MINUS,
+        a,
+        crate::cmd::apply::RENDER_DRIFT_PLUS,
+        b,
+    );
+    assert!(m.contains("kept by skip"), "{m}");
+    assert!(p.contains("kept by overwrite"), "{p}");
+}

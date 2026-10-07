@@ -875,20 +875,14 @@ fn print_merge_absorb_diff(src: &Utf8Path, dst: &Utf8Path, ignore_keys: &[String
     let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
 
     eprintln!();
-    if color {
-        eprintln!(
-            "{}  {}  {}",
-            "── unified diff (filtered) ──".bold(),
-            "[-] src".red().bold(),
-            "[+] dst".green().bold()
-        );
-        eprintln!("  {} {}", "[-] src:".red(), src);
-        eprintln!("  {} {}", "[+] dst:".green(), dst);
-    } else {
-        eprintln!("── unified diff (filtered) ──  [-] src   [+] dst");
-        eprintln!("  [-] src: {src}");
-        eprintln!("  [+] dst: {dst}");
-    }
+    super::absorb::print_diff_header(
+        color,
+        "── unified diff (filtered) ──",
+        super::absorb::ANOMALY_MINUS,
+        src,
+        super::absorb::ANOMALY_PLUS,
+        dst,
+    );
     eprintln!();
 
     let src_text = std::fs::read_to_string(src).unwrap_or_default();
@@ -1144,6 +1138,11 @@ fn prompt_render_drift(
     }
 }
 
+/// Render-drift diff labels (on disk -> fresh). Here overwrite keeps the
+/// `+` side and skip keeps the `-` side — the reverse of the anomaly prompt.
+pub(crate) const RENDER_DRIFT_MINUS: &str = "[-] rendered (on disk; kept by skip)";
+pub(crate) const RENDER_DRIFT_PLUS: &str = "[+] fresh (.tera output; kept by overwrite)";
+
 /// Render-drift counterpart of `print_absorb_diff`. The "src" side is
 /// in-memory (the fresh template output) so we can't reuse the file→file
 /// helper directly — we read the on-disk rendered file and diff it
@@ -1155,20 +1154,14 @@ fn print_render_drift_diff(entry: &render::DivergedEntry) {
     let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
 
     eprintln!();
-    if color {
-        eprintln!(
-            "{}  {}  {}",
-            "── unified diff ──".bold(),
-            "[-] rendered (on disk)".red().bold(),
-            "[+] fresh (.tera output)".green().bold()
-        );
-        eprintln!("  {} {}", "[-] rendered:".red(), entry.rendered_path);
-        eprintln!("  {} {}", "[+] .tera:   ".green(), entry.tera_path);
-    } else {
-        eprintln!("── unified diff ──  [-] rendered (on disk)   [+] fresh (.tera output)");
-        eprintln!("  [-] rendered: {}", entry.rendered_path);
-        eprintln!("  [+] .tera:    {}", entry.tera_path);
-    }
+    super::absorb::print_diff_header(
+        color,
+        "── unified diff ──",
+        RENDER_DRIFT_MINUS,
+        &entry.rendered_path,
+        RENDER_DRIFT_PLUS,
+        &entry.tera_path,
+    );
     eprintln!();
 
     // Use the shared text/binary classifier so a non-UTF-8 rendered file
