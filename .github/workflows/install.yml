@@ -46,6 +46,10 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP 'yui home'
+          $environmentKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+          $originalPath = $environmentKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+          $seededPath = "$originalPath;" + '%USERPROFILE%\yui-path-regression'
+          $environmentKey.SetValue('Path', $seededPath, [Microsoft.Win32.RegistryValueKind]::ExpandString)
           Get-Content -Raw install.ps1 | Invoke-Expression
           yui --version
           if ($LASTEXITCODE -ne 0) { throw 'Installed yui could not run.' }
@@ -56,3 +60,9 @@ jobs:
           $entries = ([Environment]::GetEnvironmentVariable('Path', 'User') -split ';') |
             Where-Object { $_ -eq $bin }
           if (@($entries).Count -ne 1) { throw 'Installer duplicated or omitted the user PATH entry.' }
+          $rawPath = $environmentKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+          if ($rawPath -cne "$seededPath;$bin") { throw 'Installer changed existing user PATH entries.' }
+          if ($environmentKey.GetValueKind('Path') -ne [Microsoft.Win32.RegistryValueKind]::ExpandString) {
+            throw 'Installer changed the user PATH registry type.'
+          }
+          $environmentKey.Dispose()

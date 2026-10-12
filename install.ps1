@@ -30,10 +30,17 @@
         Move-Item -LiteralPath $staged -Destination (Join-Path $installDir 'yui.exe') -Force
         $staged = $null
 
-        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-        if (($userPath -split ';') -notcontains $installDir) {
-            $newPath = if ([string]::IsNullOrEmpty($userPath)) { $installDir } else { "$userPath;$installDir" }
-            [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+        $environmentKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+        try {
+            # Preserve variable references such as %USERPROFILE% in the user PATH.
+            $userPath = $environmentKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            if (($userPath -split ';') -notcontains $installDir) {
+                $newPath = if ([string]::IsNullOrEmpty($userPath)) { $installDir } else { "$userPath;$installDir" }
+                $environmentKey.SetValue('Path', $newPath, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+            }
+        }
+        finally {
+            $environmentKey.Dispose()
         }
         if (($env:Path -split ';') -notcontains $installDir) {
             $env:Path = "$installDir;$env:Path"
