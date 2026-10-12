@@ -65,7 +65,7 @@ thiserror = "2.0.21"
 # unused — `updater` doesn't use `#[tokio::main]` / `tokio::test`.
 tokio = { version = "1.53.2", features = ["rt", "rt-multi-thread", "time"] }
 toml = "1.1.8"
-toml_edit = "0.25.16"
+toml_edit = "0.25.17"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 whoami = "2.1.3"
