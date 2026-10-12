@@ -141,6 +141,7 @@ your user `PATH` and the current PowerShell session. Other terminals need
 to be reopened to pick up the updated `PATH`. Close any running `yui`
 before reinstalling on Windows.
 Existing user `PATH` entries, including `%VAR%` references, are preserved.
+The Windows release download times out after five minutes; retry if it fails.
 
 Both installers download and check the binary before replacing an
 existing installation. To inspect the scripts before running them, open

@@ -18,7 +18,7 @@
         $archive = Join-Path $tmp 'yui.zip'
         $url = 'https://github.com/yukimemi/yui/releases/latest/download/yui-x86_64-pc-windows-msvc.zip'
         Write-Host 'Downloading the latest yui for Windows x86_64...'
-        Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
+        Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing -TimeoutSec 300
         Expand-Archive -LiteralPath $archive -DestinationPath $tmp
         $binary = Join-Path $tmp 'yui.exe'
         & $binary --version
