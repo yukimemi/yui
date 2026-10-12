@@ -110,13 +110,51 @@ target blocks recovery without changing source or the staged tree.
 
 ## Install
 
+Install the latest pre-built release without Rust, Git, a package manager,
+or administrator privileges.
+
+**macOS (Apple Silicon) / Linux (x86_64)**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yukimemi/yui/main/install.sh | sh
+```
+
+Installs to `~/.local/bin/yui`. If that directory is not already on your
+`PATH`, the installer prints the command to add it. For sh/bash/zsh:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Add that line to your shell's startup file to keep it across sessions.
+For fish, run `fish_add_path "$HOME/.local/bin"` instead.
+The installer does not modify Unix shell configuration.
+
+**Windows (x86_64, PowerShell 5.1+)**
+
+```powershell
+irm https://raw.githubusercontent.com/yukimemi/yui/main/install.ps1 | iex
+```
+
+Installs to `%LOCALAPPDATA%\yui\bin\yui.exe` and adds that directory to
+your user `PATH` and the current PowerShell session. Other terminals need
+to be reopened to pick up the updated `PATH`. Close any running `yui`
+before reinstalling on Windows.
+
+Both installers download and check the binary before replacing an
+existing installation. To inspect the scripts before running them, open
+[`install.sh`](install.sh) or [`install.ps1`](install.ps1).
+
+**Build from source (requires Rust)**
+
 ```sh
 cargo install yui-cli
 ```
 
 Pre-built binaries for Linux x86_64, Windows x86_64, and macOS
-(Intel + Apple Silicon) are attached to every
+Apple Silicon are attached to every
 [GitHub Release](https://github.com/yukimemi/yui/releases).
+Intel Mac and Linux ARM64 are not supported by the one-line installers.
 
 ## Quick start
 
