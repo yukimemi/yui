@@ -239,6 +239,120 @@ pub fn secret_encrypt(
     Ok(())
 }
 
+/// Suffix of the sibling temp file a bulk re-encryption writes
+/// before renaming over the `.age`. Does not end in `.age`, so the
+/// secrets walker never mistakes a leftover for a secret.
+pub(crate) const DRIFT_TMP_SUFFIX: &str = ".yui-tmp";
+
+/// Outcome counts of `yui secret encrypt --drift`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DriftEncryptReport {
+    pub encrypted: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
+
+/// Encrypt `plaintext_path` to `cipher_path` via a sibling temp file
+/// + rename, so a failed write never leaves a truncated `.age`.
+fn replace_ciphertext(
+    plaintext_path: &Utf8PathBuf,
+    cipher_path: &Utf8PathBuf,
+    recipients: &[secret::BoxedRecipient],
+) -> Result<()> {
+    let plaintext = std::fs::read(plaintext_path)?;
+    let cipher = secret::encrypt_to_passkeys(&plaintext, recipients)?;
+    let tmp = Utf8PathBuf::from(format!("{cipher_path}{DRIFT_TMP_SUFFIX}"));
+    let result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        // Keep the existing ciphertext's mode across the rename.
+        if let Ok(meta) = std::fs::metadata(cipher_path) {
+            f.set_permissions(meta.permissions())?;
+        }
+        f.write_all(&cipher)?;
+        // Flush data to disk before the rename can make it visible.
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, cipher_path)?;
+        // Persist the rename itself. Directories can't be opened for
+        // fsync on Windows, so this is Unix-only.
+        #[cfg(unix)]
+        if let Some(parent) = cipher_path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        // Never remove a directory squatting on the temp name.
+        if tmp.is_file() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+    Ok(result?)
+}
+
+/// `yui secret encrypt --drift [--dry-run]` — re-encrypt every
+/// secret whose plaintext sibling drifted from its `.age`.
+///
+/// Discovery is `secret::decrypt_all` in dry-run mode, i.e. the exact
+/// walk, ignore rules and drift test `status` / `apply` use. Only its
+/// `diverged` list is acted on; secrets without a plaintext sibling
+/// (reported as `written` in dry-run) and unchanged ones are skipped.
+/// An undecryptable `.age` aborts discovery before anything is
+/// written. Plaintext is never deleted.
+pub fn secret_encrypt_drift(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
+    let source = resolve_source(source)?;
+    let yui = YuiVars::detect(&source);
+    let config = config::load(&source, &yui)?;
+
+    if !config.secrets.enabled() {
+        anyhow::bail!(
+            "no recipients configured — run `yui secret init` to generate \
+             a keypair, or add at least one entry to `[secrets] recipients`."
+        );
+    }
+    let report = secret::decrypt_all(&source, &config, true)?;
+    let recipients = secret::parse_passkey_recipients(&config.secrets.recipients)?;
+    let rel = |p: &Utf8PathBuf| p.strip_prefix(&source).unwrap_or(p).to_string();
+
+    let mut out = DriftEncryptReport {
+        skipped: report.unchanged.len() + report.written.len(),
+        ..Default::default()
+    };
+    for plaintext_path in &report.diverged {
+        let cipher_path = Utf8PathBuf::from(format!("{plaintext_path}.age"));
+        if dry_run {
+            println!("would re-encrypt: {}", rel(plaintext_path));
+            out.encrypted += 1;
+            continue;
+        }
+        match replace_ciphertext(plaintext_path, &cipher_path, &recipients) {
+            Ok(()) => {
+                println!("re-encrypted: {}", rel(plaintext_path));
+                out.encrypted += 1;
+            }
+            Err(_) => {
+                // Deliberately no error detail: it could echo key material.
+                warn!("failed to re-encrypt {}", rel(plaintext_path));
+                out.failed += 1;
+            }
+        }
+    }
+    let verb = if dry_run {
+        "would re-encrypt"
+    } else {
+        "re-encrypted"
+    };
+    println!(
+        "{verb}: {}, skipped: {}, failed: {}",
+        out.encrypted, out.skipped, out.failed
+    );
+    if out.failed > 0 {
+        anyhow::bail!("{} secret(s) failed to re-encrypt", out.failed);
+    }
+    Ok(())
+}
+
 /// `yui secret store [--force]` — push the X25519 identity at
 /// `[secrets].identity` into the configured `[secrets.vault]`.
 /// Run on a machine that already has the identity; the new

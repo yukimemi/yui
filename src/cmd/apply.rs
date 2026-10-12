@@ -59,8 +59,8 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     if secret_report.has_drift() {
         anyhow::bail!(
             "secret drift detected ({} file(s)); the plaintext sibling diverged \
-             from the canonical .age — run `yui secret encrypt <path>` to roll \
-             the edit back into ciphertext before re-running apply",
+             from the canonical .age — run `yui secret encrypt <path>` (or \
+             `yui secret encrypt --drift` for all) to roll the edit back into ciphertext before re-running apply",
             secret_report.diverged.len()
         );
     }

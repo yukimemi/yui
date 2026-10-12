@@ -459,7 +459,7 @@ pub struct SecretReport {
     pub unchanged: Vec<camino::Utf8PathBuf>,
     /// Plaintext sibling diverged from current ciphertext. User
     /// edited the plaintext target directly; they must
-    /// `yui secret encrypt <path>` to roll the change back into
+    /// `yui secret encrypt <path>` (or `--drift` for all) to roll the change back into
     /// the canonical `.age` before the next apply.
     pub diverged: Vec<camino::Utf8PathBuf>,
 }

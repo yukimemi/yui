@@ -3517,6 +3517,147 @@ recipients = ["{public}"]
     );
 }
 
+/// Fixture for `secret encrypt --drift`: a source with a real
+/// identity file and recipient configured.
+fn drift_fixture(tmp: &TempDir) -> (Utf8PathBuf, String) {
+    let source = utf8(tmp.path().join("dotfiles"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    let (secret_key, public) = secret::generate_x25519_keypair();
+    let identity = utf8(tmp.path().join("age.txt"));
+    std::fs::write(&identity, format!("{secret_key}\n")).unwrap();
+    std::fs::write(
+        source.join("config.toml"),
+        format!(
+            "[secrets]\nidentity = \"{}\"\nrecipients = [\"{public}\"]\n",
+            toml_path(&identity)
+        ),
+    )
+    .unwrap();
+    (source, public)
+}
+
+fn drift_encrypt(source: &Utf8Path, name: &str, plain: &str, public: &str) {
+    let recipients = secret::parse_passkey_recipients(&[public.to_string()]).unwrap();
+    let cipher = secret::encrypt_to_passkeys(plain.as_bytes(), &recipients).unwrap();
+    std::fs::write(source.join(format!("{name}.age")), cipher).unwrap();
+}
+
+fn decrypt_age(source: &Utf8Path, name: &str, tmp: &TempDir) -> Vec<u8> {
+    let id = secret::load_x25519_identity(&utf8(tmp.path().join("age.txt"))).unwrap();
+    secret::decrypt_x25519(
+        &std::fs::read(source.join(format!("{name}.age"))).unwrap(),
+        &id,
+    )
+    .unwrap()
+}
+
+#[test]
+fn secret_encrypt_drift_reencrypts_only_diverged() {
+    let tmp = TempDir::new().unwrap();
+    let (source, public) = drift_fixture(&tmp);
+    drift_encrypt(&source, "home/a", "old", &public);
+    drift_encrypt(&source, "home/same", "same", &public);
+    drift_encrypt(&source, "home/noplain", "x", &public);
+    std::fs::write(source.join("home/a"), "new").unwrap();
+    std::fs::write(source.join("home/same"), "same").unwrap();
+    let same_before = std::fs::read(source.join("home/same.age")).unwrap();
+    let noplain_before = std::fs::read(source.join("home/noplain.age")).unwrap();
+
+    secret_encrypt_drift(Some(source.clone()), false).unwrap();
+
+    assert_eq!(decrypt_age(&source, "home/a", &tmp), b"new");
+    assert_eq!(
+        std::fs::read(source.join("home/same.age")).unwrap(),
+        same_before
+    );
+    assert_eq!(
+        std::fs::read(source.join("home/noplain.age")).unwrap(),
+        noplain_before
+    );
+    assert!(
+        !source.join("home/noplain").exists(),
+        "must not materialise plaintext"
+    );
+    assert_eq!(
+        std::fs::read_to_string(source.join("home/a")).unwrap(),
+        "new"
+    );
+    assert!(
+        !source
+            .join(format!("home/a.age{DRIFT_TMP_SUFFIX}"))
+            .exists()
+    );
+}
+
+#[test]
+fn secret_encrypt_drift_dry_run_writes_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let (source, public) = drift_fixture(&tmp);
+    drift_encrypt(&source, "home/a", "old", &public);
+    std::fs::write(source.join("home/a"), "new").unwrap();
+    let before = std::fs::read(source.join("home/a.age")).unwrap();
+
+    secret_encrypt_drift(Some(source.clone()), true).unwrap();
+
+    assert_eq!(std::fs::read(source.join("home/a.age")).unwrap(), before);
+    assert!(
+        !source
+            .join(format!("home/a.age{DRIFT_TMP_SUFFIX}"))
+            .exists()
+    );
+}
+
+#[test]
+fn secret_encrypt_drift_failure_keeps_ciphertext_and_continues() {
+    let tmp = TempDir::new().unwrap();
+    let (source, public) = drift_fixture(&tmp);
+    drift_encrypt(&source, "home/a", "old", &public);
+    drift_encrypt(&source, "home/b", "old", &public);
+    std::fs::write(source.join("home/a"), "new").unwrap();
+    std::fs::write(source.join("home/b"), "new").unwrap();
+    // A directory on the temp name forces the write for `a` to fail.
+    std::fs::create_dir(source.join(format!("home/a.age{DRIFT_TMP_SUFFIX}"))).unwrap();
+    let a_before = std::fs::read(source.join("home/a.age")).unwrap();
+
+    let err = secret_encrypt_drift(Some(source.clone()), false).unwrap_err();
+
+    assert!(err.to_string().contains("failed"));
+    assert_eq!(std::fs::read(source.join("home/a.age")).unwrap(), a_before);
+    assert_eq!(decrypt_age(&source, "home/b", &tmp), b"new");
+}
+
+#[test]
+fn secret_encrypt_drift_argument_validation() {
+    use crate::cli::Cli;
+    use clap::Parser;
+    let parse = |args: &[&str]| {
+        let mut v = vec!["yui", "secret", "encrypt"];
+        v.extend_from_slice(args);
+        Cli::try_parse_from(v)
+    };
+    assert!(parse(&["--drift"]).is_ok());
+    assert!(parse(&["--drift", "--dry-run"]).is_ok());
+    assert!(parse(&["some/path"]).is_ok());
+    assert!(parse(&["some/path", "--drift"]).is_err());
+    assert!(parse(&["--drift", "--rm-plaintext"]).is_err());
+    assert!(parse(&["--dry-run"]).is_err());
+    assert!(parse(&[]).is_err());
+}
+
+#[test]
+fn secret_encrypt_single_file_force_still_replaces() {
+    let tmp = TempDir::new().unwrap();
+    let (source, public) = drift_fixture(&tmp);
+    drift_encrypt(&source, "home/a", "old", &public);
+    std::fs::write(source.join("home/a"), "new").unwrap();
+
+    assert!(secret_encrypt(Some(source.clone()), source.join("home/a"), false, false).is_err());
+    secret_encrypt(Some(source.clone()), source.join("home/a"), true, true).unwrap();
+
+    assert_eq!(decrypt_age(&source, "home/a", &tmp), b"new");
+    assert!(!source.join("home/a").exists());
+}
+
 /// Build a live `ApplyCtx` for the dir-absorb staging tests. Kept
 /// separate from `ctx_for_test` because these need the borrowed
 /// pieces to outlive the call, so the caller owns the tuple.

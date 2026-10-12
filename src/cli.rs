@@ -281,15 +281,30 @@ pub enum SecretAction {
     /// before the next `apply`. Pass `--rm-plaintext` to also
     /// delete the plaintext after a successful encryption (works
     /// only when it lives under `$DOTFILES`).
+    ///
+    /// With `--drift` (and no path), instead re-encrypt every
+    /// existing plaintext sibling whose content differs from its
+    /// `.age` — the same drift `status` / `apply` report — using the
+    /// current `[secrets] recipients`. Unchanged secrets and `.age`
+    /// files without a plaintext sibling are left alone, and the
+    /// plaintext is never deleted.
     Encrypt {
-        path: Utf8PathBuf,
-        /// Replace an existing `<path>.age`.
+        #[arg(required_unless_present = "drift")]
+        path: Option<Utf8PathBuf>,
+        /// Replace an existing `<path>.age`. Not needed with `--drift`.
         #[arg(long)]
         force: bool,
         /// Delete the plaintext after a successful encryption
         /// (only works when the plaintext lives under `$DOTFILES`).
         #[arg(long)]
         rm_plaintext: bool,
+        /// Re-encrypt every secret whose plaintext sibling drifted
+        /// from its `.age`. Takes no path.
+        #[arg(long, conflicts_with_all = ["path", "rm_plaintext"])]
+        drift: bool,
+        /// With `--drift`: list the affected paths without writing.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Push the X25519 secret at `[secrets].identity` into the
@@ -378,7 +393,15 @@ impl Cli {
                     path,
                     force,
                     rm_plaintext,
-                } => cmd::secret_encrypt(source, path, force, rm_plaintext),
+                    drift,
+                    dry_run,
+                } => match path {
+                    Some(_) if dry_run => {
+                        anyhow::bail!("--dry-run is only supported together with --drift")
+                    }
+                    Some(path) if !drift => cmd::secret_encrypt(source, path, force, rm_plaintext),
+                    _ => cmd::secret_encrypt_drift(source, dry_run),
+                },
                 SecretAction::Store { force } => cmd::secret_store(source, force),
                 SecretAction::Unlock => cmd::secret_unlock(source),
             },
