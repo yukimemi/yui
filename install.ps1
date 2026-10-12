@@ -2,6 +2,7 @@
 # Install the latest release for the current user; no administrator required.
 & {
     $ErrorActionPreference = 'Stop'
+    $ProgressPreference = 'SilentlyContinue'
     $arch = $env:PROCESSOR_ARCHITEW6432
     if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
     if ($env:OS -ne 'Windows_NT' -or $arch -ne 'AMD64') {
@@ -36,7 +37,26 @@
             $userPath = $environmentKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
             if (($userPath -split ';') -notcontains $installDir) {
                 $newPath = if ([string]::IsNullOrEmpty($userPath)) { $installDir } else { "$userPath;$installDir" }
+                if (-not ('YuiInstaller.NativeMethods' -as [type])) {
+                    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace YuiInstaller {
+    public static class NativeMethods {
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        public static extern IntPtr SendMessageTimeout(
+            IntPtr hWnd, uint msg, UIntPtr wParam, string lParam,
+            uint flags, uint timeout, out UIntPtr result);
+    }
+}
+'@
+                }
                 $environmentKey.SetValue('Path', $newPath, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+                # Notify Explorer so newly opened terminals inherit the new PATH.
+                $result = [UIntPtr]::Zero
+                [void][YuiInstaller.NativeMethods]::SendMessageTimeout(
+                    [IntPtr]0xffff, 0x001a, [UIntPtr]::Zero, 'Environment',
+                    0x0002, 5000, [ref]$result)
             }
         }
         finally {

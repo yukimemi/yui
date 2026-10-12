@@ -140,6 +140,7 @@ Installs to `%LOCALAPPDATA%\yui\bin\yui.exe` and adds that directory to
 your user `PATH` and the current PowerShell session. Other terminals need
 to be reopened to pick up the updated `PATH`. Close any running `yui`
 before reinstalling on Windows.
+Existing user `PATH` entries, including `%VAR%` references, are preserved.
 
 Both installers download and check the binary before replacing an
 existing installation. To inspect the scripts before running them, open
