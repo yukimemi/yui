@@ -262,7 +262,26 @@ fn replace_ciphertext(
     let plaintext = std::fs::read(plaintext_path)?;
     let cipher = secret::encrypt_to_passkeys(&plaintext, recipients)?;
     let tmp = Utf8PathBuf::from(format!("{cipher_path}{DRIFT_TMP_SUFFIX}"));
-    let result = std::fs::write(&tmp, &cipher).and_then(|_| std::fs::rename(&tmp, cipher_path));
+    let result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        // Keep the existing ciphertext's mode across the rename.
+        if let Ok(meta) = std::fs::metadata(cipher_path) {
+            f.set_permissions(meta.permissions())?;
+        }
+        f.write_all(&cipher)?;
+        // Flush data to disk before the rename can make it visible.
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, cipher_path)?;
+        // Persist the rename itself. Directories can't be opened for
+        // fsync on Windows, so this is Unix-only.
+        #[cfg(unix)]
+        if let Some(parent) = cipher_path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
     if result.is_err() {
         // Never remove a directory squatting on the temp name.
         if tmp.is_file() {
