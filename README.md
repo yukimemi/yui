@@ -491,6 +491,27 @@ access:
    `yui secret encrypt --force <path>` per file. A `yui secret reencrypt`
    helper is planned.)
 
+### Rolling plaintext edits back in bulk
+
+When you edited several decrypted plaintext siblings, `apply` stops with
+a secret-drift error. Instead of one `yui secret encrypt --force <path>`
+per file:
+
+```sh
+yui secret encrypt --drift --dry-run   # list what would be re-encrypted
+yui secret encrypt --drift             # re-encrypt them, no --force needed
+```
+
+`--drift` takes no path and cannot be combined with `--rm-plaintext`.
+It finds secrets with the same walk and drift test as `status` / `apply`,
+and re-encrypts only plaintext siblings that differ from their `.age`
+using the current `[secrets] recipients`. Unchanged secrets and `.age`
+files without a plaintext sibling are untouched, and plaintext is never
+deleted. Each `.age` is replaced atomically; the command prints
+re-encrypted / skipped / failed counts and exits nonzero if any failed.
+If any `.age` cannot be decrypted with your identity, the command aborts
+before writing anything.
+
 ### Carrying the X25519 across machines (vault model)
 
 `apply` only ever uses the plain X25519 secret at
