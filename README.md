@@ -136,6 +136,13 @@ The installer does not modify Unix shell configuration.
 irm https://raw.githubusercontent.com/yukimemi/yui/main/install.ps1 | iex
 ```
 
+On older Windows/.NET installations, if fetching the script fails with a
+TLS error, enable TLS 1.2 in PowerShell first, then rerun the command:
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+```
+
 Installs to `%LOCALAPPDATA%\yui\bin\yui.exe` and adds that directory to
 your user `PATH` and the current PowerShell session. Other terminals need
 to be reopened to pick up the updated `PATH`. Close any running `yui`

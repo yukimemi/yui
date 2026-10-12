@@ -13,7 +13,10 @@
     $installDir = Join-Path $env:LOCALAPPDATA 'yui\bin'
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ('yui-install-' + [Guid]::NewGuid())
     $staged = $null
+    $originalProtocol = [Net.ServicePointManager]::SecurityProtocol
     try {
+        # Older .NET defaults may not negotiate the TLS required by GitHub.
+        [Net.ServicePointManager]::SecurityProtocol = $originalProtocol -bor [Net.SecurityProtocolType]::Tls12
         New-Item -ItemType Directory -Path $tmp | Out-Null
         $archive = Join-Path $tmp 'yui.zip'
         $url = 'https://github.com/yukimemi/yui/releases/latest/download/yui-x86_64-pc-windows-msvc.zip'
@@ -69,6 +72,7 @@ namespace YuiInstaller {
         Write-Host 'yui is ready in this PowerShell session. Open a new terminal for the updated user PATH.'
     }
     finally {
+        [Net.ServicePointManager]::SecurityProtocol = $originalProtocol
         if ($staged -and (Test-Path -LiteralPath $staged)) {
             Remove-Item -LiteralPath $staged -Force
         }
