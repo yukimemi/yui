@@ -46,8 +46,13 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Initialize source repo skeleton
+    /// Initialize a source skeleton or clone an existing dotfiles repository
     Init {
+        /// GitHub owner/repo, Git URL, or SSH SCP address
+        repo: Option<String>,
+        /// Apply the cloned source (requires a repository argument)
+        #[arg(long, requires = "repo")]
+        apply: bool,
         /// Install git pre-commit/pre-push hooks for render-drift check
         #[arg(long)]
         git_hooks: bool,
@@ -355,7 +360,17 @@ impl Cli {
     pub fn run(self) -> Result<()> {
         let source = self.source;
         match self.command {
-            Command::Init { git_hooks } => cmd::init(source, git_hooks),
+            Command::Init {
+                repo,
+                apply,
+                git_hooks,
+            } => {
+                if let Some(repo) = repo {
+                    cmd::bootstrap(source, &repo, git_hooks, apply)
+                } else {
+                    cmd::init(source, git_hooks)
+                }
+            }
             Command::Apply { dry_run } => cmd::apply(source, dry_run),
             Command::Render { check, dry_run } => cmd::render(source, check, dry_run),
             Command::Link { dry_run } => cmd::link(source, dry_run),

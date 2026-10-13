@@ -12,6 +12,7 @@
 
 mod absorb;
 mod apply;
+mod bootstrap;
 mod common;
 mod diff;
 mod doctor;
@@ -29,6 +30,7 @@ mod update;
 
 pub(crate) use absorb::*;
 pub(crate) use apply::*;
+pub(crate) use bootstrap::*;
 pub(crate) use common::*;
 pub(crate) use diff::*;
 pub(crate) use doctor::*;

@@ -20,7 +20,12 @@ use crate::{Error, Result};
 /// empty). `Err(Error::Git(_))` if `git` isn't on `$PATH` or `repo`
 /// isn't a repository.
 pub fn is_clean(repo: &Utf8Path) -> Result<bool> {
-    let output = Command::new("git")
+    is_clean_with_command(repo, Command::new("git"))
+}
+
+/// Check cleanliness using the caller's Git environment policy.
+pub(crate) fn is_clean_with_command(repo: &Utf8Path, mut command: Command) -> Result<bool> {
+    let output = command
         .arg("-C")
         .arg(repo.as_str())
         .arg("status")

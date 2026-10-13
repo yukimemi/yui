@@ -167,6 +167,43 @@ Intel Mac and Linux ARM64 are not supported by the one-line installers.
 
 ## Quick start
 
+To bootstrap an existing repository (Git must be installed):
+
+```sh
+yui init owner/repo             # GitHub HTTPS shorthand → ~/dotfiles
+# Explicit Git URLs and SSH SCP addresses also work:
+yui init git@github.com:owner/repo.git --source ~/my-dotfiles
+```
+
+Clone-only initialization leaves the fetched configuration unchanged. `--source`
+(or `YUI_SOURCE`) chooses the destination; otherwise repository initialization
+uses `~/dotfiles`. Existing files, symlinks, and directories (even empty ones)
+are refused unless the destination is the working tree root of a clone with a
+matching `origin`. GitHub HTTPS and SSH origins are treated as the same repository.
+Reusing a clone preserves local changes and does not fetch, pull, or reset it.
+`--git-hooks` also works with cloning and preserves existing hooks.
+
+For an encrypted repository, onboard in this order:
+
+```sh
+yui init owner/repo
+cd ~/dotfiles                  # or the destination selected by --source
+# Authenticate the vault CLI configured in config.toml:
+# Bitwarden: bw login (if needed), then export BW_SESSION="$(bw unlock --raw)"
+# 1Password: sign in using op signin (or configured desktop integration)
+yui secret unlock              # retrieve the existing X25519 identity
+yui apply
+```
+
+Initialization does not authenticate a vault or change secret storage. Use
+`yui init owner/repo --apply` to run the usual apply workflow immediately when no
+decryption key is needed or the configured identity is already available. Clone
+failures never run apply. If apply fails, the initialized clone remains available
+for correction and a later `yui apply`. A repository without `config.toml` can be
+cloned, but needs configuration before applying.
+
+To start a new source repository instead:
+
 ```sh
 # Scaffold a source repo at the current directory and install git hooks.
 yui init --git-hooks
@@ -667,7 +704,7 @@ mapping.
 
 | | |
 |---|---|
-| `yui init [--git-hooks]` | scaffold `config.toml` + `.gitignore` in cwd |
+| `yui init [repo] [--git-hooks] [--apply]` | without `repo`, scaffold in cwd; with GitHub `owner/repo` or Git URL, clone to `~/dotfiles` (override with `--source` / `YUI_SOURCE`); `--apply` requires `repo` and applies after initialization |
 | `yui apply [--dry-run]` | render → link → auto-absorb |
 | `yui render [--check] [--dry-run]` | template-only pass; `--check` fails on drift |
 | `yui link [--dry-run]` | alias for apply (kept for muscle memory) |

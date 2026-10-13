@@ -114,8 +114,16 @@ fn ensure_gitignore_yui_entries(dir: &Utf8Path) -> Result<()> {
 /// overrides come along for the ride. Refuses to overwrite existing
 /// hooks — the user has to delete them first if they want yui to
 /// manage that slot.
-fn install_git_hooks(source: &Utf8Path) -> Result<()> {
-    let out = std::process::Command::new("git")
+pub(super) fn install_git_hooks(source: &Utf8Path) -> Result<()> {
+    install_git_hooks_with_command(source, std::process::Command::new("git"))
+}
+
+/// Bootstrap supplies a Git command without inherited repository overrides.
+pub(super) fn install_git_hooks_with_command(
+    source: &Utf8Path,
+    mut command: std::process::Command,
+) -> Result<()> {
+    let out = command
         .args(["rev-parse", "--git-path", "hooks"])
         .current_dir(source.as_std_path())
         .output()
@@ -137,11 +145,21 @@ fn install_git_hooks(source: &Utf8Path) -> Result<()> {
 
     for (name, body) in [("pre-commit", PRE_COMMIT_HOOK), ("pre-push", PRE_PUSH_HOOK)] {
         let path = hooks_dir.join(name);
-        if path.exists() {
-            warn!("--git-hooks: {path} already exists — leaving it alone");
-            continue;
-        }
-        std::fs::write(&path, body).with_context(|| format!("write hook {path}"))?;
+        use std::io::Write as _;
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                warn!("--git-hooks: {path} already exists — leaving it alone");
+                continue;
+            }
+            Err(e) => return Err(e).with_context(|| format!("create hook {path}")),
+        };
+        file.write_all(body.as_bytes())
+            .with_context(|| format!("write hook {path}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
