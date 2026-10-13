@@ -140,7 +140,7 @@ fn reuse(dir: &Utf8Path, repo: &RepoSpec) -> Result<()> {
             "destination {dir} belongs to a different repository (origin does not match); choose another --source"
         );
     }
-    if !crate::git::is_clean(dir)? {
+    if !crate::git::is_clean_with_command(dir, git())? {
         warn!("{dir} has local changes; preserving them without fetching, pulling, or resetting");
     }
     info!("reusing existing repository at {dir}; no fetch or pull performed");
@@ -214,7 +214,7 @@ pub fn bootstrap(
     };
     clone_repo(&dir, &repo)?;
     if git_hooks {
-        super::init::install_git_hooks(&dir)?;
+        super::init::install_git_hooks_with_command(&dir, git())?;
     }
     if !dir.join("config.toml").is_file() {
         if apply {

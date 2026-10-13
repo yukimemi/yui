@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 fn git(dir: &Path, args: &[&str]) {
     let output = std::process::Command::new("git")
         .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
         .args(args)
         .output()
         .unwrap();
@@ -77,7 +81,9 @@ impl Fixture {
             .env("GIT_CONFIG_GLOBAL", self.home.join("absent-gitconfig"))
             .env_remove("YUI_SOURCE")
             .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE");
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_INDEX_FILE");
         cmd
     }
 
@@ -401,4 +407,58 @@ fn clone_failure_does_not_run_apply_hooks_from_current_source() {
     // Prove the sentinel would run if initialization accidentally applied cwd.
     f.cmd().arg("apply").assert().success();
     assert!(marker.exists());
+}
+
+#[test]
+fn bootstrap_ignores_inherited_repository_overrides() {
+    let f = Fixture::new();
+    let unrelated = f.home.join("unrelated");
+    std::fs::create_dir(&unrelated).unwrap();
+    git(&unrelated, &["init"]);
+    let hook = unrelated.join(".git/hooks/pre-commit");
+    std::fs::write(&hook, "unrelated hook").unwrap();
+    let run = || {
+        let mut cmd = f.cmd();
+        cmd.env("GIT_DIR", unrelated.join(".git"))
+            .env("GIT_WORK_TREE", &unrelated)
+            .env("GIT_COMMON_DIR", unrelated.join(".git"))
+            .env("GIT_INDEX_FILE", unrelated.join(".git/index"))
+            .args(["init", &f.url(), "--git-hooks"]);
+        cmd
+    };
+    run().assert().success();
+    std::fs::write(f.destination().join("untracked"), "local change").unwrap();
+    run()
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("has local changes"));
+    assert!(
+        std::fs::read_to_string(f.destination().join(".git/hooks/pre-commit"))
+            .unwrap()
+            .contains("yui render --check")
+    );
+    assert!(f.destination().join(".git/hooks/pre-push").is_file());
+    assert_eq!(std::fs::read_to_string(&hook).unwrap(), "unrelated hook");
+    assert!(!unrelated.join(".git/hooks/pre-push").exists());
+    assert!(!unrelated.join(".git/index").exists());
+}
+
+#[test]
+fn skeleton_init_keeps_explicit_git_overrides_for_hooks() {
+    let f = Fixture::new();
+    let source = f.home.join("skeleton");
+    f.cmd()
+        .env("GIT_DIR", f.repo.join(".git"))
+        .env("GIT_WORK_TREE", &f.repo)
+        .args(["init", "--git-hooks", "--source"])
+        .arg(&source)
+        .assert()
+        .success();
+    assert!(source.join("config.toml").is_file());
+    assert!(!source.join(".git").exists());
+    assert!(
+        std::fs::read_to_string(f.repo.join(".git/hooks/pre-commit"))
+            .unwrap()
+            .contains("yui render --check")
+    );
 }

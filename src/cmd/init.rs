@@ -115,7 +115,15 @@ fn ensure_gitignore_yui_entries(dir: &Utf8Path) -> Result<()> {
 /// hooks — the user has to delete them first if they want yui to
 /// manage that slot.
 pub(super) fn install_git_hooks(source: &Utf8Path) -> Result<()> {
-    let out = std::process::Command::new("git")
+    install_git_hooks_with_command(source, std::process::Command::new("git"))
+}
+
+/// Bootstrap supplies a Git command without inherited repository overrides.
+pub(super) fn install_git_hooks_with_command(
+    source: &Utf8Path,
+    mut command: std::process::Command,
+) -> Result<()> {
+    let out = command
         .args(["rev-parse", "--git-path", "hooks"])
         .current_dir(source.as_std_path())
         .output()
