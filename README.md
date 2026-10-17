@@ -418,6 +418,14 @@ ignore_keys = [
 ]
 ```
 
+The format follows the `src` extension: `.json` is merged as JSON, anything
+else as TOML. Both go through the same model, so `ignore_keys` /
+dot-notation behave identically (e.g. `ignore_keys = ["trustedWorkspaces"]`
+for a JSON settings file). JSON caveats: `null` values, integers outside the
+`i64` range and JSONC (comments / trailing commas) are unsupported — such a
+target is skipped with a warning and reported as drift by `status` — an empty
+target file is treated as an empty object, and keys are written sorted.
+
 - **`apply`**: If the target is missing, creates it from `src`. If the target exists and has newer edits, automatically absorbs upstream changes first, then merges `src` onto the live target.
 - **`absorb`**: Pulls new settings from the live target back into `src`, pruning any keys matching `ignore_keys` (supports dot notation and wildcards like `section.*`).
 - **`status` & `diff`**: Reports `drift` when base settings diverge from the live target outside of `ignore_keys`.

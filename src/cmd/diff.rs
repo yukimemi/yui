@@ -113,9 +113,13 @@ pub fn diff(
             } else {
                 let src_content = std::fs::read_to_string(&src_path).unwrap_or_default();
                 let dst_content = std::fs::read_to_string(&dst_path).unwrap_or_default();
-                let src_table: toml::Table = toml::from_str(&src_content).unwrap_or_default();
-                let dst_table: toml::Table = toml::from_str(&dst_content).unwrap_or_default();
-                if crate::merge::check_drift(&src_table, &dst_table, &m.ignore_keys) {
+                let format = crate::merge::Format::of(&src_path);
+                if crate::merge::check_drift_text(
+                    format,
+                    &src_content,
+                    &dst_content,
+                    &m.ignore_keys,
+                ) {
                     StatusState::MergeDrift
                 } else {
                     StatusState::MergeInSync
@@ -294,13 +298,12 @@ fn print_unified_diff(
                 }
             };
 
-            let mut src_table: toml::Table = toml::from_str(&src_text).unwrap_or_default();
-            let mut dst_table: toml::Table = toml::from_str(&dst_text).unwrap_or_default();
-            crate::merge::filter_table(&mut src_table, ignore_keys);
-            crate::merge::filter_table(&mut dst_table, ignore_keys);
-
-            let filtered_src = toml::to_string_pretty(&src_table).unwrap_or(src_text);
-            let filtered_dst = toml::to_string_pretty(&dst_table).unwrap_or(dst_text);
+            let (filtered_src, filtered_dst) = crate::merge::filtered_for_diff(
+                crate::merge::Format::of(src),
+                src_text,
+                dst_text,
+                ignore_keys,
+            );
 
             print_unified_text_diff(
                 &filtered_src,

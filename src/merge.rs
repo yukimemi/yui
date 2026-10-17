@@ -23,6 +23,91 @@ use crate::backup;
 use crate::paths;
 use crate::template::{self, Engine};
 
+/// On-disk syntax of a `[[merge]]` source/target, picked from the source
+/// file's extension (`.json` → JSON, anything else → TOML). Both sides are
+/// loaded into the same `toml::Table` model so `ignore_keys`, deep merge and
+/// drift detection behave identically across formats.
+///
+/// JSON limits: `null` and integers outside `i64` have no TOML equivalent
+/// and fail to parse (a target is then skipped with a warning), and output
+/// keys are sorted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Toml,
+    Json,
+}
+
+impl Format {
+    pub fn of(path: &Utf8Path) -> Self {
+        match path.extension() {
+            Some(ext) if ext.eq_ignore_ascii_case("json") => Self::Json,
+            _ => Self::Toml,
+        }
+    }
+
+    pub fn parse(self, text: &str) -> anyhow::Result<Table> {
+        match self {
+            Self::Toml => Ok(toml::from_str(text)?),
+            // An empty TOML file parses to an empty table; an empty JSON
+            // file is not valid JSON, so mirror the TOML behavior instead of
+            // leaving a blank target unrecoverable.
+            Self::Json if text.trim().is_empty() => Ok(Table::new()),
+            Self::Json => {
+                // Keep integer tokens intact until their range is checked;
+                // without arbitrary_precision, serde_json rounds oversized
+                // integers to f64 before we can reject them.
+                let value: serde_json::Value = serde_json::from_str(text)?;
+                match json_to_toml(value)? {
+                    Value::Table(table) => Ok(table),
+                    _ => anyhow::bail!("JSON merge document must be an object"),
+                }
+            }
+        }
+    }
+
+    pub fn render(self, table: &Table) -> anyhow::Result<String> {
+        match self {
+            Self::Toml => Ok(toml::to_string_pretty(table)?),
+            Self::Json => {
+                let mut s = serde_json::to_string_pretty(table)?;
+                s.push('\n');
+                Ok(s)
+            }
+        }
+    }
+}
+
+// Convert explicitly: arbitrary-precision numbers may deserialize through
+// serde as private maps, which TOML would otherwise accept as real tables.
+fn json_to_toml(value: serde_json::Value) -> anyhow::Result<Value> {
+    Ok(match value {
+        serde_json::Value::Number(number) => {
+            if let Some(integer) = number.as_i64() {
+                Value::Integer(integer)
+            } else if number.is_f64() {
+                Value::Float(number.as_f64().context("converting JSON float")?)
+            } else {
+                anyhow::bail!("JSON number {number} cannot be represented as a TOML number");
+            }
+        }
+        serde_json::Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(json_to_toml)
+                .collect::<anyhow::Result<_>>()?,
+        ),
+        serde_json::Value::Object(values) => Value::Table(
+            values
+                .into_iter()
+                .map(|(key, value)| Ok((key, json_to_toml(value)?)))
+                .collect::<anyhow::Result<_>>()?,
+        ),
+        serde_json::Value::String(value) => Value::String(value),
+        serde_json::Value::Bool(value) => Value::Boolean(value),
+        serde_json::Value::Null => anyhow::bail!("JSON null has no TOML equivalent"),
+    })
+}
+
 /// One `[[merge]]` declaration in `config.toml`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct MergeEntry {
@@ -181,6 +266,42 @@ pub fn check_drift(base: &Table, target: &Table, ignore_keys: &[String]) -> bool
     test_base != clean_base
 }
 
+/// [`check_drift`] over raw file text. A side that fails to parse (e.g. a
+/// JSON target holding `null`) counts as drift: `apply` skips such a target,
+/// so reporting it in sync would hide that it never gets merged.
+pub fn check_drift_text(
+    format: Format,
+    src_text: &str,
+    dst_text: &str,
+    ignore_keys: &[String],
+) -> bool {
+    match (format.parse(src_text), format.parse(dst_text)) {
+        (Ok(src), Ok(dst)) => check_drift(&src, &dst, ignore_keys),
+        _ => true,
+    }
+}
+
+/// Both sides rendered without `ignore_keys`, for a filtered diff. If either
+/// side fails to parse the raw texts are returned unfiltered, so the diff
+/// shows the real file content instead of a parse failure standing in as an
+/// empty document.
+pub fn filtered_for_diff(
+    format: Format,
+    src_text: String,
+    dst_text: String,
+    ignore_keys: &[String],
+) -> (String, String) {
+    let (Ok(mut src), Ok(mut dst)) = (format.parse(&src_text), format.parse(&dst_text)) else {
+        return (src_text, dst_text);
+    };
+    filter_table(&mut src, ignore_keys);
+    filter_table(&mut dst, ignore_keys);
+    (
+        format.render(&src).unwrap_or(src_text),
+        format.render(&dst).unwrap_or(dst_text),
+    )
+}
+
 /// Back up `target`'s current content into `.yui/backup/...` before a
 /// `[[merge]]` write overwrites it. `apply_entry`/`absorb_entry` each
 /// overwrite one side (target or source) of a merge based on an mtime
@@ -219,8 +340,10 @@ pub fn apply_entry(
 
     let src_content = fs::read_to_string(&src_path)
         .with_context(|| format!("reading merge source {src_path}"))?;
-    let mut src_table: Table = toml::from_str(&src_content)
-        .with_context(|| format!("parsing TOML in merge source {src_path}"))?;
+    let format = Format::of(&src_path);
+    let mut src_table: Table = format
+        .parse(&src_content)
+        .with_context(|| format!("parsing merge source {src_path}"))?;
 
     if !dst_path.exists() {
         info!("merge: creating new target {dst_path} from {src_path}");
@@ -229,7 +352,14 @@ pub fn apply_entry(
                 fs::create_dir_all(parent)
                     .with_context(|| format!("creating directory {parent}"))?;
             }
-            fs::write(&dst_path, src_content)
+            // A blank source is a valid empty table, but blank text is not
+            // a valid *JSON* document: render it instead of copying it.
+            let new_content = if src_content.trim().is_empty() {
+                format.render(&src_table)?
+            } else {
+                src_content
+            };
+            fs::write(&dst_path, new_content)
                 .with_context(|| format!("writing merge target {dst_path}"))?;
         }
         return Ok(());
@@ -237,10 +367,10 @@ pub fn apply_entry(
 
     let dst_content = fs::read_to_string(&dst_path)
         .with_context(|| format!("reading merge target {dst_path}"))?;
-    let mut dst_table: Table = match toml::from_str(&dst_content) {
+    let mut dst_table: Table = match format.parse(&dst_content) {
         Ok(t) => t,
         Err(e) => {
-            warn!("failed to parse merge target {dst_path} as TOML: {e}; skipping");
+            warn!("failed to parse merge target {dst_path}: {e}; skipping");
             return Ok(());
         }
     };
@@ -261,8 +391,9 @@ pub fn apply_entry(
         info!("merge: updating target {dst_path} with base {src_path}");
         if !dry_run {
             backup_before_overwrite(&dst_path, backup_root)?;
-            let rendered = toml::to_string_pretty(&dst_table)
-                .with_context(|| format!("serializing merged TOML for {dst_path}"))?;
+            let rendered = format
+                .render(&dst_table)
+                .with_context(|| format!("serializing merged {dst_path}"))?;
             fs::write(&dst_path, rendered)
                 .with_context(|| format!("writing merged target {dst_path}"))?;
         }
@@ -290,6 +421,8 @@ pub fn absorb_entry(
         return Ok(false);
     }
 
+    let format = Format::of(&src_path);
+
     let src_content = if src_path.exists() {
         fs::read_to_string(&src_path).with_context(|| format!("reading merge source {src_path}"))?
     } else {
@@ -298,16 +431,17 @@ pub fn absorb_entry(
     let mut src_table: Table = if src_content.trim().is_empty() {
         Table::new()
     } else {
-        toml::from_str(&src_content)
-            .with_context(|| format!("parsing TOML in merge source {src_path}"))?
+        format
+            .parse(&src_content)
+            .with_context(|| format!("parsing merge source {src_path}"))?
     };
 
     let dst_content = fs::read_to_string(&dst_path)
         .with_context(|| format!("reading merge target {dst_path}"))?;
-    let dst_table: Table = match toml::from_str(&dst_content) {
+    let dst_table: Table = match format.parse(&dst_content) {
         Ok(t) => t,
         Err(e) => {
-            warn!("failed to parse merge target {dst_path} as TOML: {e}; skipping absorb");
+            warn!("failed to parse merge target {dst_path}: {e}; skipping absorb");
             return Ok(false);
         }
     };
@@ -321,8 +455,9 @@ pub fn absorb_entry(
                     .with_context(|| format!("creating directory {parent}"))?;
             }
             backup_before_overwrite(&src_path, backup_root)?;
-            let rendered = toml::to_string_pretty(&src_table)
-                .with_context(|| format!("serializing absorbed TOML for {src_path}"))?;
+            let rendered = Format::of(&src_path)
+                .render(&src_table)
+                .with_context(|| format!("serializing absorbed {src_path}"))?;
             fs::write(&src_path, rendered)
                 .with_context(|| format!("writing absorbed source {src_path}"))?;
         }
@@ -590,5 +725,166 @@ notify = ["path/to/exe"]
 
         let notify = target.get("notify").unwrap().as_array().unwrap();
         assert_eq!(notify.len(), 1, "array should be replaced, not appended");
+    }
+
+    #[test]
+    fn test_json_rejects_out_of_range_integers() {
+        for number in [
+            "-9223372036854775809",
+            "9223372036854775808",
+            "18446744073709551616",
+            "999999999999999999999999999999999999999999",
+        ] {
+            for text in [
+                format!(r#"{{"id":{number}}}"#),
+                format!(r#"{{"nested":{{"ids":[{number}]}}}}"#),
+            ] {
+                assert!(Format::Json.parse(&text).is_err(), "accepted {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_json_preserves_noncanonical_floats() {
+        for (token, expected) in [
+            ("1.50", 1.5),
+            ("2.50", 2.5),
+            ("0.10", 0.1),
+            ("1E5", 1e5),
+            ("1e+5", 1e5),
+            ("1.0", 1.0),
+        ] {
+            let text = format!(r#"{{"scale":{token},"nested":{{"values":[{token}]}}}}"#);
+            let table = Format::Json.parse(&text).unwrap();
+            assert_eq!(table["scale"].as_float(), Some(expected), "{token}");
+            assert_eq!(table["nested"]["values"][0].as_float(), Some(expected));
+            let rendered = Format::Json.render(&table).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+            assert_eq!(json["scale"].as_f64(), Some(expected));
+            let roundtripped = Format::Json.parse(&rendered).unwrap();
+            assert!(!check_drift(&table, &roundtripped, &[]));
+        }
+    }
+
+    #[test]
+    fn test_json_apply_preserves_float_target_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(temp.path()).unwrap();
+        let dst = root.join("target.json");
+        fs::write(&dst, r#"{"scale":1.50,"theme":"light"}"#).unwrap();
+        fs::write(root.join("base.json"), r#"{"theme":"dark"}"#).unwrap();
+        let entry = MergeEntry {
+            src: "base.json".into(),
+            dst: dst.to_string(),
+            ignore_keys: Vec::new(),
+            when: None,
+        };
+        apply_entry(
+            &entry,
+            root,
+            &mut Engine::new(),
+            &teravars::Context::new(),
+            false,
+            &root.join("backup"),
+        )
+        .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dst).unwrap()).unwrap();
+        assert_eq!(json["scale"].as_f64(), Some(1.5));
+        assert_eq!(json["theme"].as_str(), Some("dark"));
+    }
+
+    #[test]
+    fn test_json_preserves_integer_limits_and_accepts_floats() {
+        let text = r#"{"min":-9223372036854775808,"max":9223372036854775807,
+            "fraction":1.5,"exponent":1e20,"label":"18446744073709551616"}"#;
+        let table = Format::Json.parse(text).unwrap();
+        assert_eq!(table["min"].as_integer(), Some(i64::MIN));
+        assert_eq!(table["max"].as_integer(), Some(i64::MAX));
+        assert_eq!(table["fraction"].as_float(), Some(1.5));
+        assert_eq!(table["exponent"].as_float(), Some(1e20));
+        assert_eq!(
+            table,
+            Format::Json
+                .parse(&Format::Json.render(&table).unwrap())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_json_apply_skips_target_with_out_of_range_integer() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(temp.path()).unwrap();
+        let src = root.join("base.json");
+        let dst = root.join("target.json");
+        let backup_root = root.join("backup");
+        let original = r#"{"id":-9223372036854775809,"theme":"light"}"#;
+        fs::write(&dst, original).unwrap();
+        fs::write(&src, r#"{"theme":"dark"}"#).unwrap();
+        let entry = MergeEntry {
+            src: "base.json".into(),
+            dst: dst.to_string(),
+            ignore_keys: Vec::new(),
+            when: None,
+        };
+        apply_entry(
+            &entry,
+            root,
+            &mut Engine::new(),
+            &teravars::Context::new(),
+            false,
+            &backup_root,
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(dst).unwrap(), original);
+        assert!(!backup_root.exists());
+    }
+
+    #[test]
+    fn test_json_format_absorb_drops_ignored_keys_and_roundtrips() {
+        assert_eq!(Format::of(Utf8Path::new("a/settings.json")), Format::Json);
+        assert_eq!(Format::of(Utf8Path::new("a/config.toml")), Format::Toml);
+
+        let mut base = Format::Json.parse(r#"{"colorScheme": "dark"}"#).unwrap();
+        let target = Format::Json
+            .parse(
+                r#"{"colorScheme": "light", "notifications": true,
+                    "trustedWorkspaces": ["/Users/me"]}"#,
+            )
+            .unwrap();
+        let ignore = vec!["trustedWorkspaces".to_string()];
+
+        assert!(absorb_toml(&mut base, &target, &ignore));
+        let rendered = Format::Json.render(&base).unwrap();
+        assert_eq!(
+            rendered,
+            "{\n  \"colorScheme\": \"light\",\n  \"notifications\": true\n}\n"
+        );
+
+        // apply direction keeps the target-only ignored key intact
+        let mut live = target.clone();
+        merge_toml(&base, &mut live);
+        assert!(live.contains_key("trustedWorkspaces"));
+        assert!(!check_drift(&base, &live, &ignore));
+    }
+
+    #[test]
+    fn test_check_drift_text_reports_unparseable_side_as_drift() {
+        // `null` is rejected by the JSON path, so `apply` skips this target;
+        // status must not call it in sync.
+        assert!(check_drift_text(
+            Format::Json,
+            "{}",
+            r#"{"setting": null}"#,
+            &[]
+        ));
+        assert!(!check_drift_text(Format::Json, "{}", "{}", &[]));
+    }
+
+    #[test]
+    fn test_filtered_for_diff_falls_back_to_raw_text_on_parse_failure() {
+        let bad = r#"{"setting": null}"#.to_string();
+        let (src, dst) = filtered_for_diff(Format::Json, "{}".into(), bad.clone(), &[]);
+        assert_eq!((src.as_str(), dst.as_str()), ("{}", bad.as_str()));
     }
 }
