@@ -4447,6 +4447,124 @@ dst = "{}"
     );
 }
 
+/// A `.json` merge source goes through the same absorb/apply flow as
+/// TOML: the live file's newer edit is pulled into the base, but a key
+/// listed in `ignore_keys` (machine-local paths) never reaches source and
+/// is never dropped from the live file.
+#[test]
+fn apply_json_merge_absorbs_edit_but_never_ignored_key() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+    let base_file = source.join("home/settings.base.json");
+    write_with_mtime(&base_file, "{\"colorScheme\": \"dark\"}\n", past);
+
+    let target_file = target.join("settings.json");
+    std::fs::write(
+        &target_file,
+        r#"{"colorScheme": "light", "trustedWorkspaces": ["/Users/me"]}"#,
+    )
+    .unwrap();
+
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/settings.base.json"
+dst = "{}"
+ignore_keys = ["trustedWorkspaces"]
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+    if !git_init_and_commit(&source) {
+        eprintln!("skipping: git not available");
+        return;
+    }
+
+    apply(Some(source.clone()), false).unwrap();
+
+    let base: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&base_file).unwrap()).unwrap();
+    assert_eq!(base, serde_json::json!({"colorScheme": "light"}));
+    let live: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&target_file).unwrap()).unwrap();
+    assert_eq!(
+        live,
+        serde_json::json!({"colorScheme": "light", "trustedWorkspaces": ["/Users/me"]})
+    );
+}
+
+/// A blank JSON target (app truncated it) must heal from the base the way a
+/// blank TOML target does, not be skipped with a parse warning forever.
+#[test]
+fn apply_json_merge_heals_empty_target() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+    let base_file = source.join("home/settings.base.json");
+    write_with_mtime(&base_file, "{\"colorScheme\": \"dark\"}\n", past);
+    let target_file = target.join("settings.json");
+    std::fs::write(&target_file, "").unwrap();
+
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/settings.base.json"
+dst = "{}"
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+    if !git_init_and_commit(&source) {
+        eprintln!("skipping: git not available");
+        return;
+    }
+
+    apply(Some(source.clone()), false).unwrap();
+
+    let live: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&target_file).unwrap()).unwrap();
+    assert_eq!(live, serde_json::json!({"colorScheme": "dark"}));
+}
+
+/// A blank `.json` source creating a missing target must yield a valid
+/// JSON document, not a copy of the blank text.
+#[test]
+fn apply_json_merge_blank_source_creates_valid_target() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    std::fs::write(source.join("home/settings.base.json"), "").unwrap();
+    let target_file = target.join("settings.json");
+
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/settings.base.json"
+dst = "{}"
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    let live: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&target_file).unwrap()).unwrap();
+    assert_eq!(live, serde_json::json!({}));
+}
+
 /// Editors/tools that write the target file wholesale (e.g. `codex`
 /// rewriting its own config) bump `dst`'s mtime past `src` even when the
 /// content is unchanged, or changed only cosmetically (comments, key

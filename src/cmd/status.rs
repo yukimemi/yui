@@ -143,9 +143,13 @@ pub fn status(
             } else {
                 let src_content = std::fs::read_to_string(&src_path).unwrap_or_default();
                 let dst_content = std::fs::read_to_string(&dst_path).unwrap_or_default();
-                let src_table: toml::Table = toml::from_str(&src_content).unwrap_or_default();
-                let dst_table: toml::Table = toml::from_str(&dst_content).unwrap_or_default();
-                if crate::merge::check_drift(&src_table, &dst_table, &m.ignore_keys) {
+                let format = crate::merge::Format::of(&src_path);
+                if crate::merge::check_drift_text(
+                    format,
+                    &src_content,
+                    &dst_content,
+                    &m.ignore_keys,
+                ) {
                     StatusState::MergeDrift
                 } else {
                     StatusState::MergeInSync

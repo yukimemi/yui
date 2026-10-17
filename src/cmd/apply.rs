@@ -183,8 +183,9 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
                     let semantically_drifted = {
                         let src_text = std::fs::read_to_string(&src_path).unwrap_or_default();
                         let dst_text = std::fs::read_to_string(&dst_path).unwrap_or_default();
-                        let src_table: toml::Table = toml::from_str(&src_text).unwrap_or_default();
-                        let dst_table: toml::Table = toml::from_str(&dst_text).unwrap_or_default();
+                        let format = crate::merge::Format::of(&src_path);
+                        let src_table: toml::Table = format.parse(&src_text).unwrap_or_default();
+                        let dst_table: toml::Table = format.parse(&dst_text).unwrap_or_default();
                         crate::merge::check_drift(&src_table, &dst_table, &m.ignore_keys)
                     };
                     if dt > st && semantically_drifted {
@@ -888,13 +889,12 @@ fn print_merge_absorb_diff(src: &Utf8Path, dst: &Utf8Path, ignore_keys: &[String
     let src_text = std::fs::read_to_string(src).unwrap_or_default();
     let dst_text = std::fs::read_to_string(dst).unwrap_or_default();
 
-    let mut src_table: toml::Table = toml::from_str(&src_text).unwrap_or_default();
-    let mut dst_table: toml::Table = toml::from_str(&dst_text).unwrap_or_default();
-    crate::merge::filter_table(&mut src_table, ignore_keys);
-    crate::merge::filter_table(&mut dst_table, ignore_keys);
-
-    let filtered_src = toml::to_string_pretty(&src_table).unwrap_or(src_text);
-    let filtered_dst = toml::to_string_pretty(&dst_table).unwrap_or(dst_text);
+    let (filtered_src, filtered_dst) = crate::merge::filtered_for_diff(
+        crate::merge::Format::of(src),
+        src_text,
+        dst_text,
+        ignore_keys,
+    );
 
     let diff = similar::TextDiff::from_lines(&filtered_src, &filtered_dst);
     let formatted = diff
