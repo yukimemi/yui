@@ -1325,7 +1325,7 @@ fn managed_gitignore_section_never_blocks_linking() {
 
     let gi = std::fs::read_to_string(source.join(".gitignore")).unwrap();
     assert!(
-        gi.contains("home/.gitconfig"),
+        gi.lines().any(|line| line == "/home/.gitconfig"),
         "managed section should list the rendered output: {gi}"
     );
     assert!(
@@ -1507,7 +1507,7 @@ recipients = ["{}"]
     // Plaintext path is in the managed .gitignore section.
     let gi = std::fs::read_to_string(source.join(".gitignore")).unwrap();
     assert!(
-        gi.contains("home/.ssh/id_ed25519"),
+        gi.lines().any(|line| line == "/home/.ssh/id_ed25519"),
         ".gitignore should list the decrypted plaintext sibling: {gi}"
     );
     // The .age ciphertext is the canonical, NOT in the managed list.
@@ -3508,7 +3508,8 @@ recipients = ["{public}"]
 
     let gi = std::fs::read_to_string(source.join(".gitignore")).unwrap();
     assert!(
-        gi.contains("home/.config/gcal/credentials.json"),
+        gi.lines()
+            .any(|line| line == "/home/.config/gcal/credentials.json"),
         ".gitignore should contain normalized entry: {gi}"
     );
     assert!(
