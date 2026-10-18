@@ -397,11 +397,10 @@ pub fn add_to_managed_section(source: &Utf8Path, plaintext_abs_path: &Utf8Path) 
     let norm_source = normalize_managed_path(source);
     let norm_plaintext = normalize_managed_path(plaintext_abs_path);
 
-    let new_entry = anchor_managed_pattern(
+    let new_entry = managed_path_pattern(
         norm_plaintext
             .strip_prefix(&norm_source)
-            .unwrap_or(&norm_plaintext)
-            .as_str(),
+            .unwrap_or(&norm_plaintext),
     );
 
     let mut managed: Vec<String> = parse_managed_section(&existing)
@@ -454,6 +453,12 @@ fn normalize_managed_path(path: &Utf8Path) -> Utf8PathBuf {
     crate::paths::normalize(Utf8Path::new(&path.as_str().replace('\\', "/")))
 }
 
+fn managed_path_pattern(path: &Utf8Path) -> String {
+    // Normalization can reconstruct native separators on Windows. Convert
+    // generated paths again here; existing patterns must retain their escapes.
+    anchor_managed_pattern(&path.as_str().replace('\\', "/"))
+}
+
 fn update_gitignore(source: &Utf8Path, rendered_abs_paths: &[Utf8PathBuf]) -> Result<()> {
     let gi_path = source.join(".gitignore");
     let existing = match std::fs::read_to_string(&gi_path) {
@@ -467,11 +472,7 @@ fn update_gitignore(source: &Utf8Path, rendered_abs_paths: &[Utf8PathBuf]) -> Re
     let mut managed: Vec<String> = rendered_abs_paths
         .iter()
         .map(|p| normalize_managed_path(p))
-        .filter_map(|p| {
-            p.strip_prefix(&norm_source)
-                .ok()
-                .map(|rel| anchor_managed_pattern(rel.as_str()))
-        })
+        .filter_map(|p| p.strip_prefix(&norm_source).ok().map(managed_path_pattern))
         .collect();
     managed.sort();
     managed.dedup();
@@ -1009,6 +1010,18 @@ mod tests {
                 "/{}",
                 plain.as_str().replace('\\', "/").trim_start_matches('/')
             )]
+        );
+    }
+
+    #[test]
+    fn generated_patterns_convert_native_separators_before_anchoring() {
+        assert_eq!(
+            managed_path_pattern(Utf8Path::new(r"home\secret.env")),
+            "/home/secret.env"
+        );
+        assert_eq!(
+            managed_path_pattern(Utf8Path::new(r"\home\secret.env")),
+            "/home/secret.env"
         );
     }
 
