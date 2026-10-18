@@ -441,7 +441,11 @@ fn parse_managed_section(text: &str) -> Vec<String> {
 
 // Anchor patterns without reinterpreting existing escapes or whitespace.
 fn anchor_managed_pattern(pattern: &str) -> String {
-    format!("/{}", pattern.trim_start_matches('/'))
+    if pattern.starts_with('/') {
+        pattern.to_string()
+    } else {
+        format!("/{pattern}")
+    }
 }
 
 // Convert separators before relativizing, including backslash-bearing inputs
