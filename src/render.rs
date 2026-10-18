@@ -382,8 +382,9 @@ pub fn write_managed_section(source: &Utf8Path, managed_abs_paths: &[Utf8PathBuf
 /// #71).
 ///
 /// Unlike [`write_managed_section`], this is non-destructive: it
-/// parses the existing section, unions the single new entry, sorts
-/// and dedupes, and rewrites only the block between the markers.
+/// parses the existing section, anchors existing entries at the root,
+/// unions the single new entry, sorts and dedupes, and rewrites only
+/// the block between the markers.
 /// Content above and below the markers is untouched.
 pub fn add_to_managed_section(source: &Utf8Path, plaintext_abs_path: &Utf8Path) -> Result<()> {
     let gi_path = source.join(".gitignore");
@@ -393,16 +394,20 @@ pub fn add_to_managed_section(source: &Utf8Path, plaintext_abs_path: &Utf8Path) 
         Err(e) => return Err(Error::Template(format!("read {gi_path}: {e}"))),
     };
 
-    let norm_source = crate::paths::normalize(source);
-    let norm_plaintext = crate::paths::normalize(plaintext_abs_path);
+    let norm_source = normalize_managed_path(source);
+    let norm_plaintext = normalize_managed_path(plaintext_abs_path);
 
-    let new_entry = norm_plaintext
-        .strip_prefix(&norm_source)
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|_| norm_plaintext.as_str().to_string())
-        .replace('\\', "/");
+    let new_entry = anchor_managed_pattern(
+        norm_plaintext
+            .strip_prefix(&norm_source)
+            .unwrap_or(&norm_plaintext)
+            .as_str(),
+    );
 
-    let mut managed = parse_managed_section(&existing);
+    let mut managed: Vec<String> = parse_managed_section(&existing)
+        .iter()
+        .map(|entry| anchor_managed_pattern(entry))
+        .collect();
     managed.push(new_entry);
     managed.sort();
     managed.dedup();
@@ -429,10 +434,20 @@ fn parse_managed_section(text: &str) -> Vec<String> {
     let body_start = start + GITIGNORE_BEGIN.len();
     text[body_start..end]
         .lines()
-        .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+// Anchor patterns without reinterpreting existing escapes or whitespace.
+fn anchor_managed_pattern(pattern: &str) -> String {
+    format!("/{}", pattern.trim_start_matches('/'))
+}
+
+// Convert separators before relativizing, including backslash-bearing inputs
+// on Unix, so the repository prefix is recognized consistently.
+fn normalize_managed_path(path: &Utf8Path) -> Utf8PathBuf {
+    crate::paths::normalize(Utf8Path::new(&path.as_str().replace('\\', "/")))
 }
 
 fn update_gitignore(source: &Utf8Path, rendered_abs_paths: &[Utf8PathBuf]) -> Result<()> {
@@ -443,15 +458,15 @@ fn update_gitignore(source: &Utf8Path, rendered_abs_paths: &[Utf8PathBuf]) -> Re
         Err(e) => return Err(Error::Template(format!("read {gi_path}: {e}"))),
     };
 
-    let norm_source = crate::paths::normalize(source);
+    let norm_source = normalize_managed_path(source);
 
     let mut managed: Vec<String> = rendered_abs_paths
         .iter()
-        .map(|p| crate::paths::normalize(p))
+        .map(|p| normalize_managed_path(p))
         .filter_map(|p| {
             p.strip_prefix(&norm_source)
                 .ok()
-                .map(|rel| rel.as_str().replace('\\', "/"))
+                .map(|rel| anchor_managed_pattern(rel.as_str()))
         })
         .collect();
     managed.sort();
@@ -728,8 +743,8 @@ mod tests {
         let gi = std::fs::read_to_string(r.join(".gitignore")).unwrap();
         assert!(gi.contains(GITIGNORE_BEGIN));
         assert!(gi.contains(GITIGNORE_END));
-        assert!(gi.contains("home/bar"));
-        assert!(gi.contains("home/foo"));
+        assert!(gi.lines().any(|line| line == "/home/bar"));
+        assert!(gi.lines().any(|line| line == "/home/foo"));
         // sorted: bar before foo
         let bar_pos = gi.find("home/bar").unwrap();
         let foo_pos = gi.find("home/foo").unwrap();
@@ -747,7 +762,7 @@ mod tests {
         let gi = std::fs::read_to_string(r.join(".gitignore")).unwrap();
         assert!(gi.contains("node_modules/"));
         assert!(gi.contains("target/"));
-        assert!(gi.contains("home/foo"));
+        assert!(gi.lines().any(|line| line == "/home/foo"));
     }
 
     #[test]
@@ -764,7 +779,7 @@ mod tests {
         write_managed_section(&r, &report_managed_paths(&report)).unwrap();
         let gi = std::fs::read_to_string(r.join(".gitignore")).unwrap();
         assert!(gi.contains("node_modules/"));
-        assert!(gi.contains("home/foo"));
+        assert!(gi.lines().any(|line| line == "/home/foo"));
         assert!(!gi.contains("stale/path"));
         // post-section content preserved
         assert!(gi.contains("\nfoo\n"));
@@ -840,7 +855,10 @@ mod tests {
         let gi = std::fs::read_to_string(r.join(".gitignore")).unwrap();
         assert!(gi.contains(GITIGNORE_BEGIN));
         assert!(gi.contains(GITIGNORE_END));
-        assert!(gi.contains("home/.config/foo/private.env"));
+        assert!(
+            gi.lines()
+                .any(|line| line == "/home/.config/foo/private.env")
+        );
     }
 
     #[test]
@@ -859,9 +877,12 @@ mod tests {
         add_to_managed_section(&r, &plain).unwrap();
         let gi = std::fs::read_to_string(r.join(".gitignore")).unwrap();
         // Existing render entry still there.
-        assert!(gi.contains("home/.gitconfig"));
+        assert!(gi.lines().any(|line| line == "/home/.gitconfig"));
         // New secret entry merged in.
-        assert!(gi.contains("home/.config/foo/private.env"));
+        assert!(
+            gi.lines()
+                .any(|line| line == "/home/.config/foo/private.env")
+        );
         // User content above + below untouched.
         assert!(gi.contains("node_modules/"));
         assert!(gi.contains("target/"));
@@ -879,6 +900,133 @@ mod tests {
         assert_eq!(occurrences, 1, "duplicate entries in: {gi}");
     }
 
+    fn assert_root_outputs_only_are_ignored(additive: bool) {
+        let tmp = TempDir::new().unwrap();
+        let r = root(&tmp);
+        let init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&r)
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "{init:?}");
+
+        let before = "# user rules\n*.swp\n\n";
+        let after = "\n# more user rules\ntarget/\n";
+        write(
+            &r.join(".gitignore"),
+            &format!(
+                "{before}{GITIGNORE_BEGIN}\nsecret.env\n/secret.env\n{GITIGNORE_END}\n{after}"
+            ),
+        );
+        let names = ["secret.env", "#private", "!private", "home/config"];
+        for name in names {
+            write(&r.join(format!("{name}.tera")), "generated");
+            write(&r.join(format!("nested/{name}")), "unrelated");
+        }
+        let report = render_all(&r, &empty_config(), &yui_vars(&r), false).unwrap();
+        let paths = report_managed_paths(&report);
+        let update = || {
+            if additive {
+                for path in &paths {
+                    add_to_managed_section(&r, path).unwrap();
+                }
+            } else {
+                write_managed_section(&r, &paths).unwrap();
+            }
+        };
+        update();
+        let gi = std::fs::read_to_string(r.join(".gitignore")).unwrap();
+        assert_eq!(
+            gi,
+            format!(
+                "{before}{GITIGNORE_BEGIN}\n/!private\n/#private\n/home/config\n/secret.env\n{GITIGNORE_END}\n{after}"
+            )
+        );
+        update();
+        assert_eq!(std::fs::read_to_string(r.join(".gitignore")).unwrap(), gi);
+
+        for name in names {
+            for (path, expected_code) in [(name.to_string(), 0), (format!("nested/{name}"), 1)] {
+                let result = std::process::Command::new("git")
+                    .args(["check-ignore", "--no-index", "--quiet", "--", &path])
+                    .current_dir(&r)
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    result.status.code(),
+                    Some(expected_code),
+                    "{path}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rewritten_managed_section_ignores_only_root_outputs() {
+        assert_root_outputs_only_are_ignored(false);
+    }
+
+    #[test]
+    fn additive_managed_section_ignores_only_root_outputs() {
+        assert_root_outputs_only_are_ignored(true);
+    }
+
+    #[test]
+    fn additive_migration_preserves_pattern_characters() {
+        let tmp = TempDir::new().unwrap();
+        let r = root(&tmp);
+        write(
+            &r.join(".gitignore"),
+            &format!(
+                "{GITIGNORE_BEGIN}\n leading\ntrailing\\ \n\\#escaped\n/\\#escaped\nhome\\name\n{GITIGNORE_END}\n"
+            ),
+        );
+        add_to_managed_section(&r, &r.join("secret.env")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(r.join(".gitignore")).unwrap(),
+            format!(
+                "{GITIGNORE_BEGIN}\n/ leading\n/\\#escaped\n/home\\name\n/secret.env\n/trailing\\ \n{GITIGNORE_END}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn additive_outside_source_fallback_has_one_anchor() {
+        let tmp = TempDir::new().unwrap();
+        let r = root(&tmp);
+        let source = r.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let plain = r.join("secret.env");
+        add_to_managed_section(&source, &plain).unwrap();
+        let gi = std::fs::read_to_string(source.join(".gitignore")).unwrap();
+        assert_eq!(
+            parse_managed_section(&gi),
+            vec![format!(
+                "/{}",
+                plain.as_str().replace('\\', "/").trim_start_matches('/')
+            )]
+        );
+    }
+
+    #[test]
+    fn rewritten_managed_paths_are_normalized_and_deduplicated() {
+        let tmp = TempDir::new().unwrap();
+        let r = root(&tmp);
+        write_managed_section(
+            &r,
+            &[
+                r.join("home/./secret.env"),
+                Utf8PathBuf::from(format!("{}\\home\\secret.env", r.as_str())),
+                r.join("secret.env"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(r.join(".gitignore")).unwrap(),
+            format!("{GITIGNORE_BEGIN}\n/home/secret.env\n/secret.env\n{GITIGNORE_END}\n")
+        );
+    }
+
     #[test]
     fn add_to_managed_normalises_windows_separators() {
         let tmp = TempDir::new().unwrap();
@@ -890,7 +1038,8 @@ mod tests {
         add_to_managed_section(&r, &plain).unwrap();
         let gi = std::fs::read_to_string(r.join(".gitignore")).unwrap();
         assert!(
-            gi.contains("home/.config/foo/private.env"),
+            gi.lines()
+                .any(|line| line == "/home/.config/foo/private.env"),
             "expected forward-slash entry in: {gi}"
         );
         assert!(
@@ -906,7 +1055,10 @@ mod tests {
         let plain = r.join("home/.config/gcal/./credentials.json");
         add_to_managed_section(&r, &plain).unwrap();
         let gi = std::fs::read_to_string(r.join(".gitignore")).unwrap();
-        assert!(gi.contains("home/.config/gcal/credentials.json"));
+        assert!(
+            gi.lines()
+                .any(|line| line == "/home/.config/gcal/credentials.json")
+        );
         assert!(!gi.contains("home/.config/gcal/./credentials.json"));
     }
 
