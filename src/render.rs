@@ -383,8 +383,9 @@ pub fn write_managed_section(source: &Utf8Path, managed_abs_paths: &[Utf8PathBuf
 ///
 /// Unlike [`write_managed_section`], this is non-destructive: it
 /// parses the existing section, anchors existing entries at the root,
-/// unions the single new entry, sorts and dedupes, and rewrites only
-/// the block between the markers.
+/// unions the single new entry, and dedupes paths. Path-only blocks are
+/// sorted; blocks containing ignore syntax retain their rule order.
+/// Only the block between the markers is rewritten.
 /// Content above and below the markers is untouched.
 pub fn add_to_managed_section(source: &Utf8Path, plaintext_abs_path: &Utf8Path) -> Result<()> {
     let gi_path = source.join(".gitignore");
@@ -405,11 +406,26 @@ pub fn add_to_managed_section(source: &Utf8Path, plaintext_abs_path: &Utf8Path) 
 
     let mut managed: Vec<String> = parse_managed_section(&existing)
         .iter()
-        .map(|entry| anchor_managed_pattern(entry))
+        .map(|entry| {
+            if is_managed_syntax(entry) {
+                entry.clone()
+            } else {
+                anchor_managed_pattern(entry)
+            }
+        })
         .collect();
     managed.push(new_entry);
-    managed.sort();
-    managed.dedup();
+    if managed.iter().any(|entry| is_managed_syntax(entry)) {
+        // Negations depend on rule order. Preserve syntax in place while
+        // removing duplicate generated paths, keeping their last occurrence.
+        let mut seen = std::collections::HashSet::new();
+        managed.reverse();
+        managed.retain(|entry| is_managed_syntax(entry) || seen.insert(entry.clone()));
+        managed.reverse();
+    } else {
+        managed.sort();
+        managed.dedup();
+    }
 
     let new_section = build_managed_section(&managed);
     let updated = replace_or_append_section(&existing, &new_section);
@@ -436,6 +452,10 @@ fn parse_managed_section(text: &str) -> Vec<String> {
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn is_managed_syntax(pattern: &str) -> bool {
+    pattern.starts_with(['#', '!']) || pattern.trim().is_empty()
 }
 
 // Anchor patterns without reinterpreting existing escapes or whitespace.
@@ -974,6 +994,46 @@ mod tests {
     #[test]
     fn additive_managed_section_ignores_only_root_outputs() {
         assert_root_outputs_only_are_ignored(true);
+    }
+
+    #[test]
+    fn additive_migration_preserves_ignore_syntax_and_order() {
+        let tmp = TempDir::new().unwrap();
+        let r = root(&tmp);
+        let init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&r)
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "{init:?}");
+        write(
+            &r.join(".gitignore"),
+            &format!(
+                "*.env\n{GITIGNORE_BEGIN}\nkeep.env\n/keep.env\n# explanation\n   \n!keep.env\n{GITIGNORE_END}\n"
+            ),
+        );
+        add_to_managed_section(&r, &r.join("secret.env")).unwrap();
+        let expected = format!(
+            "*.env\n{GITIGNORE_BEGIN}\n/keep.env\n# explanation\n   \n!keep.env\n/secret.env\n{GITIGNORE_END}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(r.join(".gitignore")).unwrap(),
+            expected
+        );
+        add_to_managed_section(&r, &r.join("secret.env")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(r.join(".gitignore")).unwrap(),
+            expected
+        );
+        for (path, code) in [("keep.env", 1), ("secret.env", 0)] {
+            write(&r.join(path), "content");
+            let result = std::process::Command::new("git")
+                .args(["check-ignore", "--no-index", "--quiet", "--", path])
+                .current_dir(&r)
+                .output()
+                .unwrap();
+            assert_eq!(result.status.code(), Some(code), "{path}: {result:?}");
+        }
     }
 
     #[test]
