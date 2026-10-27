@@ -53,7 +53,7 @@ same-file = "1.0.6"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["arbitrary_precision"] }
 sha2 = "0.11.1"
-similar = "3.2.0"
+similar = "3.2.1"
 teravars = { version = "0.2.2", default-features = false, features = ["merge"] }
 thiserror = "2.0.21"
 # Runtime needed by kaishin's async API. `run_self_update` drives it
