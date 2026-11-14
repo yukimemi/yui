@@ -4624,6 +4624,99 @@ dst = "{}"
     );
 }
 
+#[test]
+fn apply_merge_surfaces_source_parse_error_when_target_newer() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let base_file = source.join("home/config.base.toml");
+    let now = std::time::SystemTime::now();
+    let past = now - std::time::Duration::from_secs(120);
+    write_with_mtime(&base_file, "model = \"gpt-6\"\n", past);
+
+    let target_file = target.join("config.toml");
+    write_with_mtime(&target_file, "model = \"gpt-6\"\n", now);
+
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    if !git_init_and_commit(&source) {
+        eprintln!("skipping: git not available");
+        return;
+    }
+    // Introduce a syntax error in src while keeping its mtime older than dst,
+    // making the repo dirty at the same time.
+    write_with_mtime(&base_file, "model = \"unclosed\n", past);
+
+    let err = apply(Some(source.clone()), false).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("parsing merge source"),
+        "expected source parse error, got: {msg}"
+    );
+    assert!(
+        !msg.contains("unresolved"),
+        "source parse failure must not be misclassified as an unresolved anomaly: {msg}"
+    );
+}
+
+#[test]
+fn apply_merge_skips_unparseable_newer_target_without_anomaly() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let base_file = source.join("home/config.base.toml");
+    let now = std::time::SystemTime::now();
+    let past = now - std::time::Duration::from_secs(120);
+    write_with_mtime(&base_file, "model = \"gpt-6\"\n", past);
+
+    let target_file = target.join("config.toml");
+    let broken_target = "model = \"half-written\n";
+    write_with_mtime(&target_file, broken_target, now);
+
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/config.base.toml"
+dst = "{}"
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    if !git_init_and_commit(&source) {
+        eprintln!("skipping: git not available");
+        return;
+    }
+    std::fs::write(source.join("untracked.txt"), "dirty").unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        broken_target,
+        "unparseable target should be skipped and left untouched"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&base_file).unwrap(),
+        "model = \"gpt-6\"\n",
+        "unparseable target must not touch base"
+    );
+}
+
 /// `[absorb] on_anomaly = "skip"` is the explicit "leave it alone"
 /// answer for a merge entry whose target is newer than base but
 /// auto-absorb didn't run — it must stay silent (exit 0), unlike the
