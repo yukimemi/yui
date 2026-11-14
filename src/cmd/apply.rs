@@ -180,57 +180,66 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
                 let dst_mtime = dst_meta.and_then(|m| m.modified().ok());
                 let src_mtime = src_meta.and_then(|m| m.modified().ok());
                 if let (Some(dt), Some(st)) = (dst_mtime, src_mtime) {
-                    let semantically_drifted = {
-                        let src_text = std::fs::read_to_string(&src_path).unwrap_or_default();
-                        let dst_text = std::fs::read_to_string(&dst_path).unwrap_or_default();
+                    if dt > st {
+                        let src_text = std::fs::read_to_string(&src_path)
+                            .with_context(|| format!("reading merge source {src_path}"))?;
                         let format = crate::merge::Format::of(&src_path);
-                        let src_table: toml::Table = format.parse(&src_text).unwrap_or_default();
-                        let dst_table: toml::Table = format.parse(&dst_text).unwrap_or_default();
-                        crate::merge::check_drift(&src_table, &dst_table, &m.ignore_keys)
-                    };
-                    if dt > st && semantically_drifted {
-                        // Same gates as the file-level `AutoAbsorb` path
-                        // (`link_file_with_backup`): the `auto` kill-switch
-                        // and `require_clean_git` both have to clear before
-                        // target's newer edits are allowed to flow back into
-                        // source. Skipping straight to `apply_entry` here
-                        // would deep-merge the *old* base over target's
-                        // newer values for any key both sides share.
-                        let can_auto_absorb = config.absorb.auto
-                            && !(config.absorb.require_clean_git && !source_clean);
-                        if can_auto_absorb {
-                            crate::merge::absorb_entry(
-                                m,
-                                &source,
-                                &mut engine,
-                                &tera_ctx,
-                                dry_run,
-                                &backup_root,
-                            )?;
-                        } else {
-                            // The gate didn't clear, so this is an anomaly —
-                            // dispatch through `[absorb] on_anomaly` exactly
-                            // like the file-level path does, instead of
-                            // always behaving as if it were `skip`.
-                            let reason = if !config.absorb.auto {
-                                "absorb.auto = false; treating divergence as anomaly"
-                            } else {
-                                "source repo is dirty; deferring auto-absorb"
-                            };
-                            let skip_apply = handle_merge_anomaly(
-                                &ctx,
-                                m,
-                                &source,
-                                &mut engine,
-                                &tera_ctx,
-                                dry_run,
-                                &backup_root,
-                                &src_path,
-                                &dst_path,
-                                reason,
-                            )?;
-                            if skip_apply {
+                        let src_table: toml::Table = format
+                            .parse(&src_text)
+                            .with_context(|| format!("parsing merge source {src_path}"))?;
+                        let dst_text = std::fs::read_to_string(&dst_path)
+                            .with_context(|| format!("reading merge target {dst_path}"))?;
+                        let dst_table: toml::Table = match format.parse(&dst_text) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                warn!("failed to parse merge target {dst_path}: {e}; skipping");
                                 continue;
+                            }
+                        };
+                        if crate::merge::check_drift(&src_table, &dst_table, &m.ignore_keys) {
+                            // Same gates as the file-level `AutoAbsorb` path
+                            // (`link_file_with_backup`): the `auto` kill-switch
+                            // and `require_clean_git` both have to clear before
+                            // target's newer edits are allowed to flow back into
+                            // source. Skipping straight to `apply_entry` here
+                            // would deep-merge the *old* base over target's
+                            // newer values for any key both sides share.
+                            let can_auto_absorb = config.absorb.auto
+                                && !(config.absorb.require_clean_git && !source_clean);
+                            if can_auto_absorb {
+                                crate::merge::absorb_entry(
+                                    m,
+                                    &source,
+                                    &mut engine,
+                                    &tera_ctx,
+                                    dry_run,
+                                    &backup_root,
+                                )?;
+                            } else {
+                                // The gate didn't clear, so this is an anomaly —
+                                // dispatch through `[absorb] on_anomaly` exactly
+                                // like the file-level path does, instead of
+                                // always behaving as if it were `skip`.
+                                let reason = if !config.absorb.auto {
+                                    "absorb.auto = false; treating divergence as anomaly"
+                                } else {
+                                    "source repo is dirty; deferring auto-absorb"
+                                };
+                                let skip_apply = handle_merge_anomaly(
+                                    &ctx,
+                                    m,
+                                    &source,
+                                    &mut engine,
+                                    &tera_ctx,
+                                    dry_run,
+                                    &backup_root,
+                                    &src_path,
+                                    &dst_path,
+                                    reason,
+                                )?;
+                                if skip_apply {
+                                    continue;
+                                }
                             }
                         }
                     }
