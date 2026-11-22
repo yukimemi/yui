@@ -136,9 +136,8 @@ fn json_to_toml(value: serde_json::Value) -> anyhow::Result<Value> {
 
 /// Read plain scalars the YAML 1.2 way: `yes` / `no` / `on` / `off` and
 /// `1_000` are strings, which the writer quotes so that YAML 1.1 readers
-/// agree. Two YAML 1.1 idioms have no reading that suits every application
-/// and are rejected instead: `<<` merge keys here, zero-padded integers in
-/// [`validate_yaml`].
+/// agree. YAML 1.1 merge keys are rejected here, and ambiguous legacy
+/// numeric spellings in [`validate_yaml`].
 fn yaml_options() -> serde_saphyr::Options {
     serde_saphyr::options! {
         strict_booleans: true,
@@ -151,7 +150,7 @@ fn yaml_options() -> serde_saphyr::Options {
     }
 }
 
-// Check resolved tags and integer spellings before `deserialize_any` can
+// Check resolved tags and numeric spellings before `deserialize_any` can
 // discard application tags or coerce unsupported values. Returns whether the
 // input holds a document at all.
 fn validate_yaml(text: &str) -> anyhow::Result<bool> {
@@ -186,12 +185,24 @@ fn validate_yaml(text: &str) -> anyhow::Result<bool> {
                 location.col() + 1
             );
         }
-        if let Some((value, style)) = event.scalar()
-            && match event.tag() {
-                None => matches!(style, ScalarStyle::Plain),
-                Some(tag) => tag.is_yaml_core_schema_tag("int"),
-            }
+        let Some((value, style)) = event.scalar() else {
+            continue;
+        };
+        let tag = event.tag();
+        let integer_candidate = match tag {
+            None => matches!(style, ScalarStyle::Plain),
+            Some(tag) => tag.is_yaml_core_schema_tag("int"),
+        };
+        if (integer_candidate || tag.is_some_and(|tag| tag.is_yaml_core_schema_tag("float")))
+            && yaml_1_1_sexagesimal(value)
         {
+            anyhow::bail!(
+                "YAML sexagesimal number {value} is ambiguous at line {}, column {}; quote it as text or write it in decimal",
+                span.start.line(),
+                span.start.col() + 1
+            );
+        }
+        if integer_candidate {
             if yaml_integer_out_of_range(value) {
                 anyhow::bail!(
                     "YAML integer {value} is outside the i64 range at line {}, column {}",
@@ -217,6 +228,38 @@ fn validate_yaml(text: &str) -> anyhow::Result<bool> {
         }
     }
     Ok(has_document)
+}
+
+// YAML 1.1 resolves plain sexagesimal integers and floats as numbers,
+// where YAML 1.2 resolves them as strings.
+fn yaml_1_1_sexagesimal(value: &str) -> bool {
+    let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value);
+    let (whole, fraction) = match unsigned.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (unsigned, None),
+    };
+    let Some((head, rest)) = whole.split_once(':') else {
+        return false;
+    };
+    match head.as_bytes() {
+        [first, digits @ ..] if first.is_ascii_digit() => {
+            (fraction.is_some() || *first != b'0')
+                && digits
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || *byte == b'_')
+                && rest.split(':').all(|group| match group.as_bytes() {
+                    [digit] => digit.is_ascii_digit(),
+                    [b'0'..=b'5', digit] => digit.is_ascii_digit(),
+                    _ => false,
+                })
+                && fraction.is_none_or(|digits| {
+                    digits
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || byte == b'_')
+                })
+        }
+        _ => false,
+    }
 }
 
 fn yaml_integer_out_of_range(value: &str) -> bool {
@@ -565,6 +608,28 @@ fn backup_before_overwrite(target: &Utf8Path, backup_root: &Utf8Path) -> Result<
     Ok(())
 }
 
+pub(crate) fn load_target(format: Format, path: &Utf8Path) -> Result<Option<Table>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if format == Format::Yaml && error.kind() == std::io::ErrorKind::InvalidData => {
+            warn!("merge target {path} is not UTF-8; skipping");
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("reading merge target {path}"))
+                .into());
+        }
+    };
+    match format.parse(&text) {
+        Ok(table) => Ok(Some(table)),
+        Err(error) => {
+            warn!("failed to parse merge target {path}: {error}; skipping");
+            Ok(None)
+        }
+    }
+}
+
 /// Execute apply for a single merge entry.
 pub fn apply_entry(
     entry: &MergeEntry,
@@ -609,14 +674,8 @@ pub fn apply_entry(
         return Ok(());
     }
 
-    let dst_content = fs::read_to_string(&dst_path)
-        .with_context(|| format!("reading merge target {dst_path}"))?;
-    let mut dst_table: Table = match format.parse(&dst_content) {
-        Ok(t) => t,
-        Err(e) => {
-            warn!("failed to parse merge target {dst_path}: {e}; skipping");
-            return Ok(());
-        }
+    let Some(mut dst_table) = load_target(format, &dst_path)? else {
+        return Ok(());
     };
 
     // `ignore_keys` marks a key as target's exclusive local state (that's
@@ -680,14 +739,8 @@ pub fn absorb_entry(
             .with_context(|| format!("parsing merge source {src_path}"))?
     };
 
-    let dst_content = fs::read_to_string(&dst_path)
-        .with_context(|| format!("reading merge target {dst_path}"))?;
-    let dst_table: Table = match format.parse(&dst_content) {
-        Ok(t) => t,
-        Err(e) => {
-            warn!("failed to parse merge target {dst_path}: {e}; skipping absorb");
-            return Ok(false);
-        }
+    let Some(dst_table) = load_target(format, &dst_path)? else {
+        return Ok(false);
     };
 
     let changed = absorb_toml(&mut src_table, &dst_table, &entry.ignore_keys);
@@ -1303,11 +1356,26 @@ notify = ["path/to/exe"]
             ("values: [+0080]\n", "leading zeros"),
             ("count: 000\n", "leading zeros"),
             ("mode: !!int \"0755\"\n", "leading zeros"),
+            ("retry_delay: 12:30\n", "sexagesimal"),
+            ("values: [-1_2:03:59.5]\n", "sexagesimal"),
+            ("delay: !!int \"12:30\"\n", "sexagesimal"),
+            ("delay: !!float \"0:30.5\"\n", "sexagesimal"),
             ("base: &base\n  x: 1\nuse:\n  <<: *base\n", "merge"),
         ] {
             let error = format!("{:#}", Format::Yaml.parse(ambiguous).unwrap_err());
             assert!(error.contains(reason), "{ambiguous:?}: {error}");
         }
+        let error = Format::Yaml
+            .parse("# app configuration\nretry_delay: 12:30\n")
+            .unwrap_err();
+        assert!(error.to_string().contains("line 2, column 14"), "{error}");
+
+        let times = Format::Yaml
+            .parse("quoted: \"12:30\"\ntext: !!str 12:30\nlabel: 12:60\n")
+            .unwrap();
+        assert_eq!(times["quoted"].as_str(), Some("12:30"));
+        assert_eq!(times["text"].as_str(), Some("12:30"));
+        assert_eq!(times["label"].as_str(), Some("12:60"));
 
         let table = Format::Yaml
             .parse("zero: 0\nratio: 0.5\nquoted: \"0755\"\ntext: !!str 0755\nshared: &port 8080\nalias: *port\n")

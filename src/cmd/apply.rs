@@ -188,14 +188,8 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
                     let src_table: toml::Table = format
                         .parse(&src_text)
                         .with_context(|| format!("parsing merge source {src_path}"))?;
-                    let dst_text = std::fs::read_to_string(&dst_path)
-                        .with_context(|| format!("reading merge target {dst_path}"))?;
-                    let dst_table: toml::Table = match format.parse(&dst_text) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            warn!("failed to parse merge target {dst_path}: {e}; skipping");
-                            continue;
-                        }
+                    let Some(dst_table) = crate::merge::load_target(format, &dst_path)? else {
+                        continue;
                     };
                     if crate::merge::check_drift(&src_table, &dst_table, &m.ignore_keys) {
                         // Same gates as the file-level `AutoAbsorb` path

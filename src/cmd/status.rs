@@ -138,22 +138,18 @@ pub fn status(
         if m.is_active(&mut engine, &tera_ctx)? {
             let src_path = source.join(&m.src);
             let dst_path = m.resolve_dst(&mut engine, &tera_ctx)?;
-            let state = if !dst_path.exists() || !src_path.exists() {
-                StatusState::MergeDrift
+            let state = if let (Ok(src), Ok(dst)) = (
+                std::fs::read_to_string(&src_path),
+                std::fs::read_to_string(&dst_path),
+            ) && !crate::merge::check_drift_text(
+                crate::merge::Format::of(&src_path),
+                &src,
+                &dst,
+                &m.ignore_keys,
+            ) {
+                StatusState::MergeInSync
             } else {
-                let src_content = std::fs::read_to_string(&src_path).unwrap_or_default();
-                let dst_content = std::fs::read_to_string(&dst_path).unwrap_or_default();
-                let format = crate::merge::Format::of(&src_path);
-                if crate::merge::check_drift_text(
-                    format,
-                    &src_content,
-                    &dst_content,
-                    &m.ignore_keys,
-                ) {
-                    StatusState::MergeDrift
-                } else {
-                    StatusState::MergeInSync
-                }
+                StatusState::MergeDrift
             };
             report.push(StatusItem {
                 src: relative_for_display(&source, &src_path),

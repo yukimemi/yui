@@ -4617,6 +4617,66 @@ ignore_keys = ["skills.customDirectories"]
     );
 }
 
+#[test]
+fn apply_yaml_merge_skips_utf16_targets_regardless_of_mtime() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    std::fs::create_dir_all(&source).unwrap();
+    let older = utf8(tmp.path().join("older.yml"));
+    let newer = utf8(tmp.path().join("newer.yml"));
+    let next = utf8(tmp.path().join("next.yml"));
+    let now = std::time::SystemTime::now();
+    let offset = std::time::Duration::from_secs(120);
+    // An unreadable target must count as drift even against an empty base.
+    write_with_mtime(&source.join("empty.yml"), "", now);
+    std::fs::write(source.join("next.yml"), "theme: dark\n").unwrap();
+    let utf16: Vec<u8> = "\u{feff}theme: light\n"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    for (path, mtime) in [(&older, now - offset), (&newer, now + offset)] {
+        std::fs::write(path, &utf16).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "empty.yml"
+dst = "{}"
+
+[[merge]]
+src = "empty.yml"
+dst = "{}"
+
+[[merge]]
+src = "next.yml"
+dst = "{}"
+"#,
+        toml_path(&older),
+        toml_path(&newer),
+        toml_path(&next)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+
+    apply(Some(source.clone()), false).unwrap();
+
+    for path in [&older, &newer] {
+        assert_eq!(std::fs::read(path).unwrap(), utf16);
+    }
+    assert_eq!(
+        std::fs::read_to_string(source.join("empty.yml")).unwrap(),
+        ""
+    );
+    assert_eq!(std::fs::read_to_string(next).unwrap(), "theme: dark\n");
+    let error = status(Some(source), None, true).unwrap_err();
+    assert!(error.to_string().contains("2 entries diverged"), "{error}");
+}
+
 /// Editors/tools that write the target file wholesale (e.g. `codex`
 /// rewriting its own config) bump `dst`'s mtime past `src` even when the
 /// content is unchanged, or changed only cosmetically (comments, key
