@@ -219,10 +219,13 @@ fn validate_yaml(text: &str) -> anyhow::Result<bool> {
 
             // `0755` is octal 493 to a YAML 1.1 reader, decimal 755 to a
             // YAML 1.2 one and text to others: whichever a rewrite picked,
-            // some application would read a different value back.
+            // some application would read a different value back. Untagged,
+            // an underscored spelling is text; `!!int 07_55` is a number.
             if digits.len() > 1
                 && digits.starts_with('0')
-                && digits.bytes().all(|byte| byte.is_ascii_digit())
+                && digits
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (tag.is_some() && byte == b'_'))
             {
                 anyhow::bail!(
                     "YAML integer {value} has leading zeros (octal or decimal, depending on the reader) at line {}, column {}; quote it or drop the zeros",
@@ -1336,6 +1339,7 @@ notify = ["path/to/exe"]
             ("values: [+0080]\n", "leading zeros"),
             ("count: 000\n", "leading zeros"),
             ("mode: !!int \"0755\"\n", "leading zeros"),
+            ("mode: !!int 07_55\n", "leading zeros"),
             (
                 "mask: 0b1010\n",
                 "YAML binary integer 0b1010 is ambiguous at line 1, column 7",
