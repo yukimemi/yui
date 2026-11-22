@@ -24,23 +24,30 @@ use crate::paths;
 use crate::template::{self, Engine};
 
 /// On-disk syntax of a `[[merge]]` source/target, picked from the source
-/// file's extension (`.json` → JSON, anything else → TOML). Both sides are
-/// loaded into the same `toml::Table` model so `ignore_keys`, deep merge and
-/// drift detection behave identically across formats.
+/// file's extension (`.json` → JSON, `.yml` / `.yaml` → YAML, anything else
+/// → TOML). Both sides are loaded into the same `toml::Table` model so
+/// `ignore_keys`, deep merge and drift detection behave identically across
+/// formats.
 ///
-/// JSON limits: `null` and integers outside `i64` have no TOML equivalent
-/// and fail to parse (a target is then skipped with a warning), and output
-/// keys are sorted.
+/// JSON and YAML limits: `null` and integers outside `i64` have no TOML
+/// equivalent and fail to parse (a target is then skipped with a warning),
+/// and output keys are sorted. YAML additionally rejects non-string mapping
+/// keys, application tags and non-finite floats, and loses comments,
+/// anchors and quoting style when a file is rewritten.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Toml,
     Json,
+    Yaml,
 }
 
 impl Format {
     pub fn of(path: &Utf8Path) -> Self {
         match path.extension() {
             Some(ext) if ext.eq_ignore_ascii_case("json") => Self::Json,
+            Some(ext) if ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml") => {
+                Self::Yaml
+            }
             _ => Self::Toml,
         }
     }
@@ -62,6 +69,12 @@ impl Format {
                     _ => anyhow::bail!("JSON merge document must be an object"),
                 }
             }
+            // A blank or comment-only YAML file is the null document.
+            Self::Yaml => match serde_saphyr::from_str_with_options(text, yaml_options())? {
+                None => Ok(Table::new()),
+                Some(YamlValue(Value::Table(table))) => Ok(table),
+                Some(_) => anyhow::bail!("YAML merge document must be a mapping"),
+            },
         }
     }
 
@@ -73,6 +86,12 @@ impl Format {
                 s.push('\n');
                 Ok(s)
             }
+            // Keep every value on one line: the default folds strings over
+            // 80 characters (long paths) across several.
+            Self::Yaml => Ok(serde_saphyr::to_string_with_options(
+                table,
+                serde_saphyr::ser_options! { prefer_block_scalars: false },
+            )?),
         }
     }
 }
@@ -106,6 +125,124 @@ fn json_to_toml(value: serde_json::Value) -> anyhow::Result<Value> {
         serde_json::Value::Bool(value) => Value::Boolean(value),
         serde_json::Value::Null => anyhow::bail!("JSON null has no TOML equivalent"),
     })
+}
+
+/// YAML 1.1 readers take plain `yes` / `no` / `on` / `off` for booleans and
+/// `0755` / `1_000` for numbers; YAML 1.2 readers take them for strings. A
+/// merge rewrites files it does not own, so read them as the text they are
+/// (the writer quotes such strings, which every reader then agrees on)
+/// rather than change their spelling.
+fn yaml_options() -> serde_saphyr::Options {
+    serde_saphyr::options! {
+        strict_booleans: true,
+        leading_zero_numbers_as_strings: true,
+        underscored_numbers_as_strings: true,
+        reject_unsupported_tags: true,
+    }
+}
+
+/// A YAML node converted to its TOML equivalent while parsing, so a value
+/// without one fails at its line and column instead of being coerced.
+struct YamlValue(Value);
+
+impl<'de> Deserialize<'de> for YamlValue {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        use serde::de::{Error, MapAccess, SeqAccess};
+
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = YamlValue;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a YAML value with a TOML equivalent")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> std::result::Result<Self::Value, E> {
+                Ok(YamlValue(Value::Boolean(v)))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E> {
+                Ok(YamlValue(Value::Integer(v)))
+            }
+
+            fn visit_u64<E: Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+                i64::try_from(v)
+                    .map(|v| YamlValue(Value::Integer(v)))
+                    .map_err(|_| E::custom(format!("integer {v} is outside the i64 range")))
+            }
+
+            fn visit_f64<E>(self, v: f64) -> std::result::Result<Self::Value, E> {
+                Ok(YamlValue(Value::Float(v)))
+            }
+
+            fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E> {
+                Ok(YamlValue(Value::String(v.to_owned())))
+            }
+
+            fn visit_string<E>(self, v: String) -> std::result::Result<Self::Value, E> {
+                Ok(YamlValue(Value::String(v)))
+            }
+
+            fn visit_unit<E: Error>(self) -> std::result::Result<Self::Value, E> {
+                Err(E::custom("null has no TOML equivalent"))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(YamlValue(value)) = seq.next_element()? {
+                    values.push(value);
+                }
+                Ok(YamlValue(Value::Array(values)))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut table = Table::new();
+                while let Some(YamlKey(key)) = map.next_key()? {
+                    let YamlValue(value) = map.next_value()?;
+                    table.insert(key, value);
+                }
+                Ok(YamlValue(Value::Table(table)))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// A mapping key the document spells as a string. Asking for a `String`
+/// would also accept `1:` or `true:` and write them back as quoted text,
+/// changing the key's type for the application.
+struct YamlKey(String);
+
+impl<'de> Deserialize<'de> for YamlKey {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = YamlKey;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a string key")
+            }
+
+            fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E> {
+                Ok(YamlKey(v.to_owned()))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 /// One `[[merge]]` declaration in `config.toml`.
@@ -886,5 +1023,154 @@ notify = ["path/to/exe"]
         let bad = r#"{"setting": null}"#.to_string();
         let (src, dst) = filtered_for_diff(Format::Json, "{}".into(), bad.clone(), &[]);
         assert_eq!((src.as_str(), dst.as_str()), ("{}", bad.as_str()));
+    }
+
+    #[test]
+    fn test_yaml_format_absorb_drops_ignored_nested_key_and_roundtrips() {
+        assert_eq!(Format::of(Utf8Path::new("a/config.yml")), Format::Yaml);
+        assert_eq!(
+            Format::of(Utf8Path::new("a/config.base.YAML")),
+            Format::Yaml
+        );
+
+        let mut base = Format::Yaml.parse("theme:\n  dark: nord\n").unwrap();
+        let target = Format::Yaml
+            .parse(
+                "theme:\n  dark: dracula\nskills:\n  enabled: true\n  customDirectories:\n    - C:/Users/me/skills\n",
+            )
+            .unwrap();
+        let ignore = vec!["skills.customDirectories".to_string()];
+
+        assert!(absorb_toml(&mut base, &target, &ignore));
+        let rendered = Format::Yaml.render(&base).unwrap();
+        assert_eq!(
+            rendered,
+            "skills:\n  enabled: true\ntheme:\n  dark: dracula\n"
+        );
+
+        // apply direction keeps the target-only ignored key intact
+        let mut live = target.clone();
+        merge_toml(&base, &mut live);
+        assert_eq!(live, target);
+        assert!(!check_drift(&base, &live, &ignore));
+    }
+
+    #[test]
+    fn test_yaml_render_keeps_long_and_multiline_strings_on_one_line() {
+        let long = "C:/Users/me/a directory with spaces/".repeat(4);
+        let mut table = Table::new();
+        table.insert("note".into(), Value::String("two\nlines".into()));
+        table.insert("paths".into(), Value::Array(vec![Value::String(long)]));
+
+        let rendered = Format::Yaml.render(&table).unwrap();
+        assert_eq!(rendered.lines().count(), 3, "{rendered}");
+        assert_eq!(Format::Yaml.parse(&rendered).unwrap(), table);
+    }
+
+    /// A rewritten file must hand the application the same types back,
+    /// whichever YAML version its reader follows: strings and keys that look
+    /// like booleans, nulls or numbers are written quoted.
+    #[test]
+    fn test_yaml_render_keeps_scalar_lookalikes_as_strings() {
+        let lookalikes = [
+            "no",
+            "Yes",
+            "on",
+            "OFF",
+            "y",
+            "N",
+            "true",
+            "False",
+            "null",
+            "~",
+            "123",
+            "-7",
+            "1.5",
+            "1e3",
+            "0x1f",
+            "0755",
+            "1_000",
+            "12:30",
+            ".nan",
+            "",
+            " padded ",
+            "a: b",
+            "a #b",
+            "- item",
+            "# c",
+            "two\nlines",
+            "quote\"d",
+            "it's",
+            "*alias",
+            "&anchor",
+            "!tag",
+            "[x",
+            "{x",
+            "C:\\Users\\me",
+            "<<",
+        ];
+        let mut table = Table::new();
+        for (i, text) in lookalikes.iter().enumerate() {
+            table.insert(format!("k{i:02}"), Value::String(text.to_string()));
+            table.insert(text.to_string(), Value::Integer(i as i64));
+        }
+
+        let rendered = Format::Yaml.render(&table).unwrap();
+        assert_eq!(Format::Yaml.parse(&rendered).unwrap(), table, "{rendered}");
+        // A YAML 1.1 reader takes a bare `no` for false and `on:` for a
+        // boolean key.
+        assert!(rendered.contains("k00: \"no\"\n"), "{rendered}");
+        assert!(rendered.contains("\"on\": 2\n"), "{rendered}");
+    }
+
+    /// Plain scalars a YAML 1.1 reader would convert keep their spelling, so
+    /// a merge never turns `no` into `false` or `0755` into `755`.
+    #[test]
+    fn test_yaml_parse_reads_ambiguous_plain_scalars_as_text() {
+        let table = Format::Yaml
+            .parse("on: push\nanswer: no\nmode: 0755\ncount: 1_000\nflag: true\nport: 8080\n")
+            .unwrap();
+        assert_eq!(table["on"].as_str(), Some("push"));
+        assert_eq!(table["answer"].as_str(), Some("no"));
+        assert_eq!(table["mode"].as_str(), Some("0755"));
+        assert_eq!(table["count"].as_str(), Some("1_000"));
+        assert_eq!(table["flag"].as_bool(), Some(true));
+        assert_eq!(table["port"].as_integer(), Some(8080));
+    }
+
+    #[test]
+    fn test_yaml_parse_limits() {
+        // Blank and comment-only files are an empty mapping, like blank TOML.
+        assert!(Format::Yaml.parse("").unwrap().is_empty());
+        assert!(Format::Yaml.parse("# nothing yet\n").unwrap().is_empty());
+
+        for unsupported in [
+            "setting: null\n",
+            "setting: ~\n",
+            "setting:\n",
+            "list:\n  - 1\n  -\n",
+            "1: numeric key\n",
+            "true: boolean key\n",
+            "setting: !custom value\n",
+            "setting: .nan\n",
+            "setting: .inf\n",
+            "setting: 18446744073709551615\n",
+            "twice: 1\ntwice: 2\n",
+            "first: 1\n---\nsecond: 2\n",
+            "- top\n- level\n- list\n",
+            "just a string\n",
+        ] {
+            assert!(
+                Format::Yaml.parse(unsupported).is_err(),
+                "accepted {unsupported:?}"
+            );
+        }
+
+        let table = Format::Yaml
+            .parse("big: 9223372036854775807\nsmall: -9223372036854775808\nratio: 0.5\n")
+            .unwrap();
+        assert_eq!(table["big"].as_integer(), Some(i64::MAX));
+        assert_eq!(table["small"].as_integer(), Some(i64::MIN));
+        assert_eq!(table["ratio"].as_float(), Some(0.5));
     }
 }

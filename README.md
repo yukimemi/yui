@@ -418,13 +418,20 @@ ignore_keys = [
 ]
 ```
 
-The format follows the `src` extension: `.json` is merged as JSON, anything
-else as TOML. Both go through the same model, so `ignore_keys` /
-dot-notation behave identically (e.g. `ignore_keys = ["trustedWorkspaces"]`
-for a JSON settings file). JSON caveats: `null` values, integers outside the
-`i64` range and JSONC (comments / trailing commas) are unsupported — such a
-target is skipped with a warning and reported as drift by `status` — an empty
-target file is treated as an empty object, and keys are written sorted.
+The format follows the `src` extension: `.json` is merged as JSON, `.yml` /
+`.yaml` as YAML, anything else as TOML. All go through the same model, so
+`ignore_keys` / dot-notation behave identically (e.g.
+`ignore_keys = ["trustedWorkspaces"]` for a JSON settings file,
+`ignore_keys = ["skills.customDirectories"]` for a YAML one). JSON and YAML
+caveats: `null` values and integers outside the `i64` range are unsupported —
+such a target is skipped with a warning and reported as drift by `status` — an
+empty target file is treated as an empty object, and keys are written sorted.
+JSONC (comments / trailing commas) is unsupported. YAML also rejects non-string
+keys, application tags, duplicate keys, multiple documents and `.nan` /
+`.inf`; a rewritten YAML file loses its comments, anchors and quoting style.
+Plain `yes` / `no` / `on` / `off`, `0755` and `1_000` are read as strings (the
+YAML 1.2 reading), and any string another YAML reader could take for a
+boolean, null or number is written quoted.
 
 - **`apply`**: If the target is missing, creates it from `src`. If the target exists and has newer edits, automatically absorbs upstream changes first, then merges `src` onto the live target.
 - **`absorb`**: Pulls new settings from the live target back into `src`, pruning any keys matching `ignore_keys` (supports dot notation and wildcards like `section.*`).

@@ -4566,6 +4566,57 @@ dst = "{}"
     assert_eq!(live, serde_json::json!({}));
 }
 
+/// A `.yml` merge source goes through the same absorb/apply flow: the live
+/// file's newer edit reaches the base, a nested key listed in `ignore_keys`
+/// (machine-local paths) stays out of source and stays in the live file.
+#[test]
+fn apply_yaml_merge_absorbs_edit_but_never_ignored_key() {
+    let tmp = TempDir::new().unwrap();
+    let source = utf8(tmp.path().join("dotfiles"));
+    let target = utf8(tmp.path().join("target"));
+    std::fs::create_dir_all(source.join("home")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+    let base_file = source.join("home/config.base.yml");
+    write_with_mtime(&base_file, "theme: dark\n", past);
+
+    let target_file = target.join("config.yml");
+    std::fs::write(
+        &target_file,
+        "theme: light\nskills:\n  customDirectories:\n    - /Users/me/skills\n",
+    )
+    .unwrap();
+
+    let cfg = format!(
+        r#"
+[[merge]]
+src = "home/config.base.yml"
+dst = "{}"
+ignore_keys = ["skills.customDirectories"]
+"#,
+        toml_path(&target_file)
+    );
+    std::fs::write(source.join("config.toml"), cfg).unwrap();
+    if !git_init_and_commit(&source) {
+        eprintln!("skipping: git not available");
+        return;
+    }
+
+    apply(Some(source.clone()), false).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&base_file).unwrap(),
+        "theme: light\n"
+    );
+    // Nothing in the base differs from the live file any more: it is left
+    // exactly as the application wrote it.
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        "theme: light\nskills:\n  customDirectories:\n    - /Users/me/skills\n"
+    );
+}
+
 /// Editors/tools that write the target file wholesale (e.g. `codex`
 /// rewriting its own config) bump `dst`'s mtime past `src` even when the
 /// content is unchanged, or changed only cosmetically (comments, key
