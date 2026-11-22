@@ -203,6 +203,21 @@ fn validate_yaml(text: &str) -> anyhow::Result<bool> {
             );
         }
         if integer_candidate {
+            let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
+            // YAML 1.2 Core does not resolve 0b literals as integers.
+            if let Some(bits) = digits
+                .strip_prefix("0b")
+                .or_else(|| digits.strip_prefix("0B"))
+                && !bits.is_empty()
+                && bits.bytes().all(|byte| matches!(byte, b'0' | b'1' | b'_'))
+            {
+                anyhow::bail!(
+                    "YAML binary integer {value} is ambiguous at line {}, column {}; quote it as text or write it in decimal",
+                    span.start.line(),
+                    span.start.col() + 1
+                );
+            }
+
             if yaml_integer_out_of_range(value) {
                 anyhow::bail!(
                     "YAML integer {value} is outside the i64 range at line {}, column {}",
@@ -214,7 +229,6 @@ fn validate_yaml(text: &str) -> anyhow::Result<bool> {
             // `0755` is octal 493 to a YAML 1.1 reader, decimal 755 to a
             // YAML 1.2 one and text to others: whichever a rewrite picked,
             // some application would read a different value back.
-            let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
             if digits.len() > 1
                 && digits.starts_with('0')
                 && digits.bytes().all(|byte| byte.is_ascii_digit())
@@ -268,8 +282,6 @@ fn yaml_integer_out_of_range(value: &str) -> bool {
         (16, digits)
     } else if let Some(digits) = digits.strip_prefix("0o") {
         (8, digits)
-    } else if let Some(digits) = digits.strip_prefix("0b") {
-        (2, digits)
     } else {
         (10, digits)
     };
@@ -1277,6 +1289,9 @@ notify = ["path/to/exe"]
             "1.5",
             "1e3",
             "0x1f",
+            "0b1010",
+            "-0B1010",
+            "0b10_10",
             "0755",
             "1_000",
             "12:30",
@@ -1356,6 +1371,13 @@ notify = ["path/to/exe"]
             ("values: [+0080]\n", "leading zeros"),
             ("count: 000\n", "leading zeros"),
             ("mode: !!int \"0755\"\n", "leading zeros"),
+            (
+                "mask: 0b1010\n",
+                "YAML binary integer 0b1010 is ambiguous at line 1, column 7",
+            ),
+            ("values: [-0B1010, +0b1010]\n", "binary integer"),
+            ("mask: 0b10_10\n", "binary integer"),
+            ("mask: !!int \"0b1010\"\n", "binary integer"),
             ("retry_delay: 12:30\n", "sexagesimal"),
             ("values: [-1_2:03:59.5]\n", "sexagesimal"),
             ("delay: !!int \"12:30\"\n", "sexagesimal"),
@@ -1371,11 +1393,12 @@ notify = ["path/to/exe"]
         assert!(error.to_string().contains("line 2, column 14"), "{error}");
 
         let times = Format::Yaml
-            .parse("quoted: \"12:30\"\ntext: !!str 12:30\nlabel: 12:60\n")
+            .parse("quoted: \"12:30\"\ntext: !!str 12:30\nlabel: 12:60\ninvalid_bits: 0b102\n")
             .unwrap();
         assert_eq!(times["quoted"].as_str(), Some("12:30"));
         assert_eq!(times["text"].as_str(), Some("12:30"));
         assert_eq!(times["label"].as_str(), Some("12:60"));
+        assert_eq!(times["invalid_bits"].as_str(), Some("0b102"));
 
         let table = Format::Yaml
             .parse("zero: 0\nratio: 0.5\nquoted: \"0755\"\ntext: !!str 0755\nshared: &port 8080\nalias: *port\n")

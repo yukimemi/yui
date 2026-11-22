@@ -436,8 +436,9 @@ Plain scalars are read the YAML 1.2 way: `yes` / `no` / `on` / `off` and
 `1_000` are strings. Strings that resemble booleans, nulls or numbers are
 written quoted, including when `apply` first creates the target, so YAML 1.1
 readers agree. YAML 1.1 idioms whose value depends on the reader are rejected:
-`<<` merge keys, zero-padded integers such as `0755`, and sexagesimal numbers
-such as `12:30`. Quote ambiguous numbers as text or write them in decimal.
+`<<` merge keys, zero-padded integers such as `0755`, sexagesimal numbers
+such as `12:30`, and binary integer literals such as `0b1010`.
+Quote ambiguous numbers as text or write them in decimal.
 
 - **`apply`**: If the target is missing, creates it from `src`. If the target exists and has newer edits, automatically absorbs upstream changes first, then merges `src` onto the live target.
 - **`absorb`**: Pulls new settings from the live target back into `src`, pruning any keys matching `ignore_keys` (supports dot notation and wildcards like `section.*`).
