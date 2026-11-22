@@ -159,10 +159,10 @@ pub fn run_hook(
     dry_run: bool,
     force: bool,
 ) -> Result<HookOutcome> {
-    if let Some(when) = &hook.when {
-        if !template::eval_truthy(when, engine, base_ctx)? {
-            return Ok(HookOutcome::SkippedWhenFalse);
-        }
+    if let Some(when) = &hook.when
+        && !template::eval_truthy(when, engine, base_ctx)?
+    {
+        return Ok(HookOutcome::SkippedWhenFalse);
     }
 
     let script_path = source.join(&hook.script);
@@ -190,10 +190,10 @@ pub fn run_hook(
                 }
             }
             WhenRun::Onchange => {
-                if let (Some(prior_state), Some(now_hash)) = (prior, current_hash.as_deref()) {
-                    if prior_state.last_content_hash.as_deref() == Some(now_hash) {
-                        return Ok(HookOutcome::SkippedUnchanged);
-                    }
+                if let (Some(prior_state), Some(now_hash)) = (prior, current_hash.as_deref())
+                    && prior_state.last_content_hash.as_deref() == Some(now_hash)
+                {
+                    return Ok(HookOutcome::SkippedUnchanged);
                 }
             }
             WhenRun::Every => {}

@@ -58,10 +58,9 @@ pub fn classify(source: &Utf8Path, target: &Utf8Path) -> Result<AbsorbDecision> 
     if let (Ok(src_h), Ok(dst_h)) = (
         Handle::from_path(source.as_std_path()),
         Handle::from_path(target.as_std_path()),
-    ) {
-        if src_h == dst_h {
-            return Ok(AbsorbDecision::InSync);
-        }
+    ) && src_h == dst_h
+    {
+        return Ok(AbsorbDecision::InSync);
     }
 
     // Directories: we don't deep-compare contents — drift on a junction'd

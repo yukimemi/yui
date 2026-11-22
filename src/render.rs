@@ -171,14 +171,11 @@ pub fn render_to_string(
     let rel = relative_to(source, template_path);
     let rel_for_match = rel.as_str().replace('\\', "/");
     for rule in &rules {
-        // Nested ifs (not let-chains) so the crate's MSRV
-        // (rust-version = "1.85") stays buildable.
-        if rule.matcher.is_match(&rel_for_match) {
-            if let Some(w) = &rule.when {
-                if !eval_when(w, &mut engine, &ctx).map_err(|e| in_file(template_path, e))? {
-                    return Ok(None);
-                }
-            }
+        if rule.matcher.is_match(&rel_for_match)
+            && let Some(w) = &rule.when
+            && !eval_when(w, &mut engine, &ctx).map_err(|e| in_file(template_path, e))?
+        {
+            return Ok(None);
         }
     }
 
@@ -248,12 +245,11 @@ fn process_template(
     let rel = relative_to(source, template_path);
     let rel_for_match = rel.as_str().replace('\\', "/");
     for rule in rules {
-        if rule.matcher.is_match(&rel_for_match) {
-            if let Some(w) = &rule.when {
-                if !eval_when(w, engine, ctx).map_err(|e| in_file(template_path, e))? {
-                    return skip_when_false(template_path, &target, dry_run, report);
-                }
-            }
+        if rule.matcher.is_match(&rel_for_match)
+            && let Some(w) = &rule.when
+            && !eval_when(w, engine, ctx).map_err(|e| in_file(template_path, e))?
+        {
+            return skip_when_false(template_path, &target, dry_run, report);
         }
     }
 
@@ -529,22 +525,18 @@ fn build_managed_section(lines: &[String]) -> String {
 }
 
 fn replace_or_append_section(existing: &str, new_section: &str) -> String {
-    // Refactored from `if let ... && cond` (let-chains) to nested if so the
-    // crate's MSRV (rust-version = "1.85") stays buildable; let-chains were
-    // stabilized in 1.88.
     if let (Some(start), Some(end)) = (existing.find(GITIGNORE_BEGIN), existing.find(GITIGNORE_END))
+        && start < end
     {
-        if start < end {
-            let end_line_end = match existing[end..].find('\n') {
-                Some(idx) => end + idx + 1,
-                None => existing.len(),
-            };
-            let mut out = String::with_capacity(existing.len() + new_section.len());
-            out.push_str(&existing[..start]);
-            out.push_str(new_section);
-            out.push_str(&existing[end_line_end..]);
-            return out;
-        }
+        let end_line_end = match existing[end..].find('\n') {
+            Some(idx) => end + idx + 1,
+            None => existing.len(),
+        };
+        let mut out = String::with_capacity(existing.len() + new_section.len());
+        out.push_str(&existing[..start]);
+        out.push_str(new_section);
+        out.push_str(&existing[end_line_end..]);
+        return out;
     }
 
     let mut out = String::from(existing);

@@ -120,32 +120,30 @@ pub fn doctor(
     }
 
     // ── hooks ─────────────────────────────────────────────────
-    if have_source {
-        if let (Ok(s), Some(c)) = (&resolved_source, cfg) {
-            probes.push(Probe::group("hooks"));
-            if c.hook.is_empty() {
-                probes.push(Probe::ok("hooks", "(none configured)"));
-            } else {
-                let mut missing = 0usize;
-                for h in &c.hook {
-                    if !s.join(&h.script).is_file() {
-                        missing += 1;
-                        probes.push(Probe::error(
-                            format!("hook[{}]", h.name),
-                            format!("script not found at {}", h.script),
-                        ));
-                    }
-                }
-                if missing == 0 {
-                    probes.push(Probe::ok(
-                        "scripts",
-                        format!(
-                            "{} hook{} configured, all scripts present",
-                            c.hook.len(),
-                            plural(c.hook.len())
-                        ),
+    if have_source && let (Ok(s), Some(c)) = (&resolved_source, cfg) {
+        probes.push(Probe::group("hooks"));
+        if c.hook.is_empty() {
+            probes.push(Probe::ok("hooks", "(none configured)"));
+        } else {
+            let mut missing = 0usize;
+            for h in &c.hook {
+                if !s.join(&h.script).is_file() {
+                    missing += 1;
+                    probes.push(Probe::error(
+                        format!("hook[{}]", h.name),
+                        format!("script not found at {}", h.script),
                     ));
                 }
+            }
+            if missing == 0 {
+                probes.push(Probe::ok(
+                    "scripts",
+                    format!(
+                        "{} hook{} configured, all scripts present",
+                        c.hook.len(),
+                        plural(c.hook.len())
+                    ),
+                ));
             }
         }
     }
@@ -265,10 +263,10 @@ pub(crate) fn undeclared_dir_link_probes(
                 }
             }
             for link in &spec.links {
-                if let Some(when) = &link.when {
-                    if !template::eval_truthy(when, &mut engine, &tera_ctx)? {
-                        continue;
-                    }
+                if let Some(when) = &link.when
+                    && !template::eval_truthy(when, &mut engine, &tera_ctx)?
+                {
+                    continue;
                 }
                 let rendered = engine.render(&link.dst, &tera_ctx)?;
                 declared.insert(paths::normalize(&paths::expand_tilde(rendered.trim())));

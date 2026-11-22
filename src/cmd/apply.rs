@@ -179,67 +179,61 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
                 let src_meta = std::fs::metadata(&src_path).ok();
                 let dst_mtime = dst_meta.and_then(|m| m.modified().ok());
                 let src_mtime = src_meta.and_then(|m| m.modified().ok());
-                if let (Some(dt), Some(st)) = (dst_mtime, src_mtime) {
-                    if dt > st {
-                        let src_text = std::fs::read_to_string(&src_path)
-                            .with_context(|| format!("reading merge source {src_path}"))?;
-                        let format = crate::merge::Format::of(&src_path);
-                        let src_table: toml::Table = format
-                            .parse(&src_text)
-                            .with_context(|| format!("parsing merge source {src_path}"))?;
-                        let dst_text = std::fs::read_to_string(&dst_path)
-                            .with_context(|| format!("reading merge target {dst_path}"))?;
-                        let dst_table: toml::Table = match format.parse(&dst_text) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                warn!("failed to parse merge target {dst_path}: {e}; skipping");
-                                continue;
-                            }
-                        };
-                        if crate::merge::check_drift(&src_table, &dst_table, &m.ignore_keys) {
-                            // Same gates as the file-level `AutoAbsorb` path
-                            // (`link_file_with_backup`): the `auto` kill-switch
-                            // and `require_clean_git` both have to clear before
-                            // target's newer edits are allowed to flow back into
-                            // source. Skipping straight to `apply_entry` here
-                            // would deep-merge the *old* base over target's
-                            // newer values for any key both sides share.
-                            let can_auto_absorb = config.absorb.auto
-                                && !(config.absorb.require_clean_git && !source_clean);
-                            if can_auto_absorb {
-                                crate::merge::absorb_entry(
-                                    m,
-                                    &source,
-                                    &mut engine,
-                                    &tera_ctx,
-                                    dry_run,
-                                    &backup_root,
-                                )?;
+                if let (Some(dt), Some(st)) = (dst_mtime, src_mtime)
+                    && dt > st
+                {
+                    let src_text = std::fs::read_to_string(&src_path)
+                        .with_context(|| format!("reading merge source {src_path}"))?;
+                    let format = crate::merge::Format::of(&src_path);
+                    let src_table: toml::Table = format
+                        .parse(&src_text)
+                        .with_context(|| format!("parsing merge source {src_path}"))?;
+                    let Some(dst_table) = crate::merge::load_target(format, &dst_path)? else {
+                        continue;
+                    };
+                    if crate::merge::check_drift(&src_table, &dst_table, &m.ignore_keys) {
+                        // Same gates as the file-level `AutoAbsorb` path
+                        // (`link_file_with_backup`): the `auto` kill-switch
+                        // and `require_clean_git` both have to clear before
+                        // target's newer edits are allowed to flow back into
+                        // source. Skipping straight to `apply_entry` here
+                        // would deep-merge the *old* base over target's
+                        // newer values for any key both sides share.
+                        let can_auto_absorb = config.absorb.auto
+                            && !(config.absorb.require_clean_git && !source_clean);
+                        if can_auto_absorb {
+                            crate::merge::absorb_entry(
+                                m,
+                                &source,
+                                &mut engine,
+                                &tera_ctx,
+                                dry_run,
+                                &backup_root,
+                            )?;
+                        } else {
+                            // The gate didn't clear, so this is an anomaly —
+                            // dispatch through `[absorb] on_anomaly` exactly
+                            // like the file-level path does, instead of
+                            // always behaving as if it were `skip`.
+                            let reason = if !config.absorb.auto {
+                                "absorb.auto = false; treating divergence as anomaly"
                             } else {
-                                // The gate didn't clear, so this is an anomaly —
-                                // dispatch through `[absorb] on_anomaly` exactly
-                                // like the file-level path does, instead of
-                                // always behaving as if it were `skip`.
-                                let reason = if !config.absorb.auto {
-                                    "absorb.auto = false; treating divergence as anomaly"
-                                } else {
-                                    "source repo is dirty; deferring auto-absorb"
-                                };
-                                let skip_apply = handle_merge_anomaly(
-                                    &ctx,
-                                    m,
-                                    &source,
-                                    &mut engine,
-                                    &tera_ctx,
-                                    dry_run,
-                                    &backup_root,
-                                    &src_path,
-                                    &dst_path,
-                                    reason,
-                                )?;
-                                if skip_apply {
-                                    continue;
-                                }
+                                "source repo is dirty; deferring auto-absorb"
+                            };
+                            let skip_apply = handle_merge_anomaly(
+                                &ctx,
+                                m,
+                                &source,
+                                &mut engine,
+                                &tera_ctx,
+                                dry_run,
+                                &backup_root,
+                                &src_path,
+                                &dst_path,
+                                reason,
+                            )?;
+                            if skip_apply {
+                                continue;
                             }
                         }
                     }
@@ -499,12 +493,10 @@ fn walk_and_link_body(
         let mut emitted_dir_link = false;
         let mut emitted_any = false;
         for link in &spec.links {
-            // Nested ifs (not let-chains) so the crate's MSRV
-            // (rust-version = "1.85") stays buildable.
-            if let Some(when) = &link.when {
-                if !template::eval_truthy(when, engine, tera_ctx)? {
-                    continue;
-                }
+            if let Some(when) = &link.when
+                && !template::eval_truthy(when, engine, tera_ctx)?
+            {
+                continue;
             }
             let dst_str = engine.render(&link.dst, tera_ctx)?;
             let dst = paths::expand_tilde(dst_str.trim());
@@ -1424,10 +1416,10 @@ fn merge_dir_target_into_source(
                     })?;
                 }
             }
-            if let Some(parent) = source_path.parent() {
-                if !parent.exists() {
-                    std::fs::create_dir_all(parent)?;
-                }
+            if let Some(parent) = source_path.parent()
+                && !parent.exists()
+            {
+                std::fs::create_dir_all(parent)?;
             }
             // If both sides are now regular files at the same path, run
             // the file-level absorb classifier so this single overlap

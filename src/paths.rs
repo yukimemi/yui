@@ -223,12 +223,11 @@ impl YuiIgnoreStack {
         {
             matchers.push(gi);
         }
-        if self.respect_gitignore {
-            if let Some(gi) =
+        if self.respect_gitignore
+            && let Some(gi) =
                 build_matcher(dir, &dir.join(".gitignore"), /* strip_managed */ true)?
-            {
-                matchers.push(gi);
-            }
+        {
+            matchers.push(gi);
         }
         if !matchers.is_empty() {
             self.layers.push((dir.to_owned(), matchers));

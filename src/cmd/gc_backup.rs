@@ -240,18 +240,16 @@ fn walk_gc_backups_rec(dir: &Utf8Path, out: &mut Vec<BackupEntry>) -> Result<()>
             } else {
                 walk_gc_backups_rec(&path, out)?;
             }
-        } else if ft.is_file() {
-            // Nested ifs (not let-chains) so the crate's MSRV
-            // (rust-version = "1.85") stays buildable.
-            if let Some(ts) = parse_backup_suffix(name) {
-                let size = entry.metadata()?.len();
-                out.push(BackupEntry {
-                    path,
-                    ts,
-                    kind: BackupKind::File,
-                    size_bytes: size,
-                });
-            }
+        } else if ft.is_file()
+            && let Some(ts) = parse_backup_suffix(name)
+        {
+            let size = entry.metadata()?.len();
+            out.push(BackupEntry {
+                path,
+                ts,
+                kind: BackupKind::File,
+                size_bytes: size,
+            });
         }
     }
     Ok(())
@@ -304,12 +302,10 @@ pub(crate) fn parse_backup_suffix(name: &str) -> Option<jiff::civil::DateTime> {
     if let Some(ts) = parse_ts_at_end(name) {
         return Some(ts);
     }
-    // Nested ifs (not let-chains) so the crate's MSRV
-    // (rust-version = "1.85") stays buildable.
-    if let Some((before, _ext)) = name.rsplit_once('.') {
-        if let Some(ts) = parse_ts_at_end(before) {
-            return Some(ts);
-        }
+    if let Some((before, _ext)) = name.rsplit_once('.')
+        && let Some(ts) = parse_ts_at_end(before)
+    {
+        return Some(ts);
     }
     None
 }
@@ -326,12 +322,10 @@ pub(crate) fn backup_target_name(name: &str) -> Option<String> {
     if strip_ts_at_end(name).is_some() {
         return strip_ts_at_end(name).map(str::to_string);
     }
-    // Nested ifs (not let-chains) so the crate's MSRV
-    // (rust-version = "1.85") stays buildable.
-    if let Some((before, ext)) = name.rsplit_once('.') {
-        if let Some(stem) = strip_ts_at_end(before) {
-            return Some(format!("{stem}.{ext}"));
-        }
+    if let Some((before, ext)) = name.rsplit_once('.')
+        && let Some(stem) = strip_ts_at_end(before)
+    {
+        return Some(format!("{stem}.{ext}"));
     }
     None
 }

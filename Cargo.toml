@@ -2,7 +2,7 @@
 name = "yui-cli"
 version = "0.18.2"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Target-as-truth dotfiles manager: edit your live configs, source repo updates automatically via hardlink/junction/symlink."
 authors = ["yukimemi"]
 license = "MIT"
@@ -51,6 +51,10 @@ kaishin = "0.7.5"
 owo-colors = "4.4.0"
 same-file = "1.0.6"
 serde = { version = "1.0.229", features = ["derive"] }
+# YAML `[[merge]]` files. Its writer quotes strings a YAML 1.1 reader would
+# take for booleans (`no`, `on`), which the libyaml-based crates leave bare.
+# Requires Rust 1.89.
+serde-saphyr = { version = "2.2.0", default-features = false, features = ["deserialize", "serialize"] }
 serde_json = { version = "1.0.154", features = ["arbitrary_precision"] }
 sha2 = "0.11.1"
 similar = "3.2.1"
