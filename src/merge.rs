@@ -193,15 +193,6 @@ fn validate_yaml(text: &str) -> anyhow::Result<bool> {
             None => matches!(style, ScalarStyle::Plain),
             Some(tag) => tag.is_yaml_core_schema_tag("int"),
         };
-        if (integer_candidate || tag.is_some_and(|tag| tag.is_yaml_core_schema_tag("float")))
-            && yaml_1_1_sexagesimal(value)
-        {
-            anyhow::bail!(
-                "YAML sexagesimal number {value} is ambiguous at line {}, column {}; quote it as text or write it in decimal",
-                span.start.line(),
-                span.start.col() + 1
-            );
-        }
         if integer_candidate {
             let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
             // YAML 1.2 Core does not resolve 0b literals as integers.
@@ -242,38 +233,6 @@ fn validate_yaml(text: &str) -> anyhow::Result<bool> {
         }
     }
     Ok(has_document)
-}
-
-// YAML 1.1 resolves plain sexagesimal integers and floats as numbers,
-// where YAML 1.2 resolves them as strings.
-fn yaml_1_1_sexagesimal(value: &str) -> bool {
-    let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value);
-    let (whole, fraction) = match unsigned.split_once('.') {
-        Some((whole, fraction)) => (whole, Some(fraction)),
-        None => (unsigned, None),
-    };
-    let Some((head, rest)) = whole.split_once(':') else {
-        return false;
-    };
-    match head.as_bytes() {
-        [first, digits @ ..] if first.is_ascii_digit() => {
-            (fraction.is_some() || *first != b'0')
-                && digits
-                    .iter()
-                    .all(|byte| byte.is_ascii_digit() || *byte == b'_')
-                && rest.split(':').all(|group| match group.as_bytes() {
-                    [digit] => digit.is_ascii_digit(),
-                    [b'0'..=b'5', digit] => digit.is_ascii_digit(),
-                    _ => false,
-                })
-                && fraction.is_none_or(|digits| {
-                    digits
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || byte == b'_')
-                })
-        }
-        _ => false,
-    }
 }
 
 fn yaml_integer_out_of_range(value: &str) -> bool {
@@ -1350,14 +1309,20 @@ notify = ["path/to/exe"]
         );
     }
 
+    /// What YAML 1.2 does not type stays text, including values a YAML 1.1
+    /// reader would turn into booleans, numbers or timestamps.
     #[test]
     fn test_yaml_parse_reads_ambiguous_plain_scalars_as_text() {
         let table = Format::Yaml
-            .parse("on: push\nanswer: no\ncount: 1_000\nflag: true\nport: 8080\n")
+            .parse(
+                "on: push\nanswer: no\ncount: 1_000\nat: 22:05\nday: 2026-11-22\nflag: true\nport: 8080\n",
+            )
             .unwrap();
         assert_eq!(table["on"].as_str(), Some("push"));
         assert_eq!(table["answer"].as_str(), Some("no"));
         assert_eq!(table["count"].as_str(), Some("1_000"));
+        assert_eq!(table["at"].as_str(), Some("22:05"));
+        assert_eq!(table["day"].as_str(), Some("2026-11-22"));
         assert_eq!(table["flag"].as_bool(), Some(true));
         assert_eq!(table["port"].as_integer(), Some(8080));
     }
@@ -1378,19 +1343,11 @@ notify = ["path/to/exe"]
             ("values: [-0B1010, +0b1010]\n", "binary integer"),
             ("mask: 0b10_10\n", "binary integer"),
             ("mask: !!int \"0b1010\"\n", "binary integer"),
-            ("retry_delay: 12:30\n", "sexagesimal"),
-            ("values: [-1_2:03:59.5]\n", "sexagesimal"),
-            ("delay: !!int \"12:30\"\n", "sexagesimal"),
-            ("delay: !!float \"0:30.5\"\n", "sexagesimal"),
             ("base: &base\n  x: 1\nuse:\n  <<: *base\n", "merge"),
         ] {
             let error = format!("{:#}", Format::Yaml.parse(ambiguous).unwrap_err());
             assert!(error.contains(reason), "{ambiguous:?}: {error}");
         }
-        let error = Format::Yaml
-            .parse("# app configuration\nretry_delay: 12:30\n")
-            .unwrap_err();
-        assert!(error.to_string().contains("line 2, column 14"), "{error}");
 
         let times = Format::Yaml
             .parse("quoted: \"12:30\"\ntext: !!str 12:30\nlabel: 12:60\ninvalid_bits: 0b102\n")

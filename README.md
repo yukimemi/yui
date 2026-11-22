@@ -419,9 +419,10 @@ ignore_keys = [
 ```
 
 The format follows the `src` extension: `.json` is merged as JSON, `.yml` /
-`.yaml` as YAML, anything else as TOML. All go through the same model, so
-`ignore_keys` / dot-notation behave identically (e.g.
-`ignore_keys = ["trustedWorkspaces"]` for a JSON settings file,
+`.yaml` as YAML, anything else as TOML. (YAML is new in 0.19: a TOML source
+that happened to carry one of those extensions has to be renamed.) All go
+through the same model, so `ignore_keys` / dot-notation behave identically
+(e.g. `ignore_keys = ["trustedWorkspaces"]` for a JSON settings file,
 `ignore_keys = ["skills.customDirectories"]` for a YAML one). JSON and YAML
 caveats: `null` values and integers outside the `i64` range are unsupported —
 such a target is skipped with a warning and reported as drift by `status` — an
@@ -432,13 +433,17 @@ keys, application tags (including local tags such as `!map`), binary values
 as `.nan` and `.inf`). YAML files must be UTF-8; non-UTF-8 targets are left
 untouched with a warning and reported as drift. A rewritten YAML file loses
 its comments, anchors and quoting style.
-Plain scalars are read the YAML 1.2 way: `yes` / `no` / `on` / `off` and
-`1_000` are strings. Strings that resemble booleans, nulls or numbers are
-written quoted, including when `apply` first creates the target, so YAML 1.1
-readers agree. YAML 1.1 idioms whose value depends on the reader are rejected:
-`<<` merge keys, zero-padded integers such as `0755`, sexagesimal numbers
-such as `12:30`, and binary integer literals such as `0b1010`.
-Quote ambiguous numbers as text or write them in decimal.
+Plain scalars are read by the YAML 1.2 core schema, and what it does not type
+is text: `yes` / `no` / `on` / `off`, `1_000`, times such as `12:30`, dates
+such as `2026-11-22`. Text that another reader could take for a boolean,
+null, number or timestamp is written quoted, including when `apply` first
+creates the target, so afterwards every reader sees a string — an application
+that relied on YAML 1.1 typing for such a value (a PyYAML date, `yes` as
+true) reads a string back once yui has rewritten its file. Three spellings
+are rejected because no rewrite keeps their value for every reader: `<<`
+merge keys, zero-padded integers such as `0755` (octal or decimal) and
+binary literals such as `0b1010` (number or text). Quote them, or write the
+number in decimal.
 
 - **`apply`**: If the target is missing, creates it from `src`. If the target exists and has newer edits, automatically absorbs upstream changes first, then merges `src` onto the live target.
 - **`absorb`**: Pulls new settings from the live target back into `src`, pruning any keys matching `ignore_keys` (supports dot notation and wildcards like `section.*`).
