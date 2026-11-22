@@ -144,28 +144,38 @@ fn yaml_options() -> serde_saphyr::Options {
     }
 }
 
-// Inspect parser events before `deserialize_any` can round oversized
-// integers to floats or decode binary scalars as strings.
+// Check resolved tags and integer spellings before `deserialize_any` can
+// discard application tags or coerce unsupported values.
 fn validate_yaml_scalars(text: &str) -> anyhow::Result<()> {
     use serde_saphyr::granit_parser::{Parser, ScalarStyle};
 
     for event in Parser::new_from_str(text) {
         let (event, span) = event.map_err(|error| anyhow::anyhow!("{error}"))?;
         if let Some(tag) = event.tag() {
+            // In particular, serde-saphyr accepts local !map as an alias for !!map.
+            if tag.is_yaml_core_schema() || tag.parts() == ("", "!") {
+                continue;
+            }
+            let location = span.tag_start.unwrap_or(span.start);
             let is_binary = tag
                 .suffix_in_namespace("tag:yaml.org,2002:")
                 .or_else(|| tag.suffix_in_namespace("!"))
                 .is_some_and(|name| matches!(name.as_ref(), "binary" | "!binary"));
             if is_binary {
-                let location = span.tag_start.unwrap_or(span.start);
                 anyhow::bail!(
                     "YAML binary has no TOML equivalent at line {}, column {}",
                     location.line(),
                     location.col() + 1
                 );
             }
-            // Explicit integer tags already use checked integer deserialization.
-        } else if let Some((value, ScalarStyle::Plain)) = event.scalar()
+            anyhow::bail!(
+                "unsupported YAML tag {} at line {}, column {}",
+                tag.original(),
+                location.line(),
+                location.col() + 1
+            );
+        }
+        if let Some((value, ScalarStyle::Plain)) = event.scalar()
             && yaml_integer_out_of_range(value)
         {
             anyhow::bail!(
@@ -1256,6 +1266,21 @@ notify = ["path/to/exe"]
                 "binary has no TOML equivalent",
                 "line 3, column 10",
             ),
+            (
+                "setting: !map {enabled: true}\n",
+                "unsupported YAML tag !map",
+                "line 1, column 10",
+            ),
+            (
+                "setting: [!str true]\n",
+                "unsupported YAML tag !str",
+                "line 1, column 11",
+            ),
+            (
+                "%TAG !! tag:example.org,2026:\n---\nsetting: !!map {enabled: true}\n",
+                "unsupported YAML tag",
+                "line 3, column 10",
+            ),
         ] {
             let error = Format::Yaml.parse(unsupported).unwrap_err().to_string();
             assert!(
@@ -1280,6 +1305,7 @@ notify = ["path/to/exe"]
                 "padded: 018446744073709551616\n",
                 "underscored: 18_446_744_073_709_551_616\n",
                 "binary_text: '!!binary SGVsbG8='\n",
+                "non_specific: ! true\n",
             ))
             .unwrap();
         assert_eq!(table["hex"].as_integer(), Some(i64::MIN));
@@ -1295,5 +1321,11 @@ notify = ["path/to/exe"]
             Some("18_446_744_073_709_551_616")
         );
         assert_eq!(table["binary_text"].as_str(), Some("!!binary SGVsbG8="));
+        assert_eq!(table["non_specific"].as_str(), Some("true"));
+
+        let table = Format::Yaml
+            .parse("%TAG !core! tag:yaml.org,2002:\n---\nsetting: !core!map {enabled: true}\n")
+            .unwrap();
+        assert_eq!(table["setting"]["enabled"].as_bool(), Some(true));
     }
 }
