@@ -32,8 +32,8 @@ use crate::template::{self, Engine};
 /// JSON and YAML limits: `null` and integers outside `i64` have no TOML
 /// equivalent and fail to parse (a target is then skipped with a warning),
 /// and output keys are sorted. YAML additionally rejects non-string mapping
-/// keys, application tags and non-finite floats, and loses comments,
-/// anchors and quoting style when a file is rewritten.
+/// keys, application tags, binary values and non-finite floats. A rewrite
+/// loses comments, anchors and quoting style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Toml,
@@ -69,12 +69,15 @@ impl Format {
                     _ => anyhow::bail!("JSON merge document must be an object"),
                 }
             }
-            // A blank or comment-only YAML file is the null document.
-            Self::Yaml => match serde_saphyr::from_str_with_options(text, yaml_options())? {
-                None => Ok(Table::new()),
-                Some(YamlValue(Value::Table(table))) => Ok(table),
-                Some(_) => anyhow::bail!("YAML merge document must be a mapping"),
-            },
+            Self::Yaml => {
+                validate_yaml_scalars(text)?;
+                // A blank or comment-only YAML file is the null document.
+                match serde_saphyr::from_str_with_options(text, yaml_options())? {
+                    None => Ok(Table::new()),
+                    Some(YamlValue(Value::Table(table))) => Ok(table),
+                    Some(_) => anyhow::bail!("YAML merge document must be a mapping"),
+                }
+            }
         }
     }
 
@@ -139,6 +142,62 @@ fn yaml_options() -> serde_saphyr::Options {
         underscored_numbers_as_strings: true,
         reject_unsupported_tags: true,
     }
+}
+
+// Inspect parser events before `deserialize_any` can round oversized
+// integers to floats or decode binary scalars as strings.
+fn validate_yaml_scalars(text: &str) -> anyhow::Result<()> {
+    use serde_saphyr::granit_parser::{Parser, ScalarStyle};
+
+    for event in Parser::new_from_str(text) {
+        let (event, span) = event.map_err(|error| anyhow::anyhow!("{error}"))?;
+        if let Some(tag) = event.tag() {
+            let is_binary = tag
+                .suffix_in_namespace("tag:yaml.org,2002:")
+                .or_else(|| tag.suffix_in_namespace("!"))
+                .is_some_and(|name| matches!(name.as_ref(), "binary" | "!binary"));
+            if is_binary {
+                let location = span.tag_start.unwrap_or(span.start);
+                anyhow::bail!(
+                    "YAML binary has no TOML equivalent at line {}, column {}",
+                    location.line(),
+                    location.col() + 1
+                );
+            }
+            // Explicit integer tags already use checked integer deserialization.
+        } else if let Some((value, ScalarStyle::Plain)) = event.scalar()
+            && yaml_integer_out_of_range(value)
+        {
+            anyhow::bail!(
+                "YAML integer {value} is outside the i64 range at line {}, column {}",
+                span.start.line(),
+                span.start.col() + 1
+            );
+        }
+    }
+    Ok(())
+}
+
+fn yaml_integer_out_of_range(value: &str) -> bool {
+    let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
+    let (radix, digits) = if let Some(digits) = digits.strip_prefix("0x") {
+        (16, digits)
+    } else if let Some(digits) = digits.strip_prefix("0o") {
+        (8, digits)
+    } else if let Some(digits) = digits.strip_prefix("0b") {
+        (2, digits)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        return false; // Leading-zero decimals are strings.
+    } else {
+        (10, digits)
+    };
+    let max = i64::MAX as u64 + u64::from(value.starts_with('-'));
+    let too_large = match u64::from_str_radix(digits, radix) {
+        Ok(magnitude) => magnitude > max,
+        Err(error) => *error.kind() == std::num::IntErrorKind::PosOverflow,
+    };
+    // Overflow may be reported before a trailing character (e.g. `.0`) is read.
+    too_large && digits.bytes().all(|byte| char::from(byte).is_digit(radix))
 }
 
 /// A YAML node converted to its TOML equivalent while parsing, so a value
@@ -1166,11 +1225,75 @@ notify = ["path/to/exe"]
             );
         }
 
+        for (unsupported, reason, location) in [
+            (
+                "settings: [-9223372036854775809]\n",
+                "outside the i64 range",
+                "line 1, column 12",
+            ),
+            (
+                "setting: 18446744073709551616\n",
+                "outside the i64 range",
+                "line 1, column 10",
+            ),
+            (
+                "setting: 0x10000000000000000\n",
+                "outside the i64 range",
+                "line 1, column 10",
+            ),
+            (
+                "setting: !!binary SGVsbG8=\n",
+                "binary has no TOML equivalent",
+                "line 1, column 10",
+            ),
+            (
+                "setting: !<tag:yaml.org,2002:binary> SGVsbG8=\n",
+                "binary has no TOML equivalent",
+                "line 1, column 10",
+            ),
+            (
+                "%TAG !b! tag:yaml.org,2002:bi\n---\nsetting: !b!nary SGVsbG8=\n",
+                "binary has no TOML equivalent",
+                "line 3, column 10",
+            ),
+        ] {
+            let error = Format::Yaml.parse(unsupported).unwrap_err().to_string();
+            assert!(
+                error.contains(reason) && error.contains(location),
+                "{error}"
+            );
+        }
+
         let table = Format::Yaml
             .parse("big: 9223372036854775807\nsmall: -9223372036854775808\nratio: 0.5\n")
             .unwrap();
         assert_eq!(table["big"].as_integer(), Some(i64::MAX));
         assert_eq!(table["small"].as_integer(), Some(i64::MIN));
         assert_eq!(table["ratio"].as_float(), Some(0.5));
+
+        let table = Format::Yaml
+            .parse(concat!(
+                "hex: -0x8000000000000000\n",
+                "float: 18446744073709551616.0\n",
+                "quoted: '-9223372036854775809'\n",
+                "text: !!str 18446744073709551616\n",
+                "padded: 018446744073709551616\n",
+                "underscored: 18_446_744_073_709_551_616\n",
+                "binary_text: '!!binary SGVsbG8='\n",
+            ))
+            .unwrap();
+        assert_eq!(table["hex"].as_integer(), Some(i64::MIN));
+        assert_eq!(
+            table["float"].as_float(),
+            Some(18_446_744_073_709_551_616.0)
+        );
+        assert_eq!(table["quoted"].as_str(), Some("-9223372036854775809"));
+        assert_eq!(table["text"].as_str(), Some("18446744073709551616"));
+        assert_eq!(table["padded"].as_str(), Some("018446744073709551616"));
+        assert_eq!(
+            table["underscored"].as_str(),
+            Some("18_446_744_073_709_551_616")
+        );
+        assert_eq!(table["binary_text"].as_str(), Some("!!binary SGVsbG8="));
     }
 }

@@ -427,8 +427,9 @@ caveats: `null` values and integers outside the `i64` range are unsupported —
 such a target is skipped with a warning and reported as drift by `status` — an
 empty target file is treated as an empty object, and keys are written sorted.
 JSONC (comments / trailing commas) is unsupported. YAML also rejects non-string
-keys, application tags, duplicate keys, multiple documents and `.nan` /
-`.inf`; a rewritten YAML file loses its comments, anchors and quoting style.
+keys, application tags, binary values (`!!binary`), duplicate keys, multiple
+documents and non-finite floats (such as `.nan` and `.inf`). A rewritten YAML
+file loses its comments, anchors and quoting style.
 Plain `yes` / `no` / `on` / `off`, `0755` and `1_000` are read as strings (the
 YAML 1.2 reading), and any string another YAML reader could take for a
 boolean, null or number is written quoted.
