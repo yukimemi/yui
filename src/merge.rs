@@ -10,7 +10,6 @@
 //! - `absorb`: extracts clean configuration updates and schema additions
 //!   from target back into source, filtering out specified `ignore_keys`.
 
-use std::borrow::Cow;
 use std::fs;
 
 use anyhow::Context as _;
@@ -71,8 +70,8 @@ impl Format {
                 }
             }
             Self::Yaml => {
-                let (text, has_document) = prepare_yaml(text)?;
-                match serde_saphyr::from_str_with_options(&text, yaml_options())? {
+                let has_document = validate_yaml(text)?;
+                match serde_saphyr::from_str_with_options(text, yaml_options())? {
                     // A blank or comment-only file is an empty mapping, like
                     // blank TOML; a document that says `null` is not.
                     None if has_document => {
@@ -135,13 +134,15 @@ fn json_to_toml(value: serde_json::Value) -> anyhow::Result<Value> {
     })
 }
 
-/// Use YAML 1.2 spellings: `<<` is a literal key, and plain `yes` / `no` /
-/// `on` / `off` and `1_000` are strings. The writer quotes such strings
-/// for compatibility with YAML 1.1 readers.
+/// Read plain scalars the YAML 1.2 way: `yes` / `no` / `on` / `off` and
+/// `1_000` are strings, which the writer quotes so that YAML 1.1 readers
+/// agree. Two YAML 1.1 idioms have no reading that suits every application
+/// and are rejected instead: `<<` merge keys here, zero-padded integers in
+/// [`validate_yaml`].
 fn yaml_options() -> serde_saphyr::Options {
     serde_saphyr::options! {
         strict_booleans: true,
-        merge_keys: serde_saphyr::options::MergeKeyPolicy::AsOrdinary,
+        merge_keys: serde_saphyr::options::MergeKeyPolicy::Error,
         // Detect duplicates in YamlStringEntry after resolving the key's type.
         duplicate_keys: serde_saphyr::options::DuplicateKeyPolicy::PassThrough,
         underscored_numbers_as_strings: true,
@@ -151,13 +152,12 @@ fn yaml_options() -> serde_saphyr::Options {
 }
 
 // Check resolved tags and integer spellings before `deserialize_any` can
-// discard application tags or coerce unsupported values. Also report whether
-// the input holds a document at all.
-fn prepare_yaml(text: &str) -> anyhow::Result<(Cow<'_, str>, bool)> {
+// discard application tags or coerce unsupported values. Returns whether the
+// input holds a document at all.
+fn validate_yaml(text: &str) -> anyhow::Result<bool> {
     use serde_saphyr::granit_parser::{Event, Parser, ScalarStyle};
 
     let mut has_document = false;
-    let mut normalized = None;
 
     for event in Parser::new_from_str(text) {
         let (event, span) = event.map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -186,10 +186,11 @@ fn prepare_yaml(text: &str) -> anyhow::Result<(Cow<'_, str>, bool)> {
                 location.col() + 1
             );
         }
-        if let Some((value, ScalarStyle::Plain)) = event.scalar()
-            && event
-                .tag()
-                .is_none_or(|tag| tag.is_yaml_core_schema_tag("int"))
+        if let Some((value, style)) = event.scalar()
+            && match event.tag() {
+                None => matches!(style, ScalarStyle::Plain),
+                Some(tag) => tag.is_yaml_core_schema_tag("int"),
+            }
         {
             if yaml_integer_out_of_range(value) {
                 anyhow::bail!(
@@ -199,42 +200,23 @@ fn prepare_yaml(text: &str) -> anyhow::Result<(Cow<'_, str>, bool)> {
                 );
             }
 
-            // serde-saphyr 2.2's integer visitor accepts neither `0755` nor
-            // `-0755` as decimal. Move the redundant zeroes to trailing
-            // whitespace so the next token keeps its original column.
+            // `0755` is octal 493 to a YAML 1.1 reader, decimal 755 to a
+            // YAML 1.2 one and text to others: whichever a rewrite picked,
+            // some application would read a different value back.
             let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
             if digits.len() > 1
                 && digits.starts_with('0')
                 && digits.bytes().all(|byte| byte.is_ascii_digit())
             {
-                let zeroes = digits
-                    .bytes()
-                    .take(digits.len() - 1)
-                    .take_while(|&byte| byte == b'0')
-                    .count();
-                let start = span
-                    .start
-                    .byte_offset()
-                    .context("missing YAML scalar offset")?;
-                let end = start + value.len();
-                anyhow::ensure!(
-                    text.get(start..end) == Some(value),
-                    "invalid span for YAML scalar at line {}, column {}",
+                anyhow::bail!(
+                    "YAML integer {value} has leading zeros (octal or decimal, depending on the reader) at line {}, column {}; quote it or drop the zeros",
                     span.start.line(),
                     span.start.col() + 1
                 );
-                let digit_start = end - digits.len();
-                let bytes = normalized.get_or_insert_with(|| text.as_bytes().to_vec());
-                bytes.copy_within(digit_start + zeroes..end, digit_start);
-                bytes[end - zeroes..end].fill(b' ');
             }
         }
     }
-    let text = match normalized {
-        Some(bytes) => Cow::Owned(String::from_utf8(bytes)?),
-        None => Cow::Borrowed(text),
-    };
-    Ok((text, has_document))
+    Ok(has_document)
 }
 
 fn yaml_integer_out_of_range(value: &str) -> bool {
@@ -1190,10 +1172,10 @@ notify = ["path/to/exe"]
         let mut base = Format::Yaml.parse("theme:\n  dark: nord\n").unwrap();
         let target = Format::Yaml
             .parse(
-                "theme:\n  dark: dracula\nskills:\n  enabled: true\n  customDirectories:\n    - C:/Users/me/skills\n<<: {localPath: /private-work}\n",
+                "theme:\n  dark: dracula\nskills:\n  enabled: true\n  customDirectories:\n    - C:/Users/me/skills\n",
             )
             .unwrap();
-        let ignore = vec!["skills.customDirectories".to_string(), "<<".to_string()];
+        let ignore = vec!["skills.customDirectories".to_string()];
 
         assert!(absorb_toml(&mut base, &target, &ignore));
         let rendered = Format::Yaml.render(&base).unwrap();
@@ -1202,8 +1184,7 @@ notify = ["path/to/exe"]
             "skills:\n  enabled: true\ntheme:\n  dark: dracula\n"
         );
 
-        assert_eq!(target["<<"]["localPath"].as_str(), Some("/private-work"));
-        // apply direction keeps target-only ignored keys intact
+        // apply direction keeps the target-only ignored key intact
         let mut live = target.clone();
         merge_toml(&base, &mut live);
         assert_eq!(live, target);
@@ -1313,26 +1294,29 @@ notify = ["path/to/exe"]
         assert_eq!(table["port"].as_integer(), Some(8080));
     }
 
+    /// Constructs whose value depends on the reader's YAML version are
+    /// refused rather than rewritten into one reading.
     #[test]
-    fn test_yaml_rewrite_preserves_leading_zero_integer_types() {
-        let mut target = Format::Yaml
-            .parse(concat!(
-                "port: &port 0755\n",
-                "values: [é, *port, +0080, -0009, 000, !!int 0042, !!str 0755, \"0755\"]\n",
-            ))
-            .unwrap();
-        let base = Format::Yaml.parse("enabled: true\n").unwrap();
-        merge_toml(&base, &mut target);
-        let rendered = Format::Yaml.render(&target).unwrap();
-        let rewritten = Format::Yaml.parse(&rendered).unwrap();
-        assert_eq!(rewritten["port"].as_integer(), Some(755), "{rendered}");
-        let values = rewritten["values"].as_array().unwrap();
-        assert_eq!(values[0].as_str(), Some("é"));
-        for (value, expected) in values[1..6].iter().zip([755, 80, -9, 0, 42]) {
-            assert_eq!(value.as_integer(), Some(expected), "{rendered}");
+    fn test_yaml_parse_rejects_yaml_1_1_idioms() {
+        for (ambiguous, reason) in [
+            ("mode: 0755\n", "leading zeros"),
+            ("values: [+0080]\n", "leading zeros"),
+            ("count: 000\n", "leading zeros"),
+            ("mode: !!int \"0755\"\n", "leading zeros"),
+            ("base: &base\n  x: 1\nuse:\n  <<: *base\n", "merge"),
+        ] {
+            let error = format!("{:#}", Format::Yaml.parse(ambiguous).unwrap_err());
+            assert!(error.contains(reason), "{ambiguous:?}: {error}");
         }
-        assert_eq!(values[6].as_str(), Some("0755"));
-        assert_eq!(values[7].as_str(), Some("0755"));
+
+        let table = Format::Yaml
+            .parse("zero: 0\nratio: 0.5\nquoted: \"0755\"\ntext: !!str 0755\nshared: &port 8080\nalias: *port\n")
+            .unwrap();
+        assert_eq!(table["zero"].as_integer(), Some(0));
+        assert_eq!(table["ratio"].as_float(), Some(0.5));
+        assert_eq!(table["quoted"].as_str(), Some("0755"));
+        assert_eq!(table["text"].as_str(), Some("0755"));
+        assert_eq!(table["alias"].as_integer(), Some(8080));
     }
 
     #[test]

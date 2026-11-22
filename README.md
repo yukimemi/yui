@@ -431,10 +431,12 @@ keys, application tags (including local tags such as `!map`), binary values
 (`!!binary`), duplicate keys, multiple documents and non-finite floats (such
 as `.nan` and `.inf`). A rewritten YAML file loses its comments, anchors and
 quoting style.
-YAML 1.2 treats `<<` as an ordinary key, not a merge directive. Plain `yes` /
-`no` / `on` / `off` and `1_000` are strings, while `0755` is decimal `755`.
-Strings that resemble booleans, nulls or numbers are written quoted,
-including when `apply` first creates the target.
+Plain scalars are read the YAML 1.2 way: `yes` / `no` / `on` / `off` and
+`1_000` are strings. Strings that resemble booleans, nulls or numbers are
+written quoted, including when `apply` first creates the target, so YAML 1.1
+readers agree. Two YAML 1.1 idioms whose value depends on the reader are
+rejected like the unsupported values above: `<<` merge keys, and zero-padded
+integers such as `0755` (quote them or drop the zeros).
 
 - **`apply`**: If the target is missing, creates it from `src`. If the target exists and has newer edits, automatically absorbs upstream changes first, then merges `src` onto the live target.
 - **`absorb`**: Pulls new settings from the live target back into `src`, pruning any keys matching `ignore_keys` (supports dot notation and wildcards like `section.*`).
