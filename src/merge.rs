@@ -70,9 +70,13 @@ impl Format {
                 }
             }
             Self::Yaml => {
-                validate_yaml_scalars(text)?;
-                // A blank or comment-only YAML file is the null document.
+                let has_document = validate_yaml_scalars(text)?;
                 match serde_saphyr::from_str_with_options(text, yaml_options())? {
+                    // A blank or comment-only file is an empty mapping, like
+                    // blank TOML; a document that says `null` is not.
+                    None if has_document => {
+                        anyhow::bail!("YAML merge document must be a mapping, not null")
+                    }
                     None => Ok(Table::new()),
                     Some(YamlValue(Value::Table(table))) => Ok(table),
                     Some(_) => anyhow::bail!("YAML merge document must be a mapping"),
@@ -141,16 +145,21 @@ fn yaml_options() -> serde_saphyr::Options {
         leading_zero_numbers_as_strings: true,
         underscored_numbers_as_strings: true,
         reject_unsupported_tags: true,
+        non_finite_float_policy: serde_saphyr::options::NonFiniteFloatPolicy::Reject,
     }
 }
 
 // Check resolved tags and integer spellings before `deserialize_any` can
-// discard application tags or coerce unsupported values.
-fn validate_yaml_scalars(text: &str) -> anyhow::Result<()> {
-    use serde_saphyr::granit_parser::{Parser, ScalarStyle};
+// discard application tags or coerce unsupported values. Returns whether the
+// text holds a document at all.
+fn validate_yaml_scalars(text: &str) -> anyhow::Result<bool> {
+    use serde_saphyr::granit_parser::{Event, Parser, ScalarStyle};
+
+    let mut has_document = false;
 
     for event in Parser::new_from_str(text) {
         let (event, span) = event.map_err(|error| anyhow::anyhow!("{error}"))?;
+        has_document |= matches!(event, Event::DocumentStart(..));
         if let Some(tag) = event.tag() {
             // In particular, serde-saphyr accepts local !map as an alias for !!map.
             if tag.is_yaml_core_schema() || tag.parts() == ("", "!") {
@@ -185,7 +194,7 @@ fn validate_yaml_scalars(text: &str) -> anyhow::Result<()> {
             );
         }
     }
-    Ok(())
+    Ok(has_document)
 }
 
 fn yaml_integer_out_of_range(value: &str) -> bool {
@@ -1228,6 +1237,9 @@ notify = ["path/to/exe"]
             "first: 1\n---\nsecond: 2\n",
             "- top\n- level\n- list\n",
             "just a string\n",
+            "~\n",
+            "null\n",
+            "# only a null document\n---\n",
         ] {
             assert!(
                 Format::Yaml.parse(unsupported).is_err(),

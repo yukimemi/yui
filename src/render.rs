@@ -171,8 +171,6 @@ pub fn render_to_string(
     let rel = relative_to(source, template_path);
     let rel_for_match = rel.as_str().replace('\\', "/");
     for rule in &rules {
-        // Nested ifs (not let-chains) so the crate's MSRV
-        // (rust-version = "1.85") stays buildable.
         if rule.matcher.is_match(&rel_for_match)
             && let Some(w) = &rule.when
             && !eval_when(w, &mut engine, &ctx).map_err(|e| in_file(template_path, e))?
@@ -527,9 +525,6 @@ fn build_managed_section(lines: &[String]) -> String {
 }
 
 fn replace_or_append_section(existing: &str, new_section: &str) -> String {
-    // Refactored from `if let ... && cond` (let-chains) to nested if so the
-    // crate's MSRV (rust-version = "1.85") stays buildable; let-chains were
-    // stabilized in 1.88.
     if let (Some(start), Some(end)) = (existing.find(GITIGNORE_BEGIN), existing.find(GITIGNORE_END))
         && start < end
     {

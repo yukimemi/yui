@@ -499,8 +499,6 @@ fn walk_and_link_body(
         let mut emitted_dir_link = false;
         let mut emitted_any = false;
         for link in &spec.links {
-            // Nested ifs (not let-chains) so the crate's MSRV
-            // (rust-version = "1.85") stays buildable.
             if let Some(when) = &link.when
                 && !template::eval_truthy(when, engine, tera_ctx)?
             {
