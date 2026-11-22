@@ -10,6 +10,7 @@
 //! - `absorb`: extracts clean configuration updates and schema additions
 //!   from target back into source, filtering out specified `ignore_keys`.
 
+use std::borrow::Cow;
 use std::fs;
 
 use anyhow::Context as _;
@@ -70,8 +71,8 @@ impl Format {
                 }
             }
             Self::Yaml => {
-                let has_document = validate_yaml_scalars(text)?;
-                match serde_saphyr::from_str_with_options(text, yaml_options())? {
+                let (text, has_document) = prepare_yaml(text)?;
+                match serde_saphyr::from_str_with_options(&text, yaml_options())? {
                     // A blank or comment-only file is an empty mapping, like
                     // blank TOML; a document that says `null` is not.
                     None if has_document => {
@@ -134,15 +135,13 @@ fn json_to_toml(value: serde_json::Value) -> anyhow::Result<Value> {
     })
 }
 
-/// YAML 1.1 readers take plain `yes` / `no` / `on` / `off` for booleans and
-/// `0755` / `1_000` for numbers; YAML 1.2 readers take them for strings. A
-/// merge rewrites files it does not own, so read them as the text they are
-/// (the writer quotes such strings, which every reader then agrees on)
-/// rather than change their spelling.
+/// Use YAML 1.2 spellings: `<<` is a literal key, and plain `yes` / `no` /
+/// `on` / `off` and `1_000` are strings. The writer quotes such strings
+/// for compatibility with YAML 1.1 readers.
 fn yaml_options() -> serde_saphyr::Options {
     serde_saphyr::options! {
         strict_booleans: true,
-        leading_zero_numbers_as_strings: true,
+        merge_keys: serde_saphyr::options::MergeKeyPolicy::AsOrdinary,
         underscored_numbers_as_strings: true,
         reject_unsupported_tags: true,
         non_finite_float_policy: serde_saphyr::options::NonFiniteFloatPolicy::Reject,
@@ -150,21 +149,22 @@ fn yaml_options() -> serde_saphyr::Options {
 }
 
 // Check resolved tags and integer spellings before `deserialize_any` can
-// discard application tags or coerce unsupported values. Returns whether the
-// text holds a document at all.
-fn validate_yaml_scalars(text: &str) -> anyhow::Result<bool> {
+// discard application tags or coerce unsupported values. Also report whether
+// the input holds a document at all.
+fn prepare_yaml(text: &str) -> anyhow::Result<(Cow<'_, str>, bool)> {
     use serde_saphyr::granit_parser::{Event, Parser, ScalarStyle};
 
     let mut has_document = false;
+    let mut normalized = None;
 
     for event in Parser::new_from_str(text) {
         let (event, span) = event.map_err(|error| anyhow::anyhow!("{error}"))?;
         has_document |= matches!(event, Event::DocumentStart(..));
-        if let Some(tag) = event.tag() {
+        if let Some(tag) = event.tag()
+            && !tag.is_yaml_core_schema()
+            && tag.parts() != ("", "!")
+        {
             // In particular, serde-saphyr accepts local !map as an alias for !!map.
-            if tag.is_yaml_core_schema() || tag.parts() == ("", "!") {
-                continue;
-            }
             let location = span.tag_start.unwrap_or(span.start);
             let is_binary = tag
                 .suffix_in_namespace("tag:yaml.org,2002:")
@@ -185,16 +185,54 @@ fn validate_yaml_scalars(text: &str) -> anyhow::Result<bool> {
             );
         }
         if let Some((value, ScalarStyle::Plain)) = event.scalar()
-            && yaml_integer_out_of_range(value)
+            && event
+                .tag()
+                .is_none_or(|tag| tag.is_yaml_core_schema_tag("int"))
         {
-            anyhow::bail!(
-                "YAML integer {value} is outside the i64 range at line {}, column {}",
-                span.start.line(),
-                span.start.col() + 1
-            );
+            if yaml_integer_out_of_range(value) {
+                anyhow::bail!(
+                    "YAML integer {value} is outside the i64 range at line {}, column {}",
+                    span.start.line(),
+                    span.start.col() + 1
+                );
+            }
+
+            // serde-saphyr 2.2's integer visitor accepts neither `0755` nor
+            // `-0755` as decimal. Move the redundant zeroes to trailing
+            // whitespace so the next token keeps its original column.
+            let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
+            if digits.len() > 1
+                && digits.starts_with('0')
+                && digits.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                let zeroes = digits
+                    .bytes()
+                    .take(digits.len() - 1)
+                    .take_while(|&byte| byte == b'0')
+                    .count();
+                let start = span
+                    .start
+                    .byte_offset()
+                    .context("missing YAML scalar offset")?;
+                let end = start + value.len();
+                anyhow::ensure!(
+                    text.get(start..end) == Some(value),
+                    "invalid span for YAML scalar at line {}, column {}",
+                    span.start.line(),
+                    span.start.col() + 1
+                );
+                let digit_start = end - digits.len();
+                let bytes = normalized.get_or_insert_with(|| text.as_bytes().to_vec());
+                bytes.copy_within(digit_start + zeroes..end, digit_start);
+                bytes[end - zeroes..end].fill(b' ');
+            }
         }
     }
-    Ok(has_document)
+    let text = match normalized {
+        Some(bytes) => Cow::Owned(String::from_utf8(bytes)?),
+        None => Cow::Borrowed(text),
+    };
+    Ok((text, has_document))
 }
 
 fn yaml_integer_out_of_range(value: &str) -> bool {
@@ -205,8 +243,6 @@ fn yaml_integer_out_of_range(value: &str) -> bool {
         (8, digits)
     } else if let Some(digits) = digits.strip_prefix("0b") {
         (2, digits)
-    } else if digits.len() > 1 && digits.starts_with('0') {
-        return false; // Leading-zero decimals are strings.
     } else {
         (10, digits)
     };
@@ -284,9 +320,9 @@ impl<'de> Deserialize<'de> for YamlValue {
                 mut map: A,
             ) -> std::result::Result<Self::Value, A::Error> {
                 let mut table = Table::new();
-                while let Some(YamlKey(key)) = map.next_key()? {
+                while let Some(entry) = map.next_key_seed(YamlStringEntry(&mut table))? {
                     let YamlValue(value) = map.next_value()?;
-                    table.insert(key, value);
+                    entry.insert(value);
                 }
                 Ok(YamlValue(Value::Table(table)))
             }
@@ -296,30 +332,40 @@ impl<'de> Deserialize<'de> for YamlValue {
     }
 }
 
-/// A mapping key the document spells as a string. Asking for a `String`
-/// would also accept `1:` or `true:` and write them back as quoted text,
-/// changing the key's type for the application.
-struct YamlKey(String);
+/// Check the final string key while the deserializer can still locate it.
+/// Its own duplicate check uses YAML scalar identities, not these strings.
+struct YamlStringEntry<'a>(&'a mut Table);
 
-impl<'de> Deserialize<'de> for YamlKey {
+impl<'a, 'de> serde::de::DeserializeSeed<'de> for YamlStringEntry<'a> {
+    type Value = toml::map::VacantEntry<'a, String, Value>;
+
     fn deserialize<D: serde::Deserializer<'de>>(
+        self,
         deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        struct Visitor;
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
 
-        impl serde::de::Visitor<'_> for Visitor {
-            type Value = YamlKey;
+impl<'a> serde::de::Visitor<'_> for YamlStringEntry<'a> {
+    type Value = toml::map::VacantEntry<'a, String, Value>;
 
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a string key")
-            }
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a string key")
+    }
 
-            fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E> {
-                Ok(YamlKey(v.to_owned()))
-            }
+    fn visit_str<E: serde::de::Error>(self, key: &str) -> Result<Self::Value, E> {
+        self.visit_string(key.to_owned())
+    }
+
+    fn visit_string<E: serde::de::Error>(self, key: String) -> Result<Self::Value, E> {
+        match self.0.entry(key) {
+            toml::map::Entry::Vacant(entry) => Ok(entry),
+            toml::map::Entry::Occupied(entry) => Err(E::custom(format_args!(
+                "duplicate YAML string key {:?}",
+                entry.key()
+            ))),
         }
-
-        deserializer.deserialize_any(Visitor)
     }
 }
 
@@ -1114,10 +1160,10 @@ notify = ["path/to/exe"]
         let mut base = Format::Yaml.parse("theme:\n  dark: nord\n").unwrap();
         let target = Format::Yaml
             .parse(
-                "theme:\n  dark: dracula\nskills:\n  enabled: true\n  customDirectories:\n    - C:/Users/me/skills\n",
+                "theme:\n  dark: dracula\nskills:\n  enabled: true\n  customDirectories:\n    - C:/Users/me/skills\n<<: {localPath: /private-work}\n",
             )
             .unwrap();
-        let ignore = vec!["skills.customDirectories".to_string()];
+        let ignore = vec!["skills.customDirectories".to_string(), "<<".to_string()];
 
         assert!(absorb_toml(&mut base, &target, &ignore));
         let rendered = Format::Yaml.render(&base).unwrap();
@@ -1126,7 +1172,8 @@ notify = ["path/to/exe"]
             "skills:\n  enabled: true\ntheme:\n  dark: dracula\n"
         );
 
-        // apply direction keeps the target-only ignored key intact
+        assert_eq!(target["<<"]["localPath"].as_str(), Some("/private-work"));
+        // apply direction keeps target-only ignored keys intact
         let mut live = target.clone();
         merge_toml(&base, &mut live);
         assert_eq!(live, target);
@@ -1199,21 +1246,54 @@ notify = ["path/to/exe"]
         // boolean key.
         assert!(rendered.contains("k00: \"no\"\n"), "{rendered}");
         assert!(rendered.contains("\"on\": 2\n"), "{rendered}");
+        assert!(rendered.contains("\"<<\": "), "{rendered}");
     }
 
-    /// Plain scalars a YAML 1.1 reader would convert keep their spelling, so
-    /// a merge never turns `no` into `false` or `0755` into `755`.
+    #[test]
+    fn test_yaml_parse_rejects_duplicate_string_keys_after_resolution() {
+        let error = Format::Yaml
+            .parse("settings:\n  1_000: first\n  \"1_000\": second\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("duplicate YAML string key \"1_000\"")
+                && error.contains("line 3 column 3"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn test_yaml_parse_reads_ambiguous_plain_scalars_as_text() {
         let table = Format::Yaml
-            .parse("on: push\nanswer: no\nmode: 0755\ncount: 1_000\nflag: true\nport: 8080\n")
+            .parse("on: push\nanswer: no\ncount: 1_000\nflag: true\nport: 8080\n")
             .unwrap();
         assert_eq!(table["on"].as_str(), Some("push"));
         assert_eq!(table["answer"].as_str(), Some("no"));
-        assert_eq!(table["mode"].as_str(), Some("0755"));
         assert_eq!(table["count"].as_str(), Some("1_000"));
         assert_eq!(table["flag"].as_bool(), Some(true));
         assert_eq!(table["port"].as_integer(), Some(8080));
+    }
+
+    #[test]
+    fn test_yaml_rewrite_preserves_leading_zero_integer_types() {
+        let mut target = Format::Yaml
+            .parse(concat!(
+                "port: &port 0755\n",
+                "values: [é, *port, +0080, -0009, 000, !!int 0042, !!str 0755, \"0755\"]\n",
+            ))
+            .unwrap();
+        let base = Format::Yaml.parse("enabled: true\n").unwrap();
+        merge_toml(&base, &mut target);
+        let rendered = Format::Yaml.render(&target).unwrap();
+        let rewritten = Format::Yaml.parse(&rendered).unwrap();
+        assert_eq!(rewritten["port"].as_integer(), Some(755), "{rendered}");
+        let values = rewritten["values"].as_array().unwrap();
+        assert_eq!(values[0].as_str(), Some("é"));
+        for (value, expected) in values[1..6].iter().zip([755, 80, -9, 0, 42]) {
+            assert_eq!(value.as_integer(), Some(expected), "{rendered}");
+        }
+        assert_eq!(values[6].as_str(), Some("0755"));
+        assert_eq!(values[7].as_str(), Some("0755"));
     }
 
     #[test]
@@ -1224,10 +1304,12 @@ notify = ["path/to/exe"]
 
         for unsupported in [
             "setting: null\n",
+            "<<: null\n",
             "setting: ~\n",
             "setting:\n",
             "list:\n  - 1\n  -\n",
             "1: numeric key\n",
+            "0755: numeric key\n",
             "true: boolean key\n",
             "setting: !custom value\n",
             "setting: .nan\n",
@@ -1255,6 +1337,11 @@ notify = ["path/to/exe"]
             ),
             (
                 "setting: 18446744073709551616\n",
+                "outside the i64 range",
+                "line 1, column 10",
+            ),
+            (
+                "setting: 018446744073709551616\n",
                 "outside the i64 range",
                 "line 1, column 10",
             ),
@@ -1314,7 +1401,6 @@ notify = ["path/to/exe"]
                 "float: 18446744073709551616.0\n",
                 "quoted: '-9223372036854775809'\n",
                 "text: !!str 18446744073709551616\n",
-                "padded: 018446744073709551616\n",
                 "underscored: 18_446_744_073_709_551_616\n",
                 "binary_text: '!!binary SGVsbG8='\n",
                 "non_specific: ! true\n",
@@ -1327,7 +1413,6 @@ notify = ["path/to/exe"]
         );
         assert_eq!(table["quoted"].as_str(), Some("-9223372036854775809"));
         assert_eq!(table["text"].as_str(), Some("18446744073709551616"));
-        assert_eq!(table["padded"].as_str(), Some("018446744073709551616"));
         assert_eq!(
             table["underscored"].as_str(),
             Some("18_446_744_073_709_551_616")
