@@ -142,6 +142,8 @@ fn yaml_options() -> serde_saphyr::Options {
     serde_saphyr::options! {
         strict_booleans: true,
         merge_keys: serde_saphyr::options::MergeKeyPolicy::AsOrdinary,
+        // Detect duplicates in YamlStringEntry after resolving the key's type.
+        duplicate_keys: serde_saphyr::options::DuplicateKeyPolicy::PassThrough,
         underscored_numbers_as_strings: true,
         reject_unsupported_tags: true,
         non_finite_float_policy: serde_saphyr::options::NonFiniteFloatPolicy::Reject,
@@ -332,8 +334,7 @@ impl<'de> Deserialize<'de> for YamlValue {
     }
 }
 
-/// Check the final string key while the deserializer can still locate it.
-/// Its own duplicate check uses YAML scalar identities, not these strings.
+/// Reject duplicates by their resolved string keys, with the duplicate's location.
 struct YamlStringEntry<'a>(&'a mut Table);
 
 impl<'a, 'de> serde::de::DeserializeSeed<'de> for YamlStringEntry<'a> {
@@ -613,9 +614,9 @@ pub fn apply_entry(
                 fs::create_dir_all(parent)
                     .with_context(|| format!("creating directory {parent}"))?;
             }
-            // A blank source is a valid empty table, but blank text is not
-            // a valid *JSON* document: render it instead of copying it.
-            let new_content = if src_content.trim().is_empty() {
+            // YAML needs compatibility quoting even on the first write.
+            // Blank JSON must also be rendered to make it a valid document.
+            let new_content = if format == Format::Yaml || src_content.trim().is_empty() {
                 format.render(&src_table)?
             } else {
                 src_content
@@ -1130,6 +1131,35 @@ notify = ["path/to/exe"]
     }
 
     #[test]
+    fn test_yaml_apply_quotes_ambiguous_strings_in_new_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(temp.path()).unwrap();
+        let dst = root.join("target.yaml");
+        fs::write(root.join("base.yaml"), "answer: no\n").unwrap();
+        let entry = MergeEntry {
+            src: "base.yaml".into(),
+            dst: dst.to_string(),
+            ignore_keys: Vec::new(),
+            when: None,
+        };
+
+        apply_entry(
+            &entry,
+            root,
+            &mut Engine::new(),
+            &teravars::Context::new(),
+            false,
+            &root.join("backup"),
+        )
+        .unwrap();
+
+        let rendered = fs::read_to_string(dst).unwrap();
+        let legacy_booleans = serde_saphyr::options! { strict_booleans: false };
+        let table: Table = serde_saphyr::from_str_with_options(&rendered, legacy_booleans).unwrap();
+        assert_eq!(table["answer"].as_str(), Some("no"), "{rendered}");
+    }
+
+    #[test]
     fn test_check_drift_text_reports_unparseable_side_as_drift() {
         // `null` is rejected by the JSON path, so `apply` skips this target;
         // status must not call it in sync.
@@ -1247,6 +1277,15 @@ notify = ["path/to/exe"]
         assert!(rendered.contains("k00: \"no\"\n"), "{rendered}");
         assert!(rendered.contains("\"on\": 2\n"), "{rendered}");
         assert!(rendered.contains("\"<<\": "), "{rendered}");
+    }
+
+    #[test]
+    fn test_yaml_parse_keeps_distinct_underscored_string_keys() {
+        let table = Format::Yaml
+            .parse("settings:\n  1_000: first\n  10_00: second\n")
+            .unwrap();
+        assert_eq!(table["settings"]["1_000"].as_str(), Some("first"));
+        assert_eq!(table["settings"]["10_00"].as_str(), Some("second"));
     }
 
     #[test]
