@@ -306,10 +306,10 @@ pub(crate) fn parse_backup_suffix(name: &str) -> Option<jiff::civil::DateTime> {
     }
     // Nested ifs (not let-chains) so the crate's MSRV
     // (rust-version = "1.85") stays buildable.
-    if let Some((before, _ext)) = name.rsplit_once('.') {
-        if let Some(ts) = parse_ts_at_end(before) {
-            return Some(ts);
-        }
+    if let Some((before, _ext)) = name.rsplit_once('.')
+        && let Some(ts) = parse_ts_at_end(before)
+    {
+        return Some(ts);
     }
     None
 }
@@ -328,10 +328,10 @@ pub(crate) fn backup_target_name(name: &str) -> Option<String> {
     }
     // Nested ifs (not let-chains) so the crate's MSRV
     // (rust-version = "1.85") stays buildable.
-    if let Some((before, ext)) = name.rsplit_once('.') {
-        if let Some(stem) = strip_ts_at_end(before) {
-            return Some(format!("{stem}.{ext}"));
-        }
+    if let Some((before, ext)) = name.rsplit_once('.')
+        && let Some(stem) = strip_ts_at_end(before)
+    {
+        return Some(format!("{stem}.{ext}"));
     }
     None
 }

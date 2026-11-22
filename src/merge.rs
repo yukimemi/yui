@@ -176,10 +176,10 @@ fn remove_nested(table: &mut Table, parts: &[&str]) -> bool {
         // Apply rest to all child tables
         let mut keys_to_remove = Vec::new();
         for (k, v) in table.iter_mut() {
-            if let Value::Table(sub_table) = v {
-                if remove_nested(sub_table, rest) {
-                    keys_to_remove.push(k.clone());
-                }
+            if let Value::Table(sub_table) = v
+                && remove_nested(sub_table, rest)
+            {
+                keys_to_remove.push(k.clone());
             }
         }
         for k in keys_to_remove {
@@ -188,10 +188,10 @@ fn remove_nested(table: &mut Table, parts: &[&str]) -> bool {
         return table.is_empty();
     }
 
-    if let Some(Value::Table(sub_table)) = table.get_mut(key) {
-        if remove_nested(sub_table, rest) {
-            should_remove_key = true;
-        }
+    if let Some(Value::Table(sub_table)) = table.get_mut(key)
+        && remove_nested(sub_table, rest)
+    {
+        should_remove_key = true;
     }
 
     if should_remove_key {

@@ -551,10 +551,10 @@ fn find_source_for_target(
     for dir in plan.declared_dirs(source, marker_filename) {
         let spec = plan.dir_spec(&dir, marker_filename, true)?;
         for link in &spec.links {
-            if let Some(when) = &link.when {
-                if !template::eval_truthy(when, engine, tera_ctx)? {
-                    continue;
-                }
+            if let Some(when) = &link.when
+                && !template::eval_truthy(when, engine, tera_ctx)?
+            {
+                continue;
             }
             let dst_str = engine.render(&link.dst, tera_ctx)?;
             let dst = paths::expand_tilde(dst_str.trim());
@@ -602,10 +602,10 @@ fn find_source_for_target(
     // 2. Mount entries — render dst, see if target is inside it. Falls
     //    back here only when no declared `[[link]]` claimed the target.
     for entry in &config.mount.entry {
-        if let Some(when) = &entry.when {
-            if !template::eval_truthy(when, engine, tera_ctx)? {
-                continue;
-            }
+        if let Some(when) = &entry.when
+            && !template::eval_truthy(when, engine, tera_ctx)?
+        {
+            continue;
         }
         let dst_str = engine.render(&entry.dst, tera_ctx)?;
         let dst_root = paths::expand_tilde(dst_str.trim());

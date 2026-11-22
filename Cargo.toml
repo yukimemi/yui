@@ -2,7 +2,7 @@
 name = "yui-cli"
 version = "0.18.2"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Target-as-truth dotfiles manager: edit your live configs, source repo updates automatically via hardlink/junction/symlink."
 authors = ["yukimemi"]
 license = "MIT"

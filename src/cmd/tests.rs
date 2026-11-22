@@ -632,11 +632,11 @@ fn apply_target_newer_absorbs_target_into_source() {
     let backup_root = source.join(".yui/backup");
     let mut found_old = false;
     for entry in walkdir(&backup_root) {
-        if let Ok(s) = std::fs::read_to_string(&entry) {
-            if s == "default from repo" {
-                found_old = true;
-                break;
-            }
+        if let Ok(s) = std::fs::read_to_string(&entry)
+            && s == "default from repo"
+        {
+            found_old = true;
+            break;
         }
     }
     assert!(found_old, "expected backup containing 'default from repo'");
@@ -3428,11 +3428,11 @@ fn overwrite_source_into_target_replaces_target_and_backs_up() {
     // The diverged target content survives in backup.
     let mut found_old = false;
     for entry in walkdir(&backup_root) {
-        if let Ok(s) = std::fs::read_to_string(&entry) {
-            if s == "diverged target content" {
-                found_old = true;
-                break;
-            }
+        if let Ok(s) = std::fs::read_to_string(&entry)
+            && s == "diverged target content"
+        {
+            found_old = true;
+            break;
         }
     }
     assert!(

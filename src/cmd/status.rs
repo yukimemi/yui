@@ -315,10 +315,10 @@ fn classify_walk_inner_body(
     if !spec.links.is_empty() {
         let mut emitted_dir_link = false;
         for link in &spec.links {
-            if let Some(when) = &link.when {
-                if !template::eval_truthy(when, engine, tera_ctx)? {
-                    continue;
-                }
+            if let Some(when) = &link.when
+                && !template::eval_truthy(when, engine, tera_ctx)?
+            {
+                continue;
             }
             let dst_str = engine.render(&link.dst, tera_ctx)?;
             let dst = paths::expand_tilde(dst_str.trim());
