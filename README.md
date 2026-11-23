@@ -697,6 +697,10 @@ yui hooks run brew-bundle --force # bypass when_run state check
 all linking. A failing hook stops `apply` immediately — fix the
 script, then re-run.
 
+Use `yui apply --skip-hooks` to apply dotfiles without running either
+hook phase. This leaves hook run state unchanged, so the next normal
+`apply` evaluates the hooks as usual.
+
 ## Anomalies and the `[absorb]` policy
 
 When source AND target both diverge from each other, `yui` can't
@@ -732,7 +736,7 @@ mapping.
 | | |
 |---|---|
 | `yui init [repo] [--git-hooks] [--apply]` | without `repo`, scaffold in cwd; with GitHub `owner/repo` or Git URL, clone to `~/dotfiles` (override with `--source` / `YUI_SOURCE`); `--apply` requires `repo` and applies after initialization |
-| `yui apply [--dry-run]` | render → link → auto-absorb |
+| `yui apply [--dry-run] [--skip-hooks]` | render → link → auto-absorb |
 | `yui render [--check] [--dry-run]` | template-only pass; `--check` fails on drift |
 | `yui link [--dry-run]` | alias for apply (kept for muscle memory) |
 | `yui list [--all] [--icons MODE] [--no-color]` | every src→dst mapping |

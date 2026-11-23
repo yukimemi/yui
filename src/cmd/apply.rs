@@ -16,6 +16,14 @@ use teravars::Context as TeraContext;
 use tracing::{debug, info, warn};
 
 pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
+    apply_with_options(source, dry_run, false)
+}
+
+pub(crate) fn apply_with_options(
+    source: Option<Utf8PathBuf>,
+    dry_run: bool,
+    skip_hooks: bool,
+) -> Result<()> {
     let source = resolve_source(source)?;
     let yui = YuiVars::detect(&source);
     let config = config::load(&source, &yui)?;
@@ -39,15 +47,17 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
 
     // 0. Pre-apply hooks (before render / link). Bail on hook failure so
     //    apply doesn't proceed past a broken bootstrap.
-    hook::run_phase(
-        &config,
-        &source,
-        &yui,
-        &mut engine,
-        &tera_ctx,
-        HookPhase::Pre,
-        dry_run,
-    )?;
+    if !skip_hooks {
+        hook::run_phase(
+            &config,
+            &source,
+            &yui,
+            &mut engine,
+            &tera_ctx,
+            HookPhase::Pre,
+            dry_run,
+        )?;
+    }
 
     // 1a. Decrypt `*.age` files first — the rendered templates
     //     might `{{ ... }}`-reference plaintext siblings indirectly
@@ -244,15 +254,17 @@ pub fn apply(source: Option<Utf8PathBuf>, dry_run: bool) -> Result<()> {
     }
 
     // 3. Post-apply hooks (after every link is in place).
-    hook::run_phase(
-        &config,
-        &source,
-        &yui,
-        &mut engine,
-        &tera_ctx,
-        HookPhase::Post,
-        dry_run,
-    )?;
+    if !skip_hooks {
+        hook::run_phase(
+            &config,
+            &source,
+            &yui,
+            &mut engine,
+            &tera_ctx,
+            HookPhase::Post,
+            dry_run,
+        )?;
+    }
 
     // 4. Anything the run couldn't decide fails the run — silence here
     //    used to make "linked everything" and "left a declared link

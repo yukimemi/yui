@@ -62,6 +62,9 @@ pub enum Command {
     Apply {
         #[arg(long)]
         dry_run: bool,
+        /// Skip configured pre- and post-apply hooks
+        #[arg(long)]
+        skip_hooks: bool,
     },
 
     /// Render templates only
@@ -371,7 +374,10 @@ impl Cli {
                     cmd::init(source, git_hooks)
                 }
             }
-            Command::Apply { dry_run } => cmd::apply(source, dry_run),
+            Command::Apply {
+                dry_run,
+                skip_hooks,
+            } => cmd::apply_with_options(source, dry_run, skip_hooks),
             Command::Render { check, dry_run } => cmd::render(source, check, dry_run),
             Command::Link { dry_run } => cmd::link(source, dry_run),
             Command::Unlink { paths } => cmd::unlink(source, paths),
