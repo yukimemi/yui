@@ -58,7 +58,7 @@ serde-saphyr = { version = "2.2.0", default-features = false, features = ["deser
 serde_json = { version = "1.0.154", features = ["arbitrary_precision"] }
 sha2 = "0.11.1"
 similar = "3.2.1"
-teravars = { version = "0.3.2", default-features = false, features = ["merge"] }
+teravars = { version = "0.3.3", default-features = false, features = ["merge"] }
 thiserror = "2.0.21"
 # Runtime needed by kaishin's async API. `run_self_update` drives it
 # from a blocking `current_thread` runtime so that path stays sync; the
